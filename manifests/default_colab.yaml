@@ -3,6 +3,9 @@ experiment:
   seed: 17
 artifacts:
   root: /content/steering_factory_artifacts
+  # Colab overrides this with /content/drive/MyDrive/Projects/steering-factory.
+  # Each finalized run is copied to <publish_root>/<run_id>.
+  publish_root: null
 models:
   - id: qwen3_4b
     name_or_path: Qwen/Qwen3-4B

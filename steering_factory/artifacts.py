@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -53,6 +54,7 @@ class ArtifactStore:
         self.path = self.root / self.run_id
         self.path.mkdir()  # never reuse an existing run directory
         self.manifest = manifest
+        self.publish_root = manifest.get("artifacts", {}).get("publish_root")
         self.artifact = RunArtifact(self.run_id, str(self.path), manifest_hash(manifest), "running", _utc_now())
         self.write_yaml("resolved_manifest.yaml", manifest)
         self.write_json("run.json", self.artifact.to_dict())
@@ -108,3 +110,19 @@ class ArtifactStore:
             self.artifact.error = "".join(traceback.format_exception_only(type(error), error)).strip()
             self.write_json("failure.json", {"error": self.artifact.error, "traceback": traceback.format_exc()})
         self.write_json("run.json", self.artifact.to_dict())
+        self._publish()
+
+    def _publish(self) -> None:
+        """Mirror a finalized run to durable storage, such as Google Drive."""
+        if not self.publish_root:
+            return
+        destination = Path(self.publish_root) / self.run_id
+        try:
+            if destination.resolve() == self.path.resolve():
+                return
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(self.path, destination, dirs_exist_ok=True)
+            self.write_json("publish.json", {"status": "published", "destination": str(destination), "published_at": _utc_now()})
+            shutil.copy2(self.path / "publish.json", destination / "publish.json")
+        except Exception as exc:
+            self.write_json("publish.json", {"status": "failed", "destination": str(destination), "error": str(exc), "attempted_at": _utc_now()})

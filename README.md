@@ -15,14 +15,15 @@ The framework is designed for research, not deployment. Its safety recipes are d
 
 ## Colab quick start
 
-1. Connect `notebooks/colab_run.ipynb` to this repository in Colab.
-2. Select a GPU runtime and run the install cell.
-3. Set `ARTIFACT_ROOT` to either `/content/steering_factory_artifacts` or a mounted Drive location such as `/content/drive/MyDrive/steering_factory_artifacts`.
+1. Upload [colab_run.ipynb](notebooks/colab_run.ipynb) to Colab and select a GPU runtime. It clones or fast-forwards the configured GitHub repository into `/content/steering-factory`.
+2. Run the install cell, then mount Drive when prompted.
+3. Keep `ARTIFACT_ROOT=/content/steering_factory_artifacts` for fast local writes. The notebook mirrors every finalized run to `My Drive/Projects/steering-factory/<run-id>` through `PUBLISH_ROOT`.
 4. Run:
 
 ```bash
 python -m steering_factory prepare-data manifests/default_colab.yaml \
-  --set artifacts.root=/content/steering_factory_artifacts
+  --set artifacts.root=/content/steering_factory_artifacts \
+  --set artifacts.publish_root=/content/drive/MyDrive/Projects/steering-factory
 ```
 
 The tracked notebook intentionally contains only those setup and CLI calls. It does not duplicate experiment logic.
@@ -50,7 +51,7 @@ python -m steering_factory compare /path/to/run-a /path/to/run-b \
 
 ## Artifact layout
 
-Every invocation creates a new `<artifact-root>/<timestamp>-<id>/` directory. It includes:
+Every invocation creates a new `<artifact-root>/<timestamp>-<id>/` directory. When `artifacts.publish_root` is set, each finalized run is copied to `<publish-root>/<timestamp>-<id>/`; `publish.json` records the destination or any Drive-copy error. It includes:
 
 ```text
 resolved_manifest.yaml       exact effective configuration
