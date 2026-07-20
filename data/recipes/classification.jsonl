@@ -1,0 +1,3 @@
+{"id":"class-1","prompt":"Label this support query: My transfer is still pending.","positive":"pending transfer","negative":"card arrival","target":"pending transfer","category":"banking","source":"local_fixture"}
+{"id":"class-2","prompt":"Label this headline: Team wins championship after overtime.","positive":"sports","negative":"business","target":"sports","category":"news","source":"local_fixture"}
+{"id":"class-3","prompt":"Label this question type: What is the capital of Japan?","positive":"location","negative":"person","target":"location","category":"question_type","source":"local_fixture"}

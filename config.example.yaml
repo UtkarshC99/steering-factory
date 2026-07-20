@@ -1,0 +1,44 @@
+# Copy to config.yaml and edit. Everything here is overridable from the
+# Streamlit sidebar too -- this just sets the defaults on launch.
+
+target_model:
+  name_or_path: "meta-llama/Llama-3.1-8B-Instruct"   # any local path or HF id
+  dtype: "bfloat16"            # float32 | float16 | bfloat16
+  quantization: "4bit"          # none | 4bit | 8bit
+  device_map: "auto"
+  # Leave null to auto-detect via common architectures (model.layers,
+  # transformer.h, gpt_neox.layers, model.decoder.layers). Override if your
+  # architecture doesn't match, e.g. "model.layers" for most Llama-family
+  # models.
+  layer_path_override: null
+  trust_remote_code: false
+
+generator:
+  # anthropic | openai_compat | local_hf
+  backend: "anthropic"
+
+  anthropic:
+    model: "claude-sonnet-5"
+    # reads ANTHROPIC_API_KEY from environment, do not put it here
+
+  openai_compat:
+    base_url: "http://localhost:11434/v1"   # e.g. Ollama, vLLM, LM Studio
+    api_key_env: "OPENAI_API_KEY"            # set to a dummy value for local servers if required
+    model: "llama3.1:8b-instruct"
+
+  local_hf:
+    name_or_path: null   # null = reuse target_model
+    dtype: "bfloat16"
+    quantization: "4bit"
+
+storage:
+  vectors_dir: "data/vectors"
+  examples_dir: "data/examples"
+
+defaults:
+  num_pairs_per_topic: 24
+  extraction_method: "mean_diff"   # mean_diff | pca | optimized
+  layer_fraction: 0.6               # fraction of total layers, e.g. 0.6 = 60% depth
+  sweep_coefficients: [-4, -3, -2, -1, -0.5, 0, 0.5, 1, 2, 3, 4]
+  fluency_cap_ratio: 1.6            # max allowed perplexity / baseline perplexity
+  max_new_tokens: 120

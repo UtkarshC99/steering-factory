@@ -1,0 +1,59 @@
+experiment:
+  name: qwen-gemma-steering-study
+  seed: 17
+artifacts:
+  root: /content/steering_factory_artifacts
+models:
+  - id: qwen3_4b
+    name_or_path: Qwen/Qwen3-4B
+    dtype: bfloat16
+    quantization: 4bit
+  - id: gemma3_4b
+    name_or_path: google/gemma-3-4b-it
+    dtype: bfloat16
+    quantization: 4bit
+splits:
+  seed: 17
+  steer_fraction: 0.2
+  validation_fraction: 0.2
+  group_key: category
+recipes:
+  # Dataset mappings are intentionally explicit so benchmark revisions and
+  # licenses can be reviewed before a Colab run.
+  - id: safety_refusal
+    behavior: defensive_refusal
+    dataset:
+      adapter: local_jsonl
+      path: data/recipes/safety_refusal.jsonl
+      source: benchmark-controlled
+    extraction: [mean_diff, pca, whitened_mean_diff, optimized]
+    application:
+      layers: ["early_mid", "mid", "late_mid"]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      token_scopes: [all, generated_only]
+  - id: classification
+    behavior: domain_classification
+    dataset:
+      adapter: local_jsonl
+      path: data/recipes/classification.jsonl
+      source: ag_news_trec_banking77
+    extraction: [mean_diff, pca, whitened_mean_diff, optimized]
+  - id: calibrated_abstention
+    behavior: appropriate_abstention
+    dataset:
+      adapter: local_jsonl
+      path: data/recipes/abstention.jsonl
+      source: abstentionbench
+    extraction: [mean_diff, pca, whitened_mean_diff, optimized]
+  - id: structured_output
+    behavior: structured_output
+    dataset:
+      adapter: local_jsonl
+      path: data/recipes/structured_output.jsonl
+      source: jsonschemabench
+    extraction: [mean_diff, pca, whitened_mean_diff, optimized]
+finetune:
+  backend: qlora
+  matched_split: steer
+  max_steps: 200
+  target_modules: [q_proj, k_proj, v_proj, o_proj]

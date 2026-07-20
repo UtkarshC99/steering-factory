@@ -1,0 +1,21 @@
+torch>=2.1
+transformers>=5.0   # v4.x chokes on newer tokenizer_config.json formats (extra_special_tokens as list)
+accelerate>=0.33
+bitsandbytes>=0.43; platform_system != "Darwin"
+sentencepiece
+numpy
+scipy
+pyyaml
+streamlit>=1.36
+pandas
+plotly
+anthropic
+openai
+pytest
+datasets>=2.19
+jsonschema>=4.22
+psutil
+pyarrow>=15
+# Optional Colab comparison arm (install with: pip install peft trl)
+peft>=0.11
+trl>=0.9
