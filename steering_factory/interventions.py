@@ -43,10 +43,16 @@ def validate_vector_metadata(metadata: Dict[str, object], loaded: LoadedModel) -
 
 
 @contextmanager
-def apply_intervention(loaded: LoadedModel, vector: torch.Tensor, layers: Iterable[int], coefficient: float):
+def apply_intervention(
+    loaded: LoadedModel,
+    vector: torch.Tensor,
+    layers: Iterable[int],
+    coefficient: float,
+    token_scope: str = "all",
+):
     with ExitStack() as stack:
         for layer in layers:
             if layer < 0 or layer >= loaded.num_layers:
                 raise IndexError(f"Layer {layer} outside [0, {loaded.num_layers - 1}]")
-            stack.enter_context(apply_steering(loaded.layers[layer], vector, coefficient))
+            stack.enter_context(apply_steering(loaded.layers[layer], vector, coefficient, token_scope))
         yield

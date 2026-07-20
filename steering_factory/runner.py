@@ -71,8 +71,193 @@ def _behavior_score(prediction: str, example: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _resolve_layers(layers: List[Any], num_layers: int) -> List[int]:
+    """Named layer bands are resolved deterministically for each architecture."""
+    from .model_utils import layer_index_from_fraction
+
+    resolved = []
+    for layer in layers:
+        if isinstance(layer, int):
+            resolved.append(layer)
+        elif layer == "early_mid":
+            resolved.append(layer_index_from_fraction(num_layers, 0.35))
+        elif layer == "late_mid":
+            resolved.append(layer_index_from_fraction(num_layers, 0.75))
+        else:
+            resolved.append(layer_index_from_fraction(num_layers, 0.6))
+    return sorted(set(resolved))
+
+
+def run_extract(manifest: Dict[str, Any], command: str | None = None) -> ArtifactStore:
+    """Extract and persist steering vectors only -- no generation/evaluation.
+
+    Cheap to iterate on: swap extraction methods or layer grids without
+    re-running the (much more expensive) generation sweep. `run_evaluate`
+    consumes the vectors this writes under `vectors/`.
+    """
+    import torch
+    from . import extraction
+    from .config import TargetModelConfig
+    from .model_utils import load_model
+
+    store = ArtifactStore(manifest["artifacts"]["root"], manifest, command)
+    started = time.perf_counter()
+    try:
+        examples = _load_normalized_records(manifest, store)
+        recipe_map = {r["id"]: r for r in manifest["recipes"]}
+        vector_rows: List[Dict[str, Any]] = []
+        for model_cfg in manifest["models"]:
+            fields = {key: value for key, value in model_cfg.items() if key in TargetModelConfig.__dataclass_fields__}
+            loaded = load_model(TargetModelConfig(**fields))
+            store.write_json(f"models/{model_cfg.get('id', 'model')}.json", {
+                "requested": model_cfg, "resolved_layer_path": loaded.layer_path, "num_layers": loaded.num_layers,
+                "hidden_size": loaded.hidden_size, "device": loaded.device,
+                "model_revision": getattr(loaded.model.config, "_commit_hash", None),
+                "tokenizer_revision": getattr(loaded.tokenizer, "init_kwargs", {}).get("_commit_hash"),
+            })
+            for recipe_id, recipe in recipe_map.items():
+                recipe_examples = [e for e in examples if e["recipe_id"] == recipe_id]
+                steer = [e for e in recipe_examples if e["split"] == "steer"]
+                if not steer:
+                    continue
+                pairs = [{"prompt": e["prompt"], "compliant": e["positive"], "non_compliant": e["negative"]} for e in steer]
+                methods = recipe.get("extraction", ["mean_diff"])
+                grid = recipe.get("application", {})
+                layers = grid.get("layers", [0.6])
+                resolved_layers = _resolve_layers(layers, loaded.num_layers)
+                for method in methods:
+                    for layer_idx in resolved_layers:
+                        result = extraction.extract(method, loaded, layer_idx, pairs)
+                        metadata = {"model": model_cfg.get("name_or_path"), "model_id": model_cfg.get("id"),
+                                    "hidden_size": loaded.hidden_size, "layer_idx": layer_idx, "method": method,
+                                    "recipe_id": recipe_id, "num_pairs": len(pairs), "convergence": result.convergence}
+                        vector_path = store.save_vector(f"{model_cfg.get('id', 'model')}__{recipe_id}__{method}__L{layer_idx}", result.vector, metadata)
+                        vector_rows.append({**metadata, "vector_path": str(vector_path), "vector_norm": float(result.vector.norm())})
+            del loaded
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        store.write_table("vectors/index", vector_rows)
+        telemetry = {"wall_time_s": time.perf_counter() - started,
+                     "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
+                     "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0,
+                     "vectors": len(vector_rows)}
+        store.write_json("telemetry.json", telemetry)
+        store.finalize()
+        return store
+    except Exception as error:
+        store.finalize(error)
+        raise
+
+
+def _load_vector_index(run_dir: Path) -> List[Dict[str, Any]]:
+    index_path = run_dir / "vectors" / "index.jsonl"
+    if not index_path.exists():
+        raise FileNotFoundError(f"No vectors/index.jsonl in {run_dir}; run `extract` first.")
+    rows = []
+    with index_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                import json
+                rows.append(json.loads(line))
+    return rows
+
+
+def run_evaluate(manifest: Dict[str, Any], vectors_run: str | Path, command: str | None = None) -> ArtifactStore:
+    """Load vectors saved by `run_extract` and execute the generation/eval grid.
+
+    `vectors_run` is the artifact directory produced by a prior `extract`
+    (or `run`) invocation. This lets you re-evaluate the same vectors under
+    a different coefficient/token-scope grid without re-extracting them.
+    """
+    import torch
+    from . import metrics, sweep
+
+    source = Path(vectors_run)
+    vector_rows = _load_vector_index(source)
+    store = ArtifactStore(manifest["artifacts"]["root"], manifest, command)
+    started = time.perf_counter()
+    try:
+        examples = _load_normalized_records(manifest, store)
+        recipe_map = {r["id"]: r for r in manifest["recipes"]}
+        rows: List[Dict[str, Any]] = []
+        loaded_models: Dict[str, Any] = {}
+
+        def _get_loaded(model_id: str, model_name: str):
+            if model_id not in loaded_models:
+                from .config import TargetModelConfig
+                from .model_utils import load_model
+                model_cfg = next((m for m in manifest["models"] if m.get("id") == model_id), {"name_or_path": model_name})
+                fields = {key: value for key, value in model_cfg.items() if key in TargetModelConfig.__dataclass_fields__}
+                loaded_models[model_id] = load_model(TargetModelConfig(**fields))
+            return loaded_models[model_id]
+
+        for vrow in vector_rows:
+            recipe_id = vrow["recipe_id"]
+            recipe = recipe_map.get(recipe_id)
+            if recipe is None:
+                continue
+            loaded = _get_loaded(vrow["model_id"], vrow["model"])
+            vector_path = Path(vrow["vector_path"])
+            if not vector_path.is_absolute():
+                vector_path = source / vector_path.relative_to(source) if str(vector_path).startswith(str(source)) else vector_path
+            vector = torch.load(vector_path, map_location="cpu")
+
+            recipe_examples = [e for e in examples if e["recipe_id"] == recipe_id]
+            evaluate_examples = [e for e in recipe_examples if e["split"] in ("validation", "test")]
+            if not evaluate_examples:
+                continue
+            grid = recipe.get("application", {})
+            coefficients = grid.get("coefficients", [0.0, 1.0])
+            token_scopes = grid.get("token_scopes", ["all"])
+            layer_idx = vrow["layer_idx"]
+            method = vrow["method"]
+            max_new_tokens = manifest.get("decoding", {}).get("max_new_tokens", 96)
+
+            for token_scope in token_scopes:
+                for example in evaluate_examples:
+                    baseline_text, baseline_logp, baseline_probs = sweep.generate_with_steering(
+                        loaded, layer_idx, vector, 0.0, example["prompt"], max_new_tokens, token_scope,
+                    )
+                    for coefficient in sorted(set([float(c) for c in coefficients] + [0.0])):
+                        before = time.perf_counter()
+                        if coefficient == 0.0:
+                            text, logp, probs = baseline_text, baseline_logp, baseline_probs
+                        else:
+                            text, logp, probs = sweep.generate_with_steering(loaded, layer_idx, vector, coefficient, example["prompt"], max_new_tokens, token_scope)
+                        score = _behavior_score(text, example)
+                        rows.append({"model_id": vrow["model_id"], "model_name": vrow["model"], "arm": "steering",
+                                     "recipe_id": recipe_id, "behavior_id": example["behavior_id"], "example_id": example["id"],
+                                     "split": example["split"], "category": example.get("category"), "method": method,
+                                     "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope, "prompt": example["prompt"],
+                                     "output": text, "latency_s": time.perf_counter() - before,
+                                     "tokens_generated": len(logp), "perplexity": metrics.perplexity_from_logprobs(logp),
+                                     "perplexity_ratio_vs_baseline": (metrics.perplexity_from_logprobs(logp) / metrics.perplexity_from_logprobs(baseline_logp)) if baseline_logp and metrics.perplexity_from_logprobs(baseline_logp) else None,
+                                     "js_divergence_vs_baseline": metrics.js_divergence(probs, baseline_probs) if probs is not None and baseline_probs is not None else None,
+                                     "repetition_score": metrics.repetition_score(text), "distinct_2": metrics.distinct_n(text, 2), **score})
+        del loaded_models
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        store.write_table("results/generations", rows)
+        store.write_json("results/summary.json", aggregate(rows))
+        store.write_json("results/vectors_source.json", {"source_run": str(source)})
+        telemetry = {"wall_time_s": time.perf_counter() - started,
+                     "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
+                     "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0,
+                     "rows": len(rows)}
+        store.write_json("telemetry.json", telemetry)
+        store.finalize()
+        return store
+    except Exception as error:
+        store.finalize(error)
+        raise
+
+
 def run_steering(manifest: Dict[str, Any], command: str | None = None) -> ArtifactStore:
-    """Execute the configured steering grid and persist raw, scored outputs.
+    """Execute the full extract + evaluate grid in one artifact, and persist
+    raw, scored outputs. Convenience wrapper around `run_extract` followed
+    by `run_evaluate` against the vectors it just wrote, kept as a single
+    artifact directory for backward compatibility with existing manifests
+    and the `run` CLI command.
 
     This deliberately evaluates small manifest grids serially: results are
     auditable and Colab users can reduce models/recipes with dotted overrides.
@@ -80,7 +265,7 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None) -> Artifa
     import torch
     from . import extraction, metrics, sweep
     from .config import TargetModelConfig
-    from .model_utils import layer_index_from_fraction, load_model
+    from .model_utils import load_model
 
     store = ArtifactStore(manifest["artifacts"]["root"], manifest, command)
     started = time.perf_counter()
@@ -108,47 +293,39 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None) -> Artifa
                 methods = recipe.get("extraction", ["mean_diff"])
                 grid = recipe.get("application", {})
                 coefficients = grid.get("coefficients", [0.0, 1.0])
-                layers = grid.get("layers", [layer_index_from_fraction(loaded.num_layers, 0.6)])
-                # Named layer bands are resolved deterministically for each architecture.
-                resolved_layers = []
-                for layer in layers:
-                    if isinstance(layer, int):
-                        resolved_layers.append(layer)
-                    elif layer == "early_mid":
-                        resolved_layers.append(layer_index_from_fraction(loaded.num_layers, 0.35))
-                    elif layer == "late_mid":
-                        resolved_layers.append(layer_index_from_fraction(loaded.num_layers, 0.75))
-                    else:
-                        resolved_layers.append(layer_index_from_fraction(loaded.num_layers, 0.6))
+                token_scopes = grid.get("token_scopes", ["all"])
+                layers = grid.get("layers", [0.6])
+                resolved_layers = _resolve_layers(layers, loaded.num_layers)
                 for method in methods:
-                    for layer_idx in sorted(set(resolved_layers)):
+                    for layer_idx in resolved_layers:
                         result = extraction.extract(method, loaded, layer_idx, pairs)
                         metadata = {"model": model_cfg.get("name_or_path"), "model_id": model_cfg.get("id"),
                                     "hidden_size": loaded.hidden_size, "layer_idx": layer_idx, "method": method,
                                     "recipe_id": recipe_id, "num_pairs": len(pairs), "convergence": result.convergence}
                         vector_path = store.save_vector(f"{model_cfg.get('id', 'model')}__{recipe_id}__{method}__L{layer_idx}", result.vector, metadata)
                         vector_rows.append({**metadata, "vector_path": str(vector_path), "vector_norm": float(result.vector.norm())})
-                        for example in evaluate:
-                            baseline_text, baseline_logp, baseline_probs = sweep.generate_with_steering(
-                                loaded, layer_idx, result.vector, 0.0, example["prompt"],
-                                manifest.get("decoding", {}).get("max_new_tokens", 96),
-                            )
-                            for coefficient in sorted(set([float(c) for c in coefficients] + [0.0])):
-                                before = time.perf_counter()
-                                if coefficient == 0.0:
-                                    text, logp, probs = baseline_text, baseline_logp, baseline_probs
-                                else:
-                                    text, logp, probs = sweep.generate_with_steering(loaded, layer_idx, result.vector, coefficient, example["prompt"], manifest.get("decoding", {}).get("max_new_tokens", 96))
-                                score = _behavior_score(text, example)
-                                rows.append({"model_id": model_cfg.get("id"), "model_name": model_cfg.get("name_or_path"),
-                                             "recipe_id": recipe_id, "behavior_id": example["behavior_id"], "example_id": example["id"],
-                                             "split": example["split"], "category": example.get("category"), "method": method,
-                                             "layer_idx": layer_idx, "coefficient": coefficient, "prompt": example["prompt"],
-                                             "output": text, "latency_s": time.perf_counter() - before,
-                                             "tokens_generated": len(logp), "perplexity": metrics.perplexity_from_logprobs(logp),
-                                             "perplexity_ratio_vs_baseline": (metrics.perplexity_from_logprobs(logp) / metrics.perplexity_from_logprobs(baseline_logp)) if baseline_logp and metrics.perplexity_from_logprobs(baseline_logp) else None,
-                                             "js_divergence_vs_baseline": metrics.js_divergence(probs, baseline_probs) if probs is not None and baseline_probs is not None else None,
-                                             "repetition_score": metrics.repetition_score(text), "distinct_2": metrics.distinct_n(text, 2), **score})
+                        for token_scope in token_scopes:
+                            for example in evaluate:
+                                baseline_text, baseline_logp, baseline_probs = sweep.generate_with_steering(
+                                    loaded, layer_idx, result.vector, 0.0, example["prompt"],
+                                    manifest.get("decoding", {}).get("max_new_tokens", 96), token_scope,
+                                )
+                                for coefficient in sorted(set([float(c) for c in coefficients] + [0.0])):
+                                    before = time.perf_counter()
+                                    if coefficient == 0.0:
+                                        text, logp, probs = baseline_text, baseline_logp, baseline_probs
+                                    else:
+                                        text, logp, probs = sweep.generate_with_steering(loaded, layer_idx, result.vector, coefficient, example["prompt"], manifest.get("decoding", {}).get("max_new_tokens", 96), token_scope)
+                                    score = _behavior_score(text, example)
+                                    rows.append({"model_id": model_cfg.get("id"), "model_name": model_cfg.get("name_or_path"), "arm": "steering",
+                                                 "recipe_id": recipe_id, "behavior_id": example["behavior_id"], "example_id": example["id"],
+                                                 "split": example["split"], "category": example.get("category"), "method": method,
+                                                 "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope, "prompt": example["prompt"],
+                                                 "output": text, "latency_s": time.perf_counter() - before,
+                                                 "tokens_generated": len(logp), "perplexity": metrics.perplexity_from_logprobs(logp),
+                                                 "perplexity_ratio_vs_baseline": (metrics.perplexity_from_logprobs(logp) / metrics.perplexity_from_logprobs(baseline_logp)) if baseline_logp and metrics.perplexity_from_logprobs(baseline_logp) else None,
+                                                 "js_divergence_vs_baseline": metrics.js_divergence(probs, baseline_probs) if probs is not None and baseline_probs is not None else None,
+                                                 "repetition_score": metrics.repetition_score(text), "distinct_2": metrics.distinct_n(text, 2), **score})
             del loaded
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -167,8 +344,15 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None) -> Artifa
 
 
 def run_qlora(manifest: Dict[str, Any], command: str | None = None) -> ArtifactStore:
-    """Train a separate matched adapter per model/recipe steer set."""
-    from .finetune import train_qlora
+    """Train a separate matched adapter per model/recipe steer set, then
+    evaluate each adapter on the same validation/test examples the steering
+    arm uses, scored with the identical evaluator (`_behavior_score`). This
+    is what makes `compare` able to do a matched quality/cost comparison
+    instead of just diffing run metadata: both arms end up with
+    `results/generations.jsonl` rows in the same schema.
+    """
+    import time as _time
+    from .finetune import evaluate_qlora_adapter, train_qlora
     store = ArtifactStore(manifest["artifacts"]["root"], manifest, command)
     try:
         examples = _load_normalized_records(manifest, store)
@@ -176,14 +360,38 @@ def run_qlora(manifest: Dict[str, Any], command: str | None = None) -> ArtifactS
         if config.get("backend", "qlora") != "qlora":
             raise ValueError("Only the qlora fine-tuning backend is currently implemented.")
         results = []
+        eval_rows: List[Dict[str, Any]] = []
+        max_new_tokens = manifest.get("decoding", {}).get("max_new_tokens", 96)
         for model in manifest["models"]:
             for recipe in manifest["recipes"]:
-                records = [e for e in examples if e["recipe_id"] == recipe["id"] and e["split"] == config.get("matched_split", "steer")]
-                if not records:
+                recipe_examples = [e for e in examples if e["recipe_id"] == recipe["id"]]
+                train_records = [e for e in recipe_examples if e["split"] == config.get("matched_split", "steer")]
+                eval_examples = [e for e in recipe_examples if e["split"] in ("validation", "test")]
+                if not train_records:
                     continue
                 qlora_config = {**config, "model_name": model["name_or_path"], "output_dir": str(store.path / "qlora" / model["id"] / recipe["id"])}
-                results.append({"model_id": model["id"], "recipe_id": recipe["id"], **train_qlora(records, qlora_config)})
+                train_result = train_qlora(train_records, qlora_config)
+                results.append({"model_id": model["id"], "recipe_id": recipe["id"], "num_train_records": len(train_records), **train_result})
+
+                if not eval_examples:
+                    continue
+                eval_started = _time.perf_counter()
+                eval_result = evaluate_qlora_adapter(
+                    eval_examples, model["name_or_path"], train_result["adapter_dir"],
+                    max_new_tokens=max_new_tokens, trust_remote_code=bool(model.get("trust_remote_code", False)),
+                )
+                for row in eval_result["rows"]:
+                    example = next(e for e in eval_examples if e["id"] == row["example_id"])
+                    score = _behavior_score(row["output"], example)
+                    eval_rows.append({"model_id": model["id"], "model_name": model["name_or_path"],
+                                       "recipe_id": recipe["id"], "arm": "qlora",
+                                       "num_train_records": len(train_records), **row, **score})
+                results[-1]["eval_wall_time_s"] = _time.perf_counter() - eval_started
+                results[-1]["eval_records"] = len(eval_examples)
         store.write_json("results/qlora.json", results)
+        if eval_rows:
+            store.write_table("results/generations", eval_rows)
+            store.write_json("results/summary.json", aggregate(eval_rows))
         store.finalize()
         return store
     except Exception as error:
@@ -199,8 +407,80 @@ def write_evaluation(store: ArtifactStore, rows: List[Dict[str, Any]], name: str
     return summary
 
 
-def compare(run_paths: Iterable[str | Path], output_root: str | Path) -> Path:
-    """Build a machine-readable index without assuming a particular metric."""
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    import json
+    if not path.exists():
+        return []
+    rows = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def render_report(run_dir: str | Path, output_path: str | Path | None = None) -> Path:
+    """Render a Markdown summary from an existing, finalized run directory.
+
+    Loads no model and touches no GPU -- purely reads what `extract`,
+    `evaluate`, or `run` already wrote (run.json, results/generations.jsonl,
+    results/summary.json, vectors/index.jsonl) and formats it for humans.
+    """
+    import json
+
+    source = Path(run_dir)
+    run_meta = json.loads((source / "run.json").read_text(encoding="utf-8")) if (source / "run.json").exists() else {}
+    summary = json.loads((source / "results" / "summary.json").read_text(encoding="utf-8")) if (source / "results" / "summary.json").exists() else {}
+    generations = _read_jsonl(source / "results" / "generations.jsonl")
+    vector_rows = _read_jsonl(source / "vectors" / "index.jsonl")
+
+    lines = [f"# Run report: {run_meta.get('run_id', source.name)}", "",
+              f"- Status: {run_meta.get('status', 'unknown')}",
+              f"- Started: {run_meta.get('started_at', 'n/a')}",
+              f"- Ended: {run_meta.get('ended_at', 'n/a')}",
+              f"- Manifest hash: {run_meta.get('manifest_hash', 'n/a')}", ""]
+
+    if vector_rows:
+        lines.append("## Vectors")
+        lines.append("")
+        lines.append("| model | recipe | method | layer | pairs | norm |")
+        lines.append("|---|---|---|---|---|---|")
+        for v in vector_rows:
+            lines.append(f"| {v.get('model_id')} | {v.get('recipe_id')} | {v.get('method')} | {v.get('layer_idx')} | {v.get('num_pairs')} | {v.get('vector_norm', 0):.3f} |")
+        lines.append("")
+
+    if summary:
+        lines.append("## Aggregate metrics")
+        lines.append("")
+        for key, value in sorted(summary.items()):
+            if key == "n":
+                continue
+            lines.append(f"- {key}: {value:.4f}" if isinstance(value, float) else f"- {key}: {value}")
+        lines.append("")
+
+    if generations:
+        by_method_layer: Dict[Any, List[Dict[str, Any]]] = {}
+        for row in generations:
+            key = (row.get("recipe_id"), row.get("method"), row.get("layer_idx"), row.get("coefficient"))
+            by_method_layer.setdefault(key, []).append(row)
+        lines.append("## Results by recipe / method / layer / coefficient")
+        lines.append("")
+        lines.append(f"- Total scored rows: {len(generations)}")
+        lines.append(f"- Distinct configurations: {len(by_method_layer)}")
+        lines.append("")
+
+    text = "\n".join(lines)
+    destination = Path(output_path) if output_path else source / "report.md"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(text, encoding="utf-8")
+    return destination
+
+
+def _run_metadata_index(run_paths: Iterable[str | Path], output_root: str | Path) -> Path:
+    """Build a machine-readable index without assuming a particular metric.
+    Used when `compare` is given runs that aren't a clean steering+QLoRA
+    pair (more than two runs, or two runs of the same arm) -- still useful
+    for eyeballing run status/provenance side by side."""
     output = Path(output_root)
     output.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -217,3 +497,38 @@ def compare(run_paths: Iterable[str | Path], output_root: str | Path) -> Path:
     with path.open("w") as handle:
         json.dump({"runs": rows, "created_at": time.time()}, handle, indent=2)
     return path
+
+
+def _is_qlora_run(run_path: Path) -> bool:
+    return (run_path / "results" / "qlora.json").exists()
+
+
+def _is_steering_run(run_path: Path) -> bool:
+    return (run_path / "vectors" / "index.jsonl").exists()
+
+
+def compare(run_paths: Iterable[str | Path], output_root: str | Path) -> Path:
+    """Compares two run directories. When one is a steering run (has
+    `vectors/index.jsonl`) and the other is a QLoRA run (has
+    `results/qlora.json`), builds the matched quality/cost comparison from
+    `comparison.build_comparison` and writes it via
+    `comparison_report.write_comparison_report` (report.json + report.md).
+
+    Falls back to a plain run-metadata index (previous behavior) for any
+    other combination -- e.g. two steering runs, more than two runs, or a
+    QLoRA run whose adapters were never evaluated (no
+    `results/generations.jsonl`) -- so `compare` never hard-fails on
+    legitimate non-Pillar-2 uses.
+    """
+    from .comparison import build_comparison
+    from .comparison_report import write_comparison_report
+
+    paths = [Path(p) for p in run_paths]
+    if len(paths) == 2:
+        steering_path = next((p for p in paths if _is_steering_run(p) and not _is_qlora_run(p)), None)
+        qlora_path = next((p for p in paths if _is_qlora_run(p)), None)
+        if steering_path is not None and qlora_path is not None and steering_path != qlora_path:
+            comparison = build_comparison(steering_path, qlora_path)
+            return write_comparison_report(comparison, output_root)
+
+    return _run_metadata_index(run_paths, output_root)
