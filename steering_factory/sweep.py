@@ -19,15 +19,21 @@ def generate_with_steering(
     coefficient: float,
     prompt_text: str,
     max_new_tokens: int = 120,
+    token_scope: str = "all",
 ):
     """Greedy-decodes (deterministic, so coefficients are comparable) and
     returns (generated_text, per-token logprobs, first-step next-token
-    probability distribution as a numpy array)."""
+    probability distribution as a numpy array).
+
+    `token_scope` is forwarded to the steering hook: "all" steers every
+    position including the prompt prefill; "generated_only" leaves the
+    prompt untouched and only pushes newly generated tokens; "last" steers
+    only the final position of each forward call."""
     device = next(loaded.model.parameters()).device
     layer_module = loaded.layers[layer_idx]
     enc = loaded.tokenizer(prompt_text, return_tensors="pt").to(device)
 
-    with apply_steering(layer_module, vector, coefficient):
+    with apply_steering(layer_module, vector, coefficient, token_scope):
         with torch.no_grad():
             out = loaded.model.generate(
                 **enc,
@@ -62,6 +68,7 @@ def coefficient_sweep(
     max_new_tokens: int = 120,
     judge=None,
     behavior_description: Optional[str] = None,
+    token_scope: str = "all",
 ) -> Dict[str, Any]:
     """Runs generation at coefficient=0 (baseline) plus every requested
     coefficient, computing fluency/divergence/degeneration metrics for
@@ -70,7 +77,7 @@ def coefficient_sweep(
     coeffs = sorted(set(coefficients) | {0.0})
 
     baseline_text, baseline_logp, baseline_probs = generate_with_steering(
-        loaded, layer_idx, vector, 0.0, prompt_text, max_new_tokens
+        loaded, layer_idx, vector, 0.0, prompt_text, max_new_tokens, token_scope
     )
     baseline_ppl = metrics.perplexity_from_logprobs(baseline_logp)
 
@@ -80,7 +87,7 @@ def coefficient_sweep(
             text, logp, probs = baseline_text, baseline_logp, baseline_probs
         else:
             text, logp, probs = generate_with_steering(
-                loaded, layer_idx, vector, coeff, prompt_text, max_new_tokens
+                loaded, layer_idx, vector, coeff, prompt_text, max_new_tokens, token_scope
             )
         ppl = metrics.perplexity_from_logprobs(logp)
         js = (

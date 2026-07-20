@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 def qlora_available() -> bool:
@@ -67,3 +67,65 @@ def train_qlora(records: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[s
     size = sum(os.path.getsize(os.path.join(root, file)) for root, _, files in os.walk(config["output_dir"]) for file in files)
     return {"records": len(records), "wall_time_s": time.perf_counter() - started, "train_loss": output.training_loss,
             "global_step": output.global_step, "adapter_dir": config["output_dir"], "adapter_size_bytes": size}
+
+
+def evaluate_qlora_adapter(
+    examples: List[Dict[str, Any]],
+    model_name: str,
+    adapter_dir: str,
+    max_new_tokens: int = 96,
+    trust_remote_code: bool = False,
+) -> Dict[str, Any]:
+    """Generate on `examples` (validation/test split) with the base model +
+    trained QLoRA adapter, returning per-example rows in the same shape as
+    the steering arm's `results/generations.jsonl` (minus steering-only
+    fields like layer_idx/coefficient/method), so `comparison.py` can score
+    both arms with the identical evaluator and join on quality.
+
+    Loaded lazily and released per call -- this is meant to run once per
+    (model, recipe) after training, not kept resident.
+    """
+    if not qlora_available():
+        raise RuntimeError("QLoRA requires optional dependencies: pip install peft trl datasets")
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from .model_utils import format_chat
+
+    started = time.perf_counter()
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
+    base = AutoModelForCausalLM.from_pretrained(model_name, quantization_config=quant, device_map="auto",
+                                                 trust_remote_code=trust_remote_code)
+    model = PeftModel.from_pretrained(base, adapter_dir)
+    model.eval()
+    device = next(model.parameters()).device
+
+    rows = []
+    for example in examples:
+        prompt_text = format_chat(tokenizer, example["prompt"])
+        enc = tokenizer(prompt_text, return_tensors="pt").to(device)
+        before = time.perf_counter()
+        with torch.no_grad():
+            out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
+                                  output_scores=True, return_dict_in_generate=True,
+                                  pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
+        gen_ids = out.sequences[0][enc["input_ids"].shape[1]:]
+        text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+        token_logprobs = []
+        for i, step_logits in enumerate(out.scores):
+            logp = torch.log_softmax(step_logits.float(), dim=-1)[0]
+            if i < gen_ids.shape[0]:
+                token_logprobs.append(float(logp[gen_ids[i]].item()))
+        rows.append({
+            "example_id": example["id"], "behavior_id": example["behavior_id"], "split": example["split"],
+            "category": example.get("category"), "prompt": example["prompt"], "output": text,
+            "latency_s": time.perf_counter() - before, "tokens_generated": len(token_logprobs),
+        })
+
+    del model, base
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"rows": rows, "wall_time_s": time.perf_counter() - started}

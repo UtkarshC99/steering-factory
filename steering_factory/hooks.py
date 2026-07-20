@@ -72,19 +72,67 @@ class ActivationCapture:
         return torch.cat(pooled, dim=0) if pooled else torch.empty(0)
 
 
+TokenScope = str  # "all" | "generated_only" | "last"
+
+
 class SteeringHook:
     """Adds `coefficient * vector` to the residual stream at a layer's
-    output on every forward call while active."""
+    output on every forward call while active.
 
-    def __init__(self, layer_module: torch.nn.Module, vector: torch.Tensor, coefficient: float):
+    `token_scope` controls which sequence positions get the intervention:
+      - "all" (default): every position of every forward call, including
+        the prompt-prefill call under HF's cache-based `generate()`. This
+        is also what extraction methods want when they run their own
+        forward passes over full prompt+completion text.
+      - "generated_only": skips the prefill call entirely (identified by
+        the KV-cache heuristic: a forward call with more than one token in
+        its input during autoregressive generation is prefill; each
+        decode step calls the layer with exactly one new-token position).
+        Only the single-token decode-step positions get steered, so the
+        prompt itself is left unperturbed and only newly generated tokens
+        are pushed toward the behavior.
+      - "last": only the final position of each forward call gets steered
+        (useful for one-shot last-token nudges rather than continuous
+        steering across a generation).
+    """
+
+    def __init__(
+        self,
+        layer_module: torch.nn.Module,
+        vector: torch.Tensor,
+        coefficient: float,
+        token_scope: TokenScope = "all",
+    ):
         self.layer_module = layer_module
         self.vector = vector
         self.coefficient = coefficient
+        self.token_scope = token_scope
         self._handle = None
+        self._seen_multi_token_call = False
 
     def _hook(self, module, inputs, output):
         hidden_states, rest, was_tuple = _unwrap_output(output)
         vec = self.vector.to(hidden_states.dtype).to(hidden_states.device)
+        seq_len = hidden_states.shape[1]
+
+        if self.token_scope == "generated_only":
+            # The first forward call carrying more than one position is the
+            # prompt prefill; every later single-token call is a decode
+            # step. If the whole generation is single-shot forward (seq_len
+            # stays 1 throughout, e.g. some custom loops), every call is
+            # treated as a decode step since there is no prefill to skip.
+            if seq_len > 1:
+                self._seen_multi_token_call = True
+                return _rewrap_output(hidden_states, rest, was_tuple)
+            hidden_states = hidden_states.clone()
+            hidden_states[:, -1, :] = hidden_states[:, -1, :] + self.coefficient * vec
+            return _rewrap_output(hidden_states, rest, was_tuple)
+
+        if self.token_scope == "last":
+            hidden_states = hidden_states.clone()
+            hidden_states[:, -1, :] = hidden_states[:, -1, :] + self.coefficient * vec
+            return _rewrap_output(hidden_states, rest, was_tuple)
+
         hidden_states = hidden_states + self.coefficient * vec
         return _rewrap_output(hidden_states, rest, was_tuple)
 
@@ -99,12 +147,17 @@ class SteeringHook:
 
 
 @contextmanager
-def apply_steering(layer_module: torch.nn.Module, vector: Optional[torch.Tensor], coefficient: float):
+def apply_steering(
+    layer_module: torch.nn.Module,
+    vector: Optional[torch.Tensor],
+    coefficient: float,
+    token_scope: TokenScope = "all",
+):
     """No-op context manager if vector is None or coefficient == 0, so
     callers can always go through this path uniformly for the baseline."""
     if vector is None or coefficient == 0:
         yield
         return
-    hook = SteeringHook(layer_module, vector, coefficient)
+    hook = SteeringHook(layer_module, vector, coefficient, token_scope)
     with hook:
         yield

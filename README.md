@@ -40,14 +40,23 @@ python -m steering_factory prepare-data manifests/default_colab.yaml \
   --set splits.seed=29
 ```
 
-Available commands are `prepare-data`, `run`, `extract`, `evaluate`, `finetune`, `compare`, and `report`. `run`, `extract`, `evaluate`, and `report` execute the configured steering grid; `finetune` trains one matched QLoRA adapter per model/recipe steer split. The latter requires a Colab GPU and the explicit target modules in the manifest.
+Available commands are `prepare-data`, `run`, `extract`, `evaluate`, `finetune`, `compare`, and `report`.
 
-To create a comparison index after runs:
+- `run` executes the full extract + evaluate grid in one artifact (backward-compatible convenience wrapper).
+- `extract` runs extraction only and saves vectors under `vectors/index.jsonl`, without generating.
+- `evaluate <manifest> --vectors-run <run-dir>` loads vectors saved by a prior `extract`/`run` and executes the generation/eval grid against them, so you can re-score under a different coefficient/token-scope grid without re-extracting.
+- `report <run-dir>` renders a Markdown summary (`report.md`) from an existing, finalized run directory. Loads no model.
+- `finetune` trains one matched QLoRA adapter per model/recipe steer split, then evaluates each adapter on the same validation/test examples the steering arm uses, scored with the identical evaluator. Requires a Colab GPU and the explicit target modules in the manifest.
+
+`compare` produces different things depending on what it is given:
 
 ```bash
-python -m steering_factory compare /path/to/run-a /path/to/run-b \
+python -m steering_factory compare /path/to/steering-run /path/to/qlora-run \
   --output-root /content/steering_factory_artifacts/comparisons
 ```
+
+- If one path is a steering run (has `vectors/index.jsonl`) and the other is a QLoRA run (has `results/qlora.json`), `compare` builds the matched steering-vs-QLoRA quality/cost report: the best steering config is selected on validation only, held-out test quality is reported alongside QLoRA's held-out test quality for the same (model, recipe), and cost (wall time, labeled-example count, artifact size, ms/token) is normalized across both arms. Writes `report.json` and `report.md`.
+- For any other combination (two steering runs, more than two runs, an untrained/unevaluated QLoRA run), `compare` falls back to a plain run-metadata index (`comparison.json`) so it never hard-fails on legitimate non-comparison uses.
 
 ## Artifact layout
 
