@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from steering_factory.artifacts import ArtifactStore
-from steering_factory.callbacks import CompositeCallback, JsonlCallback, _safe
+from steering_factory.callbacks import CompositeCallback, JsonlCallback, PrintSummaryCallback, _safe
 
 
 def _manifest(tmp_path):
@@ -102,3 +102,81 @@ def test_composite_callback_is_itself_a_valid_callback(tmp_path):
     _safe(composite, {"event": "generation", "i": 1, "n": 1})
     assert recorder.events == [{"event": "generation", "i": 1, "n": 1}]
     assert (store.path / "progress" / "steering.jsonl").exists()
+
+
+def _generation_event(i, n=10, ppl=1.0, js=0.1):
+    return {"event": "generation", "i": i, "n": n, "model_id": "m", "recipe_id": "r", "method": "mean_diff",
+            "layer_idx": 5, "coefficient": 1.0, "token_scope": "all",
+            "perplexity_ratio_vs_baseline": ppl, "js_divergence_vs_baseline": js}
+
+
+def test_print_summary_callback_fires_only_every_k_events(capsys):
+    callback = PrintSummaryCallback(every=3)
+    for i in range(1, 3):
+        callback.on_event(_generation_event(i))
+    assert capsys.readouterr().out == ""  # no print yet, below threshold
+    callback.on_event(_generation_event(3))
+    out = capsys.readouterr().out
+    assert "steering" in out
+    assert "mean perplexity_ratio_vs_baseline=" in out
+    assert "mean js_divergence_vs_baseline=" in out
+
+
+def test_print_summary_callback_reports_only_the_most_recent_block(capsys):
+    # Block 1: all ppl=1.0. Block 2: all ppl=3.0 -- the second summary must
+    # reflect only block 2, not a running mean across both.
+    callback = PrintSummaryCallback(every=2)
+    callback.on_event(_generation_event(1, ppl=1.0))
+    callback.on_event(_generation_event(2, ppl=1.0))
+    capsys.readouterr()  # discard first block's output
+    callback.on_event(_generation_event(3, ppl=3.0))
+    callback.on_event(_generation_event(4, ppl=3.0))
+    out = capsys.readouterr().out
+    assert "mean perplexity_ratio_vs_baseline=3.000" in out
+
+
+def test_print_summary_callback_ignores_unrelated_events():
+    callback = PrintSummaryCallback(every=1)
+    callback.on_event({"event": "vector", "i": 1, "n": 1})  # no handler -- must not raise
+    callback.on_event({"event": "run_done"})
+
+
+def test_print_summary_callback_handles_train_log(capsys):
+    callback = PrintSummaryCallback(every=2)
+    callback.on_event({"event": "train_log", "step": 1, "max_steps": 10, "loss": 2.0, "grad_norm": 0.5,
+                        "model_id": "m", "recipe_id": "r"})
+    callback.on_event({"event": "train_log", "step": 2, "max_steps": 10, "loss": 1.5, "grad_norm": 0.4,
+                        "model_id": "m", "recipe_id": "r"})
+    out = capsys.readouterr().out
+    assert "qlora" in out
+    assert "mean loss=1.750" in out
+
+
+def test_print_summary_callback_handles_opt_step(capsys):
+    callback = PrintSummaryCallback(every=2)
+    callback.on_event({"event": "opt_step", "i": 1, "n": 5, "loss": 1.0, "grad_norm": 0.1})
+    callback.on_event({"event": "opt_step", "i": 2, "n": 5, "loss": 2.0, "grad_norm": 0.2})
+    out = capsys.readouterr().out
+    assert "bipo-lite" in out
+    assert "mean loss=1.500" in out
+
+
+def test_print_summary_callback_handles_missing_metric_values(capsys):
+    # perplexity/JS can be None (e.g. baseline computation failed) -- the
+    # summary must render "n/a" rather than crashing on statistics.fmean([]).
+    callback = PrintSummaryCallback(every=1)
+    callback.on_event(_generation_event(1, ppl=None, js=None))
+    out = capsys.readouterr().out
+    assert "mean perplexity_ratio_vs_baseline=n/a" in out
+    assert "mean js_divergence_vs_baseline=n/a" in out
+
+
+def test_print_summary_callback_is_isolated_by_composite_when_it_raises(monkeypatch):
+    # Even if PrintSummaryCallback somehow raised, CompositeCallback must
+    # isolate it exactly like any other callback.
+    def _boom(self, event):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(PrintSummaryCallback, "on_event", _boom)
+    composite = CompositeCallback([PrintSummaryCallback(every=1)])
+    composite.on_event(_generation_event(1))  # must not raise

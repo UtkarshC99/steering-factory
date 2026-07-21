@@ -47,6 +47,10 @@ def _patch_tokenizer_special_tokens_compat():
 # resolves and is indexable.
 COMMON_LAYER_PATHS = [
     "model.layers",          # Llama, Mistral, Qwen2, Gemma/Gemma2, Yi, ...
+    "model.language_model.layers",  # Gemma-3, PaliGemma, and other text+vision
+                                     # wrappers where AutoModelForCausalLM resolves
+                                     # to a *ForConditionalGeneration class whose
+                                     # text decoder is nested under .language_model
     "transformer.h",          # GPT-2 family
     "gpt_neox.layers",         # GPT-NeoX, Pythia
     "model.decoder.layers",     # OPT, BLOOM-style decoder wrappers
@@ -83,6 +87,35 @@ def resolve_layers(model, override_path: Optional[str] = None):
         "Set target_model.layer_path_override in config.yaml (e.g. "
         "'model.layers') to the dotted attribute path of the ModuleList "
         "of decoder blocks."
+    )
+
+
+def _resolve_hidden_size(config, layers) -> int:
+    """Text-decoder hidden size -- the width of the residual stream we hook
+    into, which is what extraction/steering actually operate on.
+
+    Tried in order: the config's own top-level field (works for plain text
+    models); `text_config.hidden_size` (Gemma-3 and other text+vision
+    wrappers nest the text decoder's config there since the top-level
+    config only has `text_config`/`vision_config`, no `hidden_size` of its
+    own); finally the resolved decoder layer's actual input projection
+    shape, which is architecture-agnostic ground truth read straight off
+    the loaded weights rather than a config-structure guess."""
+    hidden_size = getattr(config, "hidden_size", None) or getattr(config, "n_embd", None)
+    if hidden_size:
+        return hidden_size
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        hidden_size = getattr(text_config, "hidden_size", None) or getattr(text_config, "n_embd", None)
+        if hidden_size:
+            return hidden_size
+    if len(layers) > 0:
+        for param in layers[0].parameters():
+            if param.dim() >= 1:
+                return param.shape[-1]
+    raise RuntimeError(
+        "Could not resolve the text decoder's hidden size from the model config "
+        "or its first decoder layer's weights."
     )
 
 
@@ -132,9 +165,7 @@ def load_model(cfg: TargetModelConfig) -> LoadedModel:
 
     layers, layer_path = resolve_layers(model, cfg.layer_path_override)
     num_layers = len(layers)
-    hidden_size = getattr(model.config, "hidden_size", None) or getattr(
-        model.config, "n_embd", None
-    )
+    hidden_size = _resolve_hidden_size(model.config, layers)
     device = str(next(model.parameters()).device)
 
     logger.info(
