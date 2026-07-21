@@ -9,6 +9,7 @@ pyyaml
 streamlit>=1.36
 pandas
 plotly
+ipywidgets>=8.0   # required for plotly FigureWidget live updates in live_plot.py (notebook-only)
 anthropic
 openai
 pytest

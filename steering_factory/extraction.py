@@ -7,6 +7,7 @@ from typing import List, Dict, Optional, Literal
 import numpy as np
 import torch
 
+from .callbacks import RunCallback, _safe
 from .hooks import ActivationCapture, SteeringHook
 from .model_utils import LoadedModel, format_chat
 
@@ -197,6 +198,7 @@ def optimized_vector(
     lr: float = 0.05,
     coefficient: float = 1.0,
     max_pairs_per_step: Optional[int] = None,
+    callback: Optional[RunCallback] = None,
 ) -> ExtractionResult:
     """BiPO-lite: optimizes the vector by gradient descent to maximize
     logp(compliant) - logp(non_compliant) under teacher forcing, with the
@@ -209,6 +211,11 @@ def optimized_vector(
     step); keep `pairs` small (8-16) and `steps` modest (20-60) unless you
     have a lot of GPU time to spare. Cross-check the result against the
     held-out spectrum -- this method overfits small pair sets easily.
+
+    `callback`, if given, receives one `"opt_step"` event per gradient step
+    (this is the one extraction method with a real per-step loss curve --
+    the closed-form methods below have nothing analogous to emit). Always
+    `None` from the CLI; see `callbacks.py`.
     """
     device = next(loaded.model.parameters()).device
     layer_module = loaded.layers[layer_idx]
@@ -233,9 +240,12 @@ def optimized_vector(
             step_loss = step_loss - (pos_logp - neg_logp)
         step_loss = step_loss / max(len(use_pairs), 1)
         step_loss.backward()
+        grad_norm = float(vec.grad.norm().detach().cpu()) if vec.grad is not None else None
         optimizer.step()
         history.append(float(step_loss.detach().cpu()))
         logger.debug("optimized_vector step %d loss %.4f", step, history[-1])
+        _safe(callback, {"arm": "extract", "event": "opt_step", "i": step + 1, "n": steps,
+                          "layer_idx": layer_idx, "loss": history[-1], "grad_norm": grad_norm})
 
     final_vec = vec.detach().cpu()
     convergence = [{"n": i + 1, "cos_to_final": None, "loss": v} for i, v in enumerate(history)]
@@ -252,8 +262,15 @@ def extract(
     layer_idx: int,
     pairs: List[Dict],
     pooling: Pooling = "last",
+    callback: Optional[RunCallback] = None,
     **kwargs,
 ) -> ExtractionResult:
+    """`callback` is accepted here for every method for a uniform call site
+    in runner.py, but only `optimized` (BiPO-lite) has a real per-step loss
+    curve to emit -- the closed-form methods (mean_diff/pca/whitened) are
+    each a single computation with nothing analogous to a training step, so
+    `callback` is silently unused for them rather than forwarded and
+    rejected as an unexpected kwarg."""
     if method == "mean_diff":
         return mean_diff_vector(loaded, layer_idx, pairs, pooling, **kwargs)
     if method == "pca":
@@ -262,5 +279,5 @@ def extract(
         return whitened_mean_diff_vector(loaded, layer_idx, pairs, pooling, **kwargs)
     if method == "optimized":
         init = mean_diff_vector(loaded, layer_idx, pairs, pooling, track_convergence=False).vector
-        return optimized_vector(loaded, layer_idx, pairs, init_vector=init, **kwargs)
+        return optimized_vector(loaded, layer_idx, pairs, init_vector=init, callback=callback, **kwargs)
     raise ValueError(f"Unknown extraction method: {method}")

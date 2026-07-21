@@ -83,6 +83,17 @@ class ArtifactStore:
                 handle.write(json.dumps(row, default=str) + "\n")
         return path
 
+    def append_jsonl(self, relative: str, row: Dict[str, Any]) -> Path:
+        """Append one row to a JSONL file, creating it on first use. Used for
+        incremental progress logs written during a run rather than once at
+        the end -- a crashed or interrupted run still leaves a partial,
+        readable trace under this path."""
+        path = self.path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, default=str) + "\n")
+        return path
+
     def write_table(self, stem: str, rows: Iterable[Dict[str, Any]]) -> None:
         """Write JSONL always and Parquet when the runtime supports it."""
         materialized = list(rows)
