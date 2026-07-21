@@ -1,5 +1,6 @@
 torch>=2.1
 transformers>=5.0   # v4.x chokes on newer tokenizer_config.json formats (extra_special_tokens as list)
+huggingface_hub>=0.24   # login() for gated models (e.g. google/gemma-3-4b-it), used directly by the Colab notebook
 accelerate>=0.33
 bitsandbytes>=0.43; platform_system != "Darwin"
 sentencepiece
