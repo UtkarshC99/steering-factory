@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from .artifacts import ArtifactStore, fingerprint_records
 from .behaviors import get_behavior
+from .callbacks import RunCallback, _safe
 from .datasets import build_adapter, leakage_report, stable_split
 from .experiment_types import SplitPlan
 from .evaluators import aggregate
@@ -88,12 +89,32 @@ def _resolve_layers(layers: List[Any], num_layers: int) -> List[int]:
     return sorted(set(resolved))
 
 
-def run_extract(manifest: Dict[str, Any], command: str | None = None) -> ArtifactStore:
+def _count_extract_units(manifest: Dict[str, Any], examples: List[Dict[str, Any]], num_layers_by_model: Dict[str, int]) -> int:
+    """Total (model, recipe, method, layer) extraction units, for progress denominators."""
+    recipe_map = {r["id"]: r for r in manifest["recipes"]}
+    total = 0
+    for model_cfg in manifest["models"]:
+        num_layers = num_layers_by_model.get(model_cfg.get("id"))
+        for recipe_id, recipe in recipe_map.items():
+            steer = [e for e in examples if e["recipe_id"] == recipe_id and e["split"] == "steer"]
+            if not steer or num_layers is None:
+                continue
+            methods = recipe.get("extraction", ["mean_diff"])
+            layers = recipe.get("application", {}).get("layers", [0.6])
+            total += len(methods) * len(_resolve_layers(layers, num_layers))
+    return total
+
+
+def run_extract(manifest: Dict[str, Any], command: str | None = None, callback: Optional[RunCallback] = None) -> ArtifactStore:
     """Extract and persist steering vectors only -- no generation/evaluation.
 
     Cheap to iterate on: swap extraction methods or layer grids without
     re-running the (much more expensive) generation sweep. `run_evaluate`
     consumes the vectors this writes under `vectors/`.
+
+    `callback`, if given, receives one `on_event` call per extracted vector
+    plus a final `"extract_done"` event. Always `None` from the CLI -- see
+    `callbacks.py` for why this can never change subprocess/CLI behavior.
     """
     import torch
     from . import extraction
@@ -106,6 +127,7 @@ def run_extract(manifest: Dict[str, Any], command: str | None = None) -> Artifac
         examples = _load_normalized_records(manifest, store)
         recipe_map = {r["id"]: r for r in manifest["recipes"]}
         vector_rows: List[Dict[str, Any]] = []
+        done = 0
         for model_cfg in manifest["models"]:
             fields = {key: value for key, value in model_cfg.items() if key in TargetModelConfig.__dataclass_fields__}
             loaded = load_model(TargetModelConfig(**fields))
@@ -115,6 +137,7 @@ def run_extract(manifest: Dict[str, Any], command: str | None = None) -> Artifac
                 "model_revision": getattr(loaded.model.config, "_commit_hash", None),
                 "tokenizer_revision": getattr(loaded.tokenizer, "init_kwargs", {}).get("_commit_hash"),
             })
+            total = _count_extract_units(manifest, examples, {model_cfg.get("id"): loaded.num_layers})
             for recipe_id, recipe in recipe_map.items():
                 recipe_examples = [e for e in examples if e["recipe_id"] == recipe_id]
                 steer = [e for e in recipe_examples if e["split"] == "steer"]
@@ -127,16 +150,22 @@ def run_extract(manifest: Dict[str, Any], command: str | None = None) -> Artifac
                 resolved_layers = _resolve_layers(layers, loaded.num_layers)
                 for method in methods:
                     for layer_idx in resolved_layers:
-                        result = extraction.extract(method, loaded, layer_idx, pairs)
+                        result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback)
                         metadata = {"model": model_cfg.get("name_or_path"), "model_id": model_cfg.get("id"),
                                     "hidden_size": loaded.hidden_size, "layer_idx": layer_idx, "method": method,
                                     "recipe_id": recipe_id, "num_pairs": len(pairs), "convergence": result.convergence}
                         vector_path = store.save_vector(f"{model_cfg.get('id', 'model')}__{recipe_id}__{method}__L{layer_idx}", result.vector, metadata)
                         vector_rows.append({**metadata, "vector_path": str(vector_path), "vector_norm": float(result.vector.norm())})
+                        done += 1
+                        _safe(callback, {"arm": "extract", "event": "vector", "i": done, "n": total,
+                                          "model_id": model_cfg.get("id"), "recipe_id": recipe_id,
+                                          "method": method, "layer_idx": layer_idx,
+                                          "vector_norm": float(result.vector.norm())})
             del loaded
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         store.write_table("vectors/index", vector_rows)
+        _safe(callback, {"arm": "extract", "event": "extract_done", "vectors": len(vector_rows)})
         telemetry = {"wall_time_s": time.perf_counter() - started,
                      "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
                      "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0,
@@ -162,12 +191,34 @@ def _load_vector_index(run_dir: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def run_evaluate(manifest: Dict[str, Any], vectors_run: str | Path, command: str | None = None) -> ArtifactStore:
+def _count_evaluate_units(vector_rows: List[Dict[str, Any]], recipe_map: Dict[str, Any], examples: List[Dict[str, Any]]) -> int:
+    """Total (vector, token_scope, example, coefficient) generation units."""
+    total = 0
+    for vrow in vector_rows:
+        recipe = recipe_map.get(vrow["recipe_id"])
+        if recipe is None:
+            continue
+        evaluate_examples = [e for e in examples if e["recipe_id"] == vrow["recipe_id"] and e["split"] in ("validation", "test")]
+        if not evaluate_examples:
+            continue
+        grid = recipe.get("application", {})
+        coefficients = grid.get("coefficients", [0.0, 1.0])
+        token_scopes = grid.get("token_scopes", ["all"])
+        n_coeffs = len(sorted(set([float(c) for c in coefficients] + [0.0])))
+        total += len(token_scopes) * len(evaluate_examples) * n_coeffs
+    return total
+
+
+def run_evaluate(manifest: Dict[str, Any], vectors_run: str | Path, command: str | None = None, callback: Optional[RunCallback] = None) -> ArtifactStore:
     """Load vectors saved by `run_extract` and execute the generation/eval grid.
 
     `vectors_run` is the artifact directory produced by a prior `extract`
     (or `run`) invocation. This lets you re-evaluate the same vectors under
     a different coefficient/token-scope grid without re-extracting them.
+
+    `callback`, if given, receives one `on_event` call per generated row
+    (with the perplexity-ratio/JS-divergence already computed for that
+    row) plus a final `"evaluate_done"` event. Always `None` from the CLI.
     """
     import torch
     from . import metrics, sweep
@@ -179,6 +230,8 @@ def run_evaluate(manifest: Dict[str, Any], vectors_run: str | Path, command: str
     try:
         examples = _load_normalized_records(manifest, store)
         recipe_map = {r["id"]: r for r in manifest["recipes"]}
+        total = _count_evaluate_units(vector_rows, recipe_map, examples)
+        done = 0
         rows: List[Dict[str, Any]] = []
         loaded_models: Dict[str, Any] = {}
 
@@ -225,21 +278,29 @@ def run_evaluate(manifest: Dict[str, Any], vectors_run: str | Path, command: str
                         else:
                             text, logp, probs = sweep.generate_with_steering(loaded, layer_idx, vector, coefficient, example["prompt"], max_new_tokens, token_scope)
                         score = _behavior_score(text, example)
-                        rows.append({"model_id": vrow["model_id"], "model_name": vrow["model"], "arm": "steering",
-                                     "recipe_id": recipe_id, "behavior_id": example["behavior_id"], "example_id": example["id"],
-                                     "split": example["split"], "category": example.get("category"), "method": method,
-                                     "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope, "prompt": example["prompt"],
-                                     "output": text, "latency_s": time.perf_counter() - before,
-                                     "tokens_generated": len(logp), "perplexity": metrics.perplexity_from_logprobs(logp),
-                                     "perplexity_ratio_vs_baseline": (metrics.perplexity_from_logprobs(logp) / metrics.perplexity_from_logprobs(baseline_logp)) if baseline_logp and metrics.perplexity_from_logprobs(baseline_logp) else None,
-                                     "js_divergence_vs_baseline": metrics.js_divergence(probs, baseline_probs) if probs is not None and baseline_probs is not None else None,
-                                     "repetition_score": metrics.repetition_score(text), "distinct_2": metrics.distinct_n(text, 2), **score})
+                        row = {"model_id": vrow["model_id"], "model_name": vrow["model"], "arm": "steering",
+                               "recipe_id": recipe_id, "behavior_id": example["behavior_id"], "example_id": example["id"],
+                               "split": example["split"], "category": example.get("category"), "method": method,
+                               "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope, "prompt": example["prompt"],
+                               "output": text, "latency_s": time.perf_counter() - before,
+                               "tokens_generated": len(logp), "perplexity": metrics.perplexity_from_logprobs(logp),
+                               "perplexity_ratio_vs_baseline": (metrics.perplexity_from_logprobs(logp) / metrics.perplexity_from_logprobs(baseline_logp)) if baseline_logp and metrics.perplexity_from_logprobs(baseline_logp) else None,
+                               "js_divergence_vs_baseline": metrics.js_divergence(probs, baseline_probs) if probs is not None and baseline_probs is not None else None,
+                               "repetition_score": metrics.repetition_score(text), "distinct_2": metrics.distinct_n(text, 2), **score}
+                        rows.append(row)
+                        done += 1
+                        _safe(callback, {"arm": "steering", "event": "generation", "i": done, "n": total,
+                                          "model_id": row["model_id"], "recipe_id": recipe_id, "method": method,
+                                          "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope,
+                                          "perplexity_ratio_vs_baseline": row["perplexity_ratio_vs_baseline"],
+                                          "js_divergence_vs_baseline": row["js_divergence_vs_baseline"]})
         del loaded_models
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         store.write_table("results/generations", rows)
         store.write_json("results/summary.json", aggregate(rows))
         store.write_json("results/vectors_source.json", {"source_run": str(source)})
+        _safe(callback, {"arm": "steering", "event": "evaluate_done", "rows": len(rows)})
         telemetry = {"wall_time_s": time.perf_counter() - started,
                      "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
                      "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0,
@@ -252,7 +313,7 @@ def run_evaluate(manifest: Dict[str, Any], vectors_run: str | Path, command: str
         raise
 
 
-def run_steering(manifest: Dict[str, Any], command: str | None = None) -> ArtifactStore:
+def run_steering(manifest: Dict[str, Any], command: str | None = None, callback: Optional[RunCallback] = None) -> ArtifactStore:
     """Execute the full extract + evaluate grid in one artifact, and persist
     raw, scored outputs. Convenience wrapper around `run_extract` followed
     by `run_evaluate` against the vectors it just wrote, kept as a single
@@ -261,6 +322,12 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None) -> Artifa
 
     This deliberately evaluates small manifest grids serially: results are
     auditable and Colab users can reduce models/recipes with dotted overrides.
+
+    `callback`, if given, receives `"vector"` events (one per extracted
+    vector) and `"generation"` events (one per generated+scored row), each
+    carrying an `i`/`n` progress pair. The CLI never passes one, so this
+    param existing has no effect on the `python -m steering_factory run`
+    subprocess path -- see `callbacks.py`.
     """
     import torch
     from . import extraction, metrics, sweep
@@ -274,6 +341,8 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None) -> Artifa
         recipe_map = {r["id"]: r for r in manifest["recipes"]}
         rows: List[Dict[str, Any]] = []
         vector_rows: List[Dict[str, Any]] = []
+        vectors_done = 0
+        generations_done = 0
         for model_cfg in manifest["models"]:
             fields = {key: value for key, value in model_cfg.items() if key in TargetModelConfig.__dataclass_fields__}
             loaded = load_model(TargetModelConfig(**fields))
@@ -283,6 +352,7 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None) -> Artifa
                 "model_revision": getattr(loaded.model.config, "_commit_hash", None),
                 "tokenizer_revision": getattr(loaded.tokenizer, "init_kwargs", {}).get("_commit_hash"),
             })
+            vectors_total = _count_extract_units(manifest, examples, {model_cfg.get("id"): loaded.num_layers})
             for recipe_id, recipe in recipe_map.items():
                 recipe_examples = [e for e in examples if e["recipe_id"] == recipe_id]
                 steer = [e for e in recipe_examples if e["split"] == "steer"]
@@ -296,14 +366,21 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None) -> Artifa
                 token_scopes = grid.get("token_scopes", ["all"])
                 layers = grid.get("layers", [0.6])
                 resolved_layers = _resolve_layers(layers, loaded.num_layers)
+                n_coeffs = len(sorted(set([float(c) for c in coefficients] + [0.0])))
+                generations_total = len(resolved_layers) * len(methods) * len(token_scopes) * len(evaluate) * n_coeffs
                 for method in methods:
                     for layer_idx in resolved_layers:
-                        result = extraction.extract(method, loaded, layer_idx, pairs)
+                        result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback)
                         metadata = {"model": model_cfg.get("name_or_path"), "model_id": model_cfg.get("id"),
                                     "hidden_size": loaded.hidden_size, "layer_idx": layer_idx, "method": method,
                                     "recipe_id": recipe_id, "num_pairs": len(pairs), "convergence": result.convergence}
                         vector_path = store.save_vector(f"{model_cfg.get('id', 'model')}__{recipe_id}__{method}__L{layer_idx}", result.vector, metadata)
                         vector_rows.append({**metadata, "vector_path": str(vector_path), "vector_norm": float(result.vector.norm())})
+                        vectors_done += 1
+                        _safe(callback, {"arm": "steering", "event": "vector", "i": vectors_done, "n": vectors_total,
+                                          "model_id": model_cfg.get("id"), "recipe_id": recipe_id,
+                                          "method": method, "layer_idx": layer_idx,
+                                          "vector_norm": float(result.vector.norm())})
                         for token_scope in token_scopes:
                             for example in evaluate:
                                 baseline_text, baseline_logp, baseline_probs = sweep.generate_with_steering(
@@ -317,15 +394,22 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None) -> Artifa
                                     else:
                                         text, logp, probs = sweep.generate_with_steering(loaded, layer_idx, result.vector, coefficient, example["prompt"], manifest.get("decoding", {}).get("max_new_tokens", 96), token_scope)
                                     score = _behavior_score(text, example)
-                                    rows.append({"model_id": model_cfg.get("id"), "model_name": model_cfg.get("name_or_path"), "arm": "steering",
-                                                 "recipe_id": recipe_id, "behavior_id": example["behavior_id"], "example_id": example["id"],
-                                                 "split": example["split"], "category": example.get("category"), "method": method,
-                                                 "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope, "prompt": example["prompt"],
-                                                 "output": text, "latency_s": time.perf_counter() - before,
-                                                 "tokens_generated": len(logp), "perplexity": metrics.perplexity_from_logprobs(logp),
-                                                 "perplexity_ratio_vs_baseline": (metrics.perplexity_from_logprobs(logp) / metrics.perplexity_from_logprobs(baseline_logp)) if baseline_logp and metrics.perplexity_from_logprobs(baseline_logp) else None,
-                                                 "js_divergence_vs_baseline": metrics.js_divergence(probs, baseline_probs) if probs is not None and baseline_probs is not None else None,
-                                                 "repetition_score": metrics.repetition_score(text), "distinct_2": metrics.distinct_n(text, 2), **score})
+                                    row = {"model_id": model_cfg.get("id"), "model_name": model_cfg.get("name_or_path"), "arm": "steering",
+                                           "recipe_id": recipe_id, "behavior_id": example["behavior_id"], "example_id": example["id"],
+                                           "split": example["split"], "category": example.get("category"), "method": method,
+                                           "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope, "prompt": example["prompt"],
+                                           "output": text, "latency_s": time.perf_counter() - before,
+                                           "tokens_generated": len(logp), "perplexity": metrics.perplexity_from_logprobs(logp),
+                                           "perplexity_ratio_vs_baseline": (metrics.perplexity_from_logprobs(logp) / metrics.perplexity_from_logprobs(baseline_logp)) if baseline_logp and metrics.perplexity_from_logprobs(baseline_logp) else None,
+                                           "js_divergence_vs_baseline": metrics.js_divergence(probs, baseline_probs) if probs is not None and baseline_probs is not None else None,
+                                           "repetition_score": metrics.repetition_score(text), "distinct_2": metrics.distinct_n(text, 2), **score}
+                                    rows.append(row)
+                                    generations_done += 1
+                                    _safe(callback, {"arm": "steering", "event": "generation", "i": generations_done, "n": generations_total,
+                                                      "model_id": row["model_id"], "recipe_id": recipe_id, "method": method,
+                                                      "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope,
+                                                      "perplexity_ratio_vs_baseline": row["perplexity_ratio_vs_baseline"],
+                                                      "js_divergence_vs_baseline": row["js_divergence_vs_baseline"]})
             del loaded
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -336,6 +420,7 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None) -> Artifa
                      "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0,
                      "rows": len(rows), "vectors": len(vector_rows)}
         store.write_json("telemetry.json", telemetry)
+        _safe(callback, {"arm": "steering", "event": "run_done", "rows": len(rows), "vectors": len(vector_rows)})
         store.finalize()
         return store
     except Exception as error:
@@ -343,13 +428,19 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None) -> Artifa
         raise
 
 
-def run_qlora(manifest: Dict[str, Any], command: str | None = None) -> ArtifactStore:
+def run_qlora(manifest: Dict[str, Any], command: str | None = None, callback: Optional[RunCallback] = None) -> ArtifactStore:
     """Train a separate matched adapter per model/recipe steer set, then
     evaluate each adapter on the same validation/test examples the steering
     arm uses, scored with the identical evaluator (`_behavior_score`). This
     is what makes `compare` able to do a matched quality/cost comparison
     instead of just diffing run metadata: both arms end up with
     `results/generations.jsonl` rows in the same schema.
+
+    `callback`, if given, is forwarded into `train_qlora` where it receives
+    one `on_log`-derived `"train_log"` event per `logging_steps` (loss,
+    grad_norm, learning_rate, epoch) via a small TrainerCallback adapter,
+    plus `"adapter_done"`/`"eval_generation"` events around evaluation.
+    Always `None` from the CLI -- see `callbacks.py`.
     """
     import time as _time
     from .finetune import evaluate_qlora_adapter, train_qlora
@@ -370,8 +461,11 @@ def run_qlora(manifest: Dict[str, Any], command: str | None = None) -> ArtifactS
                 if not train_records:
                     continue
                 qlora_config = {**config, "model_name": model["name_or_path"], "output_dir": str(store.path / "qlora" / model["id"] / recipe["id"])}
-                train_result = train_qlora(train_records, qlora_config)
+                train_result = train_qlora(train_records, qlora_config, callback=callback,
+                                            callback_context={"model_id": model["id"], "recipe_id": recipe["id"]})
                 results.append({"model_id": model["id"], "recipe_id": recipe["id"], "num_train_records": len(train_records), **train_result})
+                _safe(callback, {"arm": "qlora", "event": "adapter_done", "model_id": model["id"], "recipe_id": recipe["id"],
+                                  "train_loss": train_result.get("train_loss"), "global_step": train_result.get("global_step")})
 
                 if not eval_examples:
                     continue
@@ -386,12 +480,15 @@ def run_qlora(manifest: Dict[str, Any], command: str | None = None) -> ArtifactS
                     eval_rows.append({"model_id": model["id"], "model_name": model["name_or_path"],
                                        "recipe_id": recipe["id"], "arm": "qlora",
                                        "num_train_records": len(train_records), **row, **score})
+                    _safe(callback, {"arm": "qlora", "event": "eval_generation", "model_id": model["id"],
+                                      "recipe_id": recipe["id"], "example_id": row["example_id"]})
                 results[-1]["eval_wall_time_s"] = _time.perf_counter() - eval_started
                 results[-1]["eval_records"] = len(eval_examples)
         store.write_json("results/qlora.json", results)
         if eval_rows:
             store.write_table("results/generations", eval_rows)
             store.write_json("results/summary.json", aggregate(eval_rows))
+        _safe(callback, {"arm": "qlora", "event": "qlora_done", "adapters": len(results)})
         store.finalize()
         return store
     except Exception as error:

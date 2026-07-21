@@ -5,6 +5,8 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
+from .callbacks import RunCallback, _safe
+
 
 def qlora_available() -> bool:
     try:
@@ -15,12 +17,46 @@ def qlora_available() -> bool:
         return False
 
 
-def train_qlora(records: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, Any]:
+def _build_trainer_callback(callback: Optional[RunCallback], context: Dict[str, Any]):
+    """Wraps a RunCallback as a transformers.TrainerCallback, forwarding
+    HF's own `on_log` events (loss/grad_norm/learning_rate/epoch, emitted
+    every `logging_steps`) as `"train_log"` events. Returns None if no
+    callback was given, so `Trainer(callbacks=[x] if x else [])` stays a
+    no-op path identical to before this existed."""
+    if callback is None:
+        return None
+    from transformers import TrainerCallback
+
+    class _Forwarder(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            logs = logs or {}
+            _safe(callback, {"arm": "qlora", "event": "train_log", "step": state.global_step,
+                              "max_steps": state.max_steps if state.max_steps and state.max_steps > 0 else None,
+                              "epoch": logs.get("epoch"), "loss": logs.get("loss"),
+                              "grad_norm": logs.get("grad_norm"), "learning_rate": logs.get("learning_rate"),
+                              **context})
+
+    return _Forwarder()
+
+
+def train_qlora(
+    records: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    callback: Optional[RunCallback] = None,
+    callback_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Train a matched QLoRA adapter when optional dependencies are present.
 
     The caller supplies already-normalized records, preserving identical split
     and prompt formatting to the steering arm. Full trainer configuration is
     recorded by the runner manifest instead of hidden in this function.
+
+    `callback`, if given, receives one `"train_log"` event per
+    `logging_steps` (HF's own `Trainer` instrumentation, just forwarded
+    instead of discarded) via a small `TrainerCallback` adapter.
+    `callback_context` (e.g. `{"model_id", "recipe_id"}`) is merged into
+    every emitted event so a multi-model/multi-recipe run's events stay
+    attributable. Always `None` from the CLI; see `callbacks.py`.
     """
     if not qlora_available():
         raise RuntimeError("QLoRA requires optional dependencies: pip install peft trl datasets")
@@ -59,14 +95,18 @@ def train_qlora(records: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[s
         max_steps=int(config.get("max_steps", -1)), learning_rate=float(config.get("learning_rate", 2e-4)),
         per_device_train_batch_size=int(config.get("batch_size", 1)), gradient_accumulation_steps=int(config.get("gradient_accumulation_steps", 8)),
         logging_steps=int(config.get("logging_steps", 5)), save_strategy="no", report_to=[])
+    trainer_callback = _build_trainer_callback(callback, callback_context or {})
     trainer = Trainer(model=model, args=args, train_dataset=dataset,
-        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, label_pad_token_id=-100, padding=True))
+        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, label_pad_token_id=-100, padding=True),
+        callbacks=[trainer_callback] if trainer_callback is not None else None)
     output = trainer.train()
     model.save_pretrained(config["output_dir"])
     tokenizer.save_pretrained(config["output_dir"])
     size = sum(os.path.getsize(os.path.join(root, file)) for root, _, files in os.walk(config["output_dir"]) for file in files)
+    log_history = list(trainer.state.log_history)
     return {"records": len(records), "wall_time_s": time.perf_counter() - started, "train_loss": output.training_loss,
-            "global_step": output.global_step, "adapter_dir": config["output_dir"], "adapter_size_bytes": size}
+            "global_step": output.global_step, "adapter_dir": config["output_dir"], "adapter_size_bytes": size,
+            "log_history": log_history}
 
 
 def evaluate_qlora_adapter(
