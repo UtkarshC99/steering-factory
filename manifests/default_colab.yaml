@@ -20,6 +20,21 @@ splits:
   steer_fraction: 0.2
   validation_fraction: 0.2
   group_key: category
+decoding:
+  max_new_tokens: 96
+  # Examples are batched together (left-padded) at each fixed
+  # (method, layer, coefficient, token_scope) rather than generated one at
+  # a time -- see GPU-batching plan for the L4/22.5GB VRAM sizing this
+  # value is based on (Gemma-3's 262k vocab is the binding memory
+  # constraint via retained generation scores, not KV cache). Also used as
+  # the QLoRA arm's evaluate_qlora_adapter batch size.
+  batch_size: 16
+extraction:
+  # Batches this many (compliant, non_compliant) pairs' worth of forward
+  # passes together per extraction method. Plain forward passes (no
+  # autoregression, no retained scores), so cheaper per row than
+  # generation -- same batch_size is a safe default for both.
+  batch_size: 16
 recipes:
   # Dataset mappings are intentionally explicit so benchmark revisions and
   # licenses can be reviewed before a Colab run.
@@ -60,3 +75,8 @@ finetune:
   matched_split: steer
   max_steps: 200
   target_modules: [q_proj, k_proj, v_proj, o_proj]
+  # Effective batch size stays 4*2=8 (unchanged from the old 1*8 default)
+  # -- training dynamics and the resulting adapter are identical, only
+  # micro-batch throughput improves. See GPU-batching plan.
+  batch_size: 4
+  gradient_accumulation_steps: 2

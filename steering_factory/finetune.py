@@ -93,7 +93,11 @@ def train_qlora(
     dataset = Dataset.from_list(records).map(tokenize, remove_columns=list(records[0].keys()))
     args = TrainingArguments(output_dir=config["output_dir"], num_train_epochs=float(config.get("epochs", 1)),
         max_steps=int(config.get("max_steps", -1)), learning_rate=float(config.get("learning_rate", 2e-4)),
-        per_device_train_batch_size=int(config.get("batch_size", 1)), gradient_accumulation_steps=int(config.get("gradient_accumulation_steps", 8)),
+        # Defaults 4/2 (was 1/8): effective batch size stays 4*2=8, unchanged
+        # from 1*8 -- training dynamics and the resulting adapter are
+        # identical, only micro-batch throughput improves. See
+        # GPU-batching plan for the L4/22.5GB VRAM sizing this is based on.
+        per_device_train_batch_size=int(config.get("batch_size", 4)), gradient_accumulation_steps=int(config.get("gradient_accumulation_steps", 2)),
         logging_steps=int(config.get("logging_steps", 5)), save_strategy="no", report_to=[])
     trainer_callback = _build_trainer_callback(callback, callback_context or {})
     trainer = Trainer(model=model, args=args, train_dataset=dataset,
@@ -109,12 +113,70 @@ def train_qlora(
             "log_history": log_history}
 
 
+def _generate_batched_rows(
+    model, tokenizer, examples: List[Dict[str, Any]], max_new_tokens: int, batch_size: int,
+) -> List[Dict[str, Any]]:
+    """The actual batched-generation loop, factored out of
+    `evaluate_qlora_adapter` so it's testable against a plain (unquantized,
+    non-PEFT) tiny model -- quantization/PEFT loading can't run without a
+    real CUDA GPU, but the batching/padding/score-reduction logic here has
+    nothing to do with either and is exactly what needs a correctness
+    guarantee (see tests/test_finetune_batching.py).
+
+    Same pattern as sweep.generate_with_steering_batch: left-padded batch,
+    scores reduced to chosen-token logprob per step (no steering hook or
+    JS-divergence baseline needed here, so first_step_probs is discarded).
+    `latency_s` is amortized (`batch_wall_time_s / batch_size`);
+    `batch_size`/`batch_wall_time_s` are recorded alongside it per row so
+    cost analysis can tell measured-per-row apart from amortized-per-row,
+    matching the steering arm's row schema."""
+    import torch
+
+    from .model_utils import format_chat
+    from .sweep import _reduce_scores
+
+    device = next(model.parameters()).device
+    rows: List[Dict[str, Any]] = []
+    for start in range(0, len(examples), batch_size):
+        chunk = examples[start : start + batch_size]
+        prompt_texts = [format_chat(tokenizer, example["prompt"]) for example in chunk]
+
+        original_padding_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        try:
+            enc = tokenizer(prompt_texts, return_tensors="pt", padding=True).to(device)
+        finally:
+            tokenizer.padding_side = original_padding_side
+        prompt_len = enc["input_ids"].shape[1]
+
+        before = time.perf_counter()
+        with torch.no_grad():
+            out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
+                                  output_scores=True, return_dict_in_generate=True,
+                                  pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
+        batch_wall_time_s = time.perf_counter() - before
+
+        for row, example in enumerate(chunk):
+            gen_ids_row = out.sequences[row][prompt_len:]
+            text = tokenizer.decode(gen_ids_row, skip_special_tokens=True)
+            row_scores = [step_logits[row : row + 1] for step_logits in out.scores]
+            token_logprobs, _ = _reduce_scores(row_scores, gen_ids_row)
+            rows.append({
+                "example_id": example["id"], "behavior_id": example["behavior_id"], "split": example["split"],
+                "category": example.get("category"), "prompt": example["prompt"], "output": text,
+                "latency_s": batch_wall_time_s / len(chunk), "batch_size": len(chunk),
+                "batch_wall_time_s": batch_wall_time_s, "tokens_generated": len(token_logprobs),
+            })
+    return rows
+
+
 def evaluate_qlora_adapter(
     examples: List[Dict[str, Any]],
     model_name: str,
     adapter_dir: str,
     max_new_tokens: int = 96,
     trust_remote_code: bool = False,
+    batch_size: int = 16,
 ) -> Dict[str, Any]:
     """Generate on `examples` (validation/test split) with the base model +
     trained QLoRA adapter, returning per-example rows in the same shape as
@@ -130,7 +192,6 @@ def evaluate_qlora_adapter(
     import torch
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    from .model_utils import format_chat
 
     started = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
@@ -141,29 +202,8 @@ def evaluate_qlora_adapter(
                                                  trust_remote_code=trust_remote_code)
     model = PeftModel.from_pretrained(base, adapter_dir)
     model.eval()
-    device = next(model.parameters()).device
 
-    rows = []
-    for example in examples:
-        prompt_text = format_chat(tokenizer, example["prompt"])
-        enc = tokenizer(prompt_text, return_tensors="pt").to(device)
-        before = time.perf_counter()
-        with torch.no_grad():
-            out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False,
-                                  output_scores=True, return_dict_in_generate=True,
-                                  pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
-        gen_ids = out.sequences[0][enc["input_ids"].shape[1]:]
-        text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-        token_logprobs = []
-        for i, step_logits in enumerate(out.scores):
-            logp = torch.log_softmax(step_logits.float(), dim=-1)[0]
-            if i < gen_ids.shape[0]:
-                token_logprobs.append(float(logp[gen_ids[i]].item()))
-        rows.append({
-            "example_id": example["id"], "behavior_id": example["behavior_id"], "split": example["split"],
-            "category": example.get("category"), "prompt": example["prompt"], "output": text,
-            "latency_s": time.perf_counter() - before, "tokens_generated": len(token_logprobs),
-        })
+    rows = _generate_batched_rows(model, tokenizer, examples, max_new_tokens, batch_size)
 
     del model, base
     if torch.cuda.is_available():

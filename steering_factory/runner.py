@@ -128,6 +128,7 @@ def run_extract(manifest: Dict[str, Any], command: str | None = None, callback: 
         recipe_map = {r["id"]: r for r in manifest["recipes"]}
         vector_rows: List[Dict[str, Any]] = []
         done = 0
+        extraction_batch_size = manifest.get("extraction", {}).get("batch_size", 16)
         for model_cfg in manifest["models"]:
             fields = {key: value for key, value in model_cfg.items() if key in TargetModelConfig.__dataclass_fields__}
             loaded = load_model(TargetModelConfig(**fields))
@@ -150,7 +151,7 @@ def run_extract(manifest: Dict[str, Any], command: str | None = None, callback: 
                 resolved_layers = _resolve_layers(layers, loaded.num_layers)
                 for method in methods:
                     for layer_idx in resolved_layers:
-                        result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback)
+                        result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback, batch_size=extraction_batch_size)
                         metadata = {"model": model_cfg.get("name_or_path"), "model_id": model_cfg.get("id"),
                                     "hidden_size": loaded.hidden_size, "layer_idx": layer_idx, "method": method,
                                     "recipe_id": recipe_id, "num_pairs": len(pairs), "convergence": result.convergence}
@@ -209,6 +210,92 @@ def _count_evaluate_units(vector_rows: List[Dict[str, Any]], recipe_map: Dict[st
     return total
 
 
+def _evaluate_vector_grid(
+    loaded: Any,
+    vector: Any,
+    layer_idx: int,
+    method: str,
+    recipe_id: str,
+    model_id: Optional[str],
+    model_name: Optional[str],
+    evaluate_examples: List[Dict[str, Any]],
+    coefficients: List[float],
+    token_scopes: List[str],
+    max_new_tokens: int,
+    batch_size: int,
+    callback: Optional[RunCallback],
+    progress: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    """Generates and scores every (token_scope, coefficient, example) row
+    for one already-extracted vector, batching examples together at each
+    fixed (token_scope, coefficient) -- the axis every row in a batch can
+    share, since one `SteeringHook` carries one coefficient/vector for its
+    whole active scope (see sweep.generate_with_steering_batch). This is
+    the single implementation shared by `run_evaluate` and `run_steering`,
+    which used to duplicate this loop; extracted so a future change to the
+    grid/batching logic can't drift between the two.
+
+    Emits one `"generation"` callback event PER ROW (not per batch), so
+    live plots and PrintSummaryCallback's cadence are unaffected by
+    batch_size -- `progress` is a shared mutable {"done": int, "total": int}
+    dict so callers can track one running count across multiple vectors.
+
+    `latency_s` on each row is amortized from the batch's measured wall
+    time (`batch_wall_time_s / batch_size`); both are kept on the row so
+    downstream cost analysis (e.g. the steering-vs-QLoRA comparison) can
+    tell measured-per-row apart from amortized-per-row rather than
+    silently trusting the amortized number as a per-row measurement."""
+    from . import metrics, sweep
+
+    rows: List[Dict[str, Any]] = []
+    all_coefficients = sorted(set([float(c) for c in coefficients] + [0.0]))
+    prompts = [e["prompt"] for e in evaluate_examples]
+
+    for token_scope in token_scopes:
+        # Baseline (coefficient 0.0) is computed once per example per
+        # token_scope and reused for every other coefficient's
+        # perplexity-ratio/JS-divergence-vs-baseline -- unchanged from the
+        # pre-batching loop's behavior, just computed for the whole batch
+        # of examples in one call instead of one example at a time.
+        baseline_results = sweep.generate_with_steering_batch(
+            loaded, layer_idx, vector, 0.0, prompts, max_new_tokens, token_scope,
+        )
+        results_by_coefficient: Dict[float, List] = {0.0: baseline_results}
+        for coefficient in all_coefficients:
+            if coefficient == 0.0:
+                continue
+            results_by_coefficient[coefficient] = sweep.generate_with_steering_batch(
+                loaded, layer_idx, vector, coefficient, prompts, max_new_tokens, token_scope,
+            )
+
+        for example_idx, example in enumerate(evaluate_examples):
+            baseline = baseline_results[example_idx]
+            baseline_ppl = metrics.perplexity_from_logprobs(baseline.token_logprobs)
+            for coefficient in all_coefficients:
+                result = results_by_coefficient[coefficient][example_idx]
+                text, logp, probs = result.text, result.token_logprobs, result.first_step_probs
+                score = _behavior_score(text, example)
+                ppl = metrics.perplexity_from_logprobs(logp)
+                row = {"model_id": model_id, "model_name": model_name, "arm": "steering",
+                       "recipe_id": recipe_id, "behavior_id": example["behavior_id"], "example_id": example["id"],
+                       "split": example["split"], "category": example.get("category"), "method": method,
+                       "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope, "prompt": example["prompt"],
+                       "output": text, "latency_s": result.latency_s, "batch_size": result.batch_size,
+                       "batch_wall_time_s": result.batch_wall_time_s,
+                       "tokens_generated": len(logp), "perplexity": ppl,
+                       "perplexity_ratio_vs_baseline": (ppl / baseline_ppl) if baseline_ppl and baseline_ppl > 0 else None,
+                       "js_divergence_vs_baseline": metrics.js_divergence(probs, baseline.first_step_probs) if probs is not None and baseline.first_step_probs is not None else None,
+                       "repetition_score": metrics.repetition_score(text), "distinct_2": metrics.distinct_n(text, 2), **score}
+                rows.append(row)
+                progress["done"] += 1
+                _safe(callback, {"arm": "steering", "event": "generation", "i": progress["done"], "n": progress["total"],
+                                  "model_id": model_id, "recipe_id": recipe_id, "method": method,
+                                  "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope,
+                                  "perplexity_ratio_vs_baseline": row["perplexity_ratio_vs_baseline"],
+                                  "js_divergence_vs_baseline": row["js_divergence_vs_baseline"]})
+    return rows
+
+
 def run_evaluate(manifest: Dict[str, Any], vectors_run: str | Path, command: str | None = None, callback: Optional[RunCallback] = None) -> ArtifactStore:
     """Load vectors saved by `run_extract` and execute the generation/eval grid.
 
@@ -221,7 +308,6 @@ def run_evaluate(manifest: Dict[str, Any], vectors_run: str | Path, command: str
     row) plus a final `"evaluate_done"` event. Always `None` from the CLI.
     """
     import torch
-    from . import metrics, sweep
 
     source = Path(vectors_run)
     vector_rows = _load_vector_index(source)
@@ -230,10 +316,12 @@ def run_evaluate(manifest: Dict[str, Any], vectors_run: str | Path, command: str
     try:
         examples = _load_normalized_records(manifest, store)
         recipe_map = {r["id"]: r for r in manifest["recipes"]}
-        total = _count_evaluate_units(vector_rows, recipe_map, examples)
-        done = 0
+        progress = {"done": 0, "total": _count_evaluate_units(vector_rows, recipe_map, examples)}
         rows: List[Dict[str, Any]] = []
         loaded_models: Dict[str, Any] = {}
+        decoding_cfg = manifest.get("decoding", {})
+        max_new_tokens = decoding_cfg.get("max_new_tokens", 96)
+        batch_size = decoding_cfg.get("batch_size", 16)
 
         def _get_loaded(model_id: str, model_name: str):
             if model_id not in loaded_models:
@@ -264,36 +352,11 @@ def run_evaluate(manifest: Dict[str, Any], vectors_run: str | Path, command: str
             token_scopes = grid.get("token_scopes", ["all"])
             layer_idx = vrow["layer_idx"]
             method = vrow["method"]
-            max_new_tokens = manifest.get("decoding", {}).get("max_new_tokens", 96)
 
-            for token_scope in token_scopes:
-                for example in evaluate_examples:
-                    baseline_text, baseline_logp, baseline_probs = sweep.generate_with_steering(
-                        loaded, layer_idx, vector, 0.0, example["prompt"], max_new_tokens, token_scope,
-                    )
-                    for coefficient in sorted(set([float(c) for c in coefficients] + [0.0])):
-                        before = time.perf_counter()
-                        if coefficient == 0.0:
-                            text, logp, probs = baseline_text, baseline_logp, baseline_probs
-                        else:
-                            text, logp, probs = sweep.generate_with_steering(loaded, layer_idx, vector, coefficient, example["prompt"], max_new_tokens, token_scope)
-                        score = _behavior_score(text, example)
-                        row = {"model_id": vrow["model_id"], "model_name": vrow["model"], "arm": "steering",
-                               "recipe_id": recipe_id, "behavior_id": example["behavior_id"], "example_id": example["id"],
-                               "split": example["split"], "category": example.get("category"), "method": method,
-                               "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope, "prompt": example["prompt"],
-                               "output": text, "latency_s": time.perf_counter() - before,
-                               "tokens_generated": len(logp), "perplexity": metrics.perplexity_from_logprobs(logp),
-                               "perplexity_ratio_vs_baseline": (metrics.perplexity_from_logprobs(logp) / metrics.perplexity_from_logprobs(baseline_logp)) if baseline_logp and metrics.perplexity_from_logprobs(baseline_logp) else None,
-                               "js_divergence_vs_baseline": metrics.js_divergence(probs, baseline_probs) if probs is not None and baseline_probs is not None else None,
-                               "repetition_score": metrics.repetition_score(text), "distinct_2": metrics.distinct_n(text, 2), **score}
-                        rows.append(row)
-                        done += 1
-                        _safe(callback, {"arm": "steering", "event": "generation", "i": done, "n": total,
-                                          "model_id": row["model_id"], "recipe_id": recipe_id, "method": method,
-                                          "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope,
-                                          "perplexity_ratio_vs_baseline": row["perplexity_ratio_vs_baseline"],
-                                          "js_divergence_vs_baseline": row["js_divergence_vs_baseline"]})
+            rows.extend(_evaluate_vector_grid(
+                loaded, vector, layer_idx, method, recipe_id, vrow["model_id"], vrow["model"],
+                evaluate_examples, coefficients, token_scopes, max_new_tokens, batch_size, callback, progress,
+            ))
         del loaded_models
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -330,7 +393,7 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None, callback:
     subprocess path -- see `callbacks.py`.
     """
     import torch
-    from . import extraction, metrics, sweep
+    from . import extraction
     from .config import TargetModelConfig
     from .model_utils import load_model
 
@@ -343,6 +406,10 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None, callback:
         vector_rows: List[Dict[str, Any]] = []
         vectors_done = 0
         generations_done = 0
+        decoding_cfg = manifest.get("decoding", {})
+        max_new_tokens = decoding_cfg.get("max_new_tokens", 96)
+        batch_size = decoding_cfg.get("batch_size", 16)
+        extraction_batch_size = manifest.get("extraction", {}).get("batch_size", 16)
         for model_cfg in manifest["models"]:
             fields = {key: value for key, value in model_cfg.items() if key in TargetModelConfig.__dataclass_fields__}
             loaded = load_model(TargetModelConfig(**fields))
@@ -367,10 +434,15 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None, callback:
                 layers = grid.get("layers", [0.6])
                 resolved_layers = _resolve_layers(layers, loaded.num_layers)
                 n_coeffs = len(sorted(set([float(c) for c in coefficients] + [0.0])))
+                # generations_total is the per-recipe denominator (unchanged
+                # from before batching existed) -- generations_done keeps
+                # counting across the whole run, so "i" is monotonic but
+                # "n" changes when a new recipe starts. Preserved as-is;
+                # not something this batching change is meant to alter.
                 generations_total = len(resolved_layers) * len(methods) * len(token_scopes) * len(evaluate) * n_coeffs
                 for method in methods:
                     for layer_idx in resolved_layers:
-                        result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback)
+                        result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback, batch_size=extraction_batch_size)
                         metadata = {"model": model_cfg.get("name_or_path"), "model_id": model_cfg.get("id"),
                                     "hidden_size": loaded.hidden_size, "layer_idx": layer_idx, "method": method,
                                     "recipe_id": recipe_id, "num_pairs": len(pairs), "convergence": result.convergence}
@@ -381,35 +453,13 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None, callback:
                                           "model_id": model_cfg.get("id"), "recipe_id": recipe_id,
                                           "method": method, "layer_idx": layer_idx,
                                           "vector_norm": float(result.vector.norm())})
-                        for token_scope in token_scopes:
-                            for example in evaluate:
-                                baseline_text, baseline_logp, baseline_probs = sweep.generate_with_steering(
-                                    loaded, layer_idx, result.vector, 0.0, example["prompt"],
-                                    manifest.get("decoding", {}).get("max_new_tokens", 96), token_scope,
-                                )
-                                for coefficient in sorted(set([float(c) for c in coefficients] + [0.0])):
-                                    before = time.perf_counter()
-                                    if coefficient == 0.0:
-                                        text, logp, probs = baseline_text, baseline_logp, baseline_probs
-                                    else:
-                                        text, logp, probs = sweep.generate_with_steering(loaded, layer_idx, result.vector, coefficient, example["prompt"], manifest.get("decoding", {}).get("max_new_tokens", 96), token_scope)
-                                    score = _behavior_score(text, example)
-                                    row = {"model_id": model_cfg.get("id"), "model_name": model_cfg.get("name_or_path"), "arm": "steering",
-                                           "recipe_id": recipe_id, "behavior_id": example["behavior_id"], "example_id": example["id"],
-                                           "split": example["split"], "category": example.get("category"), "method": method,
-                                           "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope, "prompt": example["prompt"],
-                                           "output": text, "latency_s": time.perf_counter() - before,
-                                           "tokens_generated": len(logp), "perplexity": metrics.perplexity_from_logprobs(logp),
-                                           "perplexity_ratio_vs_baseline": (metrics.perplexity_from_logprobs(logp) / metrics.perplexity_from_logprobs(baseline_logp)) if baseline_logp and metrics.perplexity_from_logprobs(baseline_logp) else None,
-                                           "js_divergence_vs_baseline": metrics.js_divergence(probs, baseline_probs) if probs is not None and baseline_probs is not None else None,
-                                           "repetition_score": metrics.repetition_score(text), "distinct_2": metrics.distinct_n(text, 2), **score}
-                                    rows.append(row)
-                                    generations_done += 1
-                                    _safe(callback, {"arm": "steering", "event": "generation", "i": generations_done, "n": generations_total,
-                                                      "model_id": row["model_id"], "recipe_id": recipe_id, "method": method,
-                                                      "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope,
-                                                      "perplexity_ratio_vs_baseline": row["perplexity_ratio_vs_baseline"],
-                                                      "js_divergence_vs_baseline": row["js_divergence_vs_baseline"]})
+                        progress = {"done": generations_done, "total": generations_total}
+                        new_rows = _evaluate_vector_grid(
+                            loaded, result.vector, layer_idx, method, recipe_id, model_cfg.get("id"), model_cfg.get("name_or_path"),
+                            evaluate, coefficients, token_scopes, max_new_tokens, batch_size, callback, progress,
+                        )
+                        rows.extend(new_rows)
+                        generations_done = progress["done"]
             del loaded
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -452,7 +502,9 @@ def run_qlora(manifest: Dict[str, Any], command: str | None = None, callback: Op
             raise ValueError("Only the qlora fine-tuning backend is currently implemented.")
         results = []
         eval_rows: List[Dict[str, Any]] = []
-        max_new_tokens = manifest.get("decoding", {}).get("max_new_tokens", 96)
+        decoding_cfg = manifest.get("decoding", {})
+        max_new_tokens = decoding_cfg.get("max_new_tokens", 96)
+        eval_batch_size = decoding_cfg.get("batch_size", 16)
         for model in manifest["models"]:
             for recipe in manifest["recipes"]:
                 recipe_examples = [e for e in examples if e["recipe_id"] == recipe["id"]]
@@ -473,6 +525,7 @@ def run_qlora(manifest: Dict[str, Any], command: str | None = None, callback: Op
                 eval_result = evaluate_qlora_adapter(
                     eval_examples, model["name_or_path"], train_result["adapter_dir"],
                     max_new_tokens=max_new_tokens, trust_remote_code=bool(model.get("trust_remote_code", False)),
+                    batch_size=eval_batch_size,
                 )
                 for row in eval_result["rows"]:
                     example = next(e for e in eval_examples if e["id"] == row["example_id"])
