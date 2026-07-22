@@ -58,6 +58,47 @@ python -m steering_factory compare /path/to/steering-run /path/to/qlora-run \
 - If one path is a steering run (has `vectors/index.jsonl`) and the other is a QLoRA run (has `results/qlora.json`), `compare` builds the matched steering-vs-QLoRA quality/cost report: the best steering config is selected on validation only, held-out test quality is reported alongside QLoRA's held-out test quality for the same (model, recipe), and cost (wall time, labeled-example count, artifact size, ms/token) is normalized across both arms. Writes `report.json` and `report.md`.
 - For any other combination (two steering runs, more than two runs, an untrained/unevaluated QLoRA run), `compare` falls back to a plain run-metadata index (`comparison.json`) so it never hard-fails on legitimate non-comparison uses.
 
+## GPU batching
+
+Generation (the steering coefficient sweep and the QLoRA evaluation arm) and extraction
+(the closed-form methods' forward passes) batch multiple examples/pairs together per GPU
+call instead of running one at a time, controlled by two manifest fields:
+
+```yaml
+decoding:
+  max_new_tokens: 96
+  batch_size: 16   # examples per generate() call; also used by the QLoRA eval arm
+extraction:
+  batch_size: 16   # (compliant, non_compliant) pairs per forward pass
+finetune:
+  batch_size: 4                  # QLoRA micro-batch
+  gradient_accumulation_steps: 2  # effective batch size = batch_size * this, kept
+                                  # constant at 8 relative to the old 1x8 default so
+                                  # training dynamics and the resulting adapter don't change
+```
+
+Batching is done across examples/pairs at a fixed (method, layer, coefficient,
+token_scope) — the one axis every row in a batch can share, since one steering hook
+carries a single coefficient/vector for its whole active scope. It never batches across
+coefficients. Left-padding (the decoder-only convention) is used throughout and is
+required for correct results on this project's target architectures (Qwen3, Gemma-3; both
+RoPE + attention-mask-aware). Batching is verified bit-for-bit equivalent to batch size 1
+— same output text, logprobs, and JS divergence — across ragged prompt lengths and all
+three `token_scope` values; see `tests/test_sweep_batching.py`,
+`tests/test_extraction_batching.py`, `tests/test_finetune_batching.py`, and the end-to-end
+`tests/test_runner_batching_e2e.py`.
+
+`results/generations.jsonl` rows carry both `latency_s` (amortized: `batch_wall_time_s /
+batch_size`) and the measured `batch_wall_time_s`/`batch_size` alongside it, so cost
+analysis (including the steering-vs-QLoRA comparison) can distinguish a true per-row
+measurement from a batch-amortized estimate rather than silently treating one as the other.
+
+Default `batch_size: 16` is sized for an L4 (22.5 GB VRAM): at ~30-token prompts and
+`max_new_tokens: 96`, KV cache is negligible and Gemma-3's 262k-token vocab in retained
+generation scores is the dominant memory cost, well within budget at this batch size with
+large headroom to spare. Lower it for smaller GPUs; there is no assumption tying it to a
+specific card.
+
 ## Artifact layout
 
 Every invocation creates a new `<artifact-root>/<timestamp>-<id>/` directory. When `artifacts.publish_root` is set, each finalized run is copied to `<publish-root>/<timestamp>-<id>/`; `publish.json` records the destination or any Drive-copy error. It includes:

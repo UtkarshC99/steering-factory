@@ -48,12 +48,26 @@ class ActivationCapture:
 
     def last_token_activation(self, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Pools captured activations to one vector per forward call, taking
-        the last non-padded token. Returns shape (n_calls, hidden)."""
+        the last non-padded token. Returns shape (n_calls, hidden).
+
+        Finds the rightmost position where attention_mask == 1 per row,
+        which is correct under EITHER padding side. `mask.sum(dim=1) - 1`
+        (real-token count minus one) is only the right answer for
+        right-padding, where real tokens start at index 0 -- under
+        left-padding the last real token sits at a fixed absolute position
+        near the end of the sequence regardless of how much padding
+        precedes it, and real-token-count does not tell you where that is.
+        This was a real, previously-latent bug: every caller used to pass
+        batch size 1 with an all-ones mask, where the two formulas
+        coincide, so it was never exercised until left-padded batching was
+        introduced (see tests/test_extraction_batching.py)."""
         pooled = []
-        for i, act in enumerate(self.activations):
+        for act in self.activations:
             if attention_mask is not None:
-                lengths = attention_mask.sum(dim=1) - 1
-                idx = lengths.clamp(min=0)
+                seq_len = act.size(1)
+                positions = torch.arange(seq_len, device=attention_mask.device).unsqueeze(0)
+                masked_positions = torch.where(attention_mask.bool(), positions, torch.full_like(positions, -1))
+                idx = masked_positions.max(dim=1).values.clamp(min=0)
                 pooled.append(act[torch.arange(act.size(0)), idx])
             else:
                 pooled.append(act[:, -1, :])

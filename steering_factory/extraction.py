@@ -31,37 +31,72 @@ def _encode(tokenizer, text: str, device):
     return {k: v.to(device) for k, v in enc.items()}
 
 
-def _pair_activation_diff(
-    loaded: LoadedModel, layer_idx: int, pair: Dict, pooling: Pooling
+def _pooled_activations_batch(
+    loaded: LoadedModel, layer_idx: int, texts: List[str], pooling: Pooling
 ) -> torch.Tensor:
-    """Runs the model on (prompt + compliant) and (prompt + non_compliant)
-    and returns the pooled activation difference at the given layer."""
+    """Runs one left-padded, batched forward pass over `texts` and returns
+    the pooled activation at `layer_idx` for each row, shape (len(texts),
+    hidden). A plain forward pass (no autoregression, no KV cache), so
+    unlike generation this needs no scores/logprob handling -- just
+    `ActivationCapture`'s existing attention_mask-aware pooling, which
+    already returns one row per batch item correctly under left-padding.
+
+    Left-padding (not right) matters here for the same reason as
+    generation: `last_token_activation` finds each row's real last token
+    via its attention mask regardless of pad side, but this project's
+    target architectures (Qwen3/Gemma-3, both RoPE + attention_mask-aware,
+    verified against a Llama-family stand-in in
+    tests/test_extraction_batching.py) only produce identical hidden
+    states to an unpadded single-row forward pass under LEFT padding --
+    right-padding shifts position handling for the trailing pad tokens in
+    a way that does not affect the real tokens' own hidden states, but
+    left-padding is the standard decoder-only convention and is what's
+    verified, so it's what's used everywhere in this codebase."""
     device = next(loaded.model.parameters()).device
     layer_module = loaded.layers[layer_idx]
-    prompt_text = format_chat(loaded.tokenizer, pair["prompt"])
 
-    diffs = []
-    for key in ("compliant", "non_compliant"):
-        text = prompt_text + pair[key]
-        enc = _encode(loaded.tokenizer, text, device)
-        with ActivationCapture(layer_module) as cap:
-            with torch.no_grad():
-                loaded.model(**enc)
-        if pooling == "last":
-            act = cap.last_token_activation(enc.get("attention_mask"))
-        else:
-            act = cap.mean_activation(enc.get("attention_mask"))
-        diffs.append(act.squeeze(0).float().cpu())
+    original_padding_side = loaded.tokenizer.padding_side
+    loaded.tokenizer.padding_side = "left"
+    try:
+        enc = loaded.tokenizer(texts, return_tensors="pt", truncation=True, max_length=1024, padding=True)
+    finally:
+        loaded.tokenizer.padding_side = original_padding_side
+    enc = {k: v.to(device) for k, v in enc.items()}
 
-    pos_act, neg_act = diffs
-    return pos_act - neg_act
+    with ActivationCapture(layer_module) as cap:
+        with torch.no_grad():
+            loaded.model(**enc)
+    if pooling == "last":
+        pooled = cap.last_token_activation(enc.get("attention_mask"))
+    else:
+        pooled = cap.mean_activation(enc.get("attention_mask"))
+    return pooled.float().cpu()
 
 
 def _collect_diffs(
-    loaded: LoadedModel, layer_idx: int, pairs: List[Dict], pooling: Pooling
+    loaded: LoadedModel, layer_idx: int, pairs: List[Dict], pooling: Pooling, batch_size: int = 16,
 ) -> torch.Tensor:
-    rows = [_pair_activation_diff(loaded, layer_idx, p, pooling) for p in pairs]
-    return torch.stack(rows, dim=0)  # (n_pairs, hidden)
+    """Computes the pooled (compliant - non_compliant) activation diff for
+    every pair, batching `batch_size` pairs' worth of forward passes at a
+    time (both sides together, so one chunk of N pairs is one batch of 2N
+    texts) rather than one forward pass per side per pair. Pair order is
+    preserved exactly, which matters for the convergence-tracking partial
+    sums in mean_diff_vector/pca_vector (they read diffs[:n] and depend on
+    pair order, not batch order)."""
+    prompt_texts = [format_chat(loaded.tokenizer, p["prompt"]) for p in pairs]
+    all_texts: List[str] = []
+    for prompt_text, pair in zip(prompt_texts, pairs):
+        all_texts.append(prompt_text + pair["compliant"])
+        all_texts.append(prompt_text + pair["non_compliant"])
+
+    pooled_rows: List[torch.Tensor] = []
+    for start in range(0, len(all_texts), batch_size * 2):
+        chunk = all_texts[start : start + batch_size * 2]
+        pooled_rows.append(_pooled_activations_batch(loaded, layer_idx, chunk, pooling))
+    pooled = torch.cat(pooled_rows, dim=0)  # (2 * n_pairs, hidden): [pos0, neg0, pos1, neg1, ...]
+
+    diffs = pooled[0::2] - pooled[1::2]  # (n_pairs, hidden)
+    return diffs
 
 
 def mean_diff_vector(
@@ -71,8 +106,9 @@ def mean_diff_vector(
     pooling: Pooling = "last",
     track_convergence: bool = True,
     convergence_steps: Optional[List[int]] = None,
+    batch_size: int = 16,
 ) -> ExtractionResult:
-    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling)
+    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size)
     final_vec = diffs.mean(dim=0)
 
     convergence = []
@@ -101,8 +137,9 @@ def pca_vector(
     pairs: List[Dict],
     pooling: Pooling = "last",
     track_convergence: bool = True,
+    batch_size: int = 16,
 ) -> ExtractionResult:
-    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling)
+    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size)
     centered = diffs - diffs.mean(dim=0, keepdim=True)
     # SVD on the (n_pairs, hidden) diff matrix; top right-singular vector
     # is the principal direction of the activation differences.
@@ -145,13 +182,14 @@ def whitened_mean_diff_vector(
     pairs: List[Dict],
     pooling: Pooling = "last",
     ridge: float = 1e-3,
+    batch_size: int = 16,
 ) -> ExtractionResult:
     """Regularized Fisher/whitened contrastive direction.
 
     It downweights activation dimensions whose pair differences are noisy,
     offering a useful ablation between raw CAA and a learned optimizer.
     """
-    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling).float()
+    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size).float()
     mean = diffs.mean(dim=0)
     centered = diffs - mean
     # Diagonal covariance is deliberate: full covariance is unstable when
@@ -278,6 +316,13 @@ def extract(
     if method in ("whitened_mean_diff", "fisher"):
         return whitened_mean_diff_vector(loaded, layer_idx, pairs, pooling, **kwargs)
     if method == "optimized":
-        init = mean_diff_vector(loaded, layer_idx, pairs, pooling, track_convergence=False).vector
+        # batch_size is only meaningful for the init-vector's closed-form
+        # forward passes; optimized_vector's own per-pair gradient loop
+        # below is NOT batched (each pair needs its own backward pass
+        # under teacher forcing, which batching would change the semantics
+        # of, not just the speed) and has no batch_size parameter -- pop
+        # it here rather than forward it and hit an unexpected-kwarg error.
+        init_batch_size = kwargs.pop("batch_size", 16)
+        init = mean_diff_vector(loaded, layer_idx, pairs, pooling, track_convergence=False, batch_size=init_batch_size).vector
         return optimized_vector(loaded, layer_idx, pairs, init_vector=init, callback=callback, **kwargs)
     raise ValueError(f"Unknown extraction method: {method}")
