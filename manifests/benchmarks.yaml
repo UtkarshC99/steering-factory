@@ -52,9 +52,21 @@ capability_probe:
   max_new_tokens: 24
 decoding:
   max_new_tokens: 96
-  batch_size: 16
+  # Raised from 16 to 32: a live run reported 8.6/22.5 GB VRAM used at
+  # batch_size=16 (~13.9 GB headroom). Memory scales roughly linearly with
+  # batch size once fixed model weights (~3 GB) are subtracted out, so
+  # batch=32 is estimated at ~14 GB -- comfortable 2x margin under the L4's
+  # 22.5 GB, not batch=48+ which the same linear estimate puts closer to
+  # ~20 GB (too close to the edge given decode-time activation memory
+  # doesn't scale perfectly linearly, and a mid-run OOM costs more time
+  # than a conservative bump saves). Also used by the QLoRA eval arm. If
+  # you see OOM at 32, drop back to 16 or 24.
+  batch_size: 32
 extraction:
-  batch_size: 16
+  # Extraction is plain forward passes (no autoregression, no retained
+  # scores) -- strictly cheaper per row than generation -- so it can safely
+  # match or exceed decoding.batch_size.
+  batch_size: 32
 recipes:
   # Real, gated/licensed benchmark data -- NOT the local_jsonl fixtures in
   # default_colab.yaml. Every recipe below requires
