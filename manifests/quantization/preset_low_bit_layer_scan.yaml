@@ -1,0 +1,113 @@
+# ============================================================================
+# PRESET: low-bit layer scan (follow-up, not part of the first confirming
+# pass -- run preset_4bit_baseline.yaml and preset_bf16_control.yaml first)
+# ============================================================================
+# HYPOTHESIS (H3): quantization error is DEPTH-DEPENDENT -- the layer that is
+# optimal (most robust/highest quality) under bf16 (see
+# preset_bf16_control.yaml's own widened layer sweep) is NOT necessarily the
+# same layer that is optimal under 4bit. Falsifiable: if the best-performing
+# layer in this run's config_grid matches the best-performing layer in
+# preset_bf16_control.yaml's config_grid for the same (model, recipe), H3 is
+# refuted for that pair.
+#
+# Same weights as preset_4bit_baseline.yaml (quantization: 4bit, dtype:
+# bfloat16) -- this is NOT a new precision level, it is the SAME 4bit
+# precision with the experiment DESIGN changed to spend its step budget on
+# depth instead of breadth. This is deliberately the "optimal settings for
+# THIS combination" the layer-depth hypothesis needs, not a shared grid:
+#
+#   - layers: widened to ["early","mid","late"] (was ["mid"] only) -- the
+#     axis this hypothesis is actually about.
+#   - extraction: narrowed to [mean_diff] only (was 3 methods) -- mean_diff
+#     is the cheapest, least noise-sensitive method, so it isolates the
+#     layer-depth signal instead of also varying how the direction is
+#     estimated. (whitened_mean_diff, the method most sensitive to
+#     activation covariance and therefore most informative about
+#     quantization noise specifically, is deliberately reserved for
+#     preset_8bit_midpoint.yaml/preset_4bit_baseline.yaml's full 3-method
+#     grid, not spent here.)
+#   - coefficients: narrowed to [-1, 1] (drops the implicit 0.0 baseline is
+#     still evaluated automatically by _evaluate_vector_grid regardless) --
+#     halves the coefficient axis to afford 3x the layer axis within a
+#     similar total step budget.
+#   - n_sweep: narrowed to a single point [40] (was [10,20,40]) -- this
+#     hypothesis is about layer robustness at a fixed, reasonably-sized
+#     labeled pool, not about data efficiency; the N-sweep axis is orthogonal
+#     to H3 and cut entirely rather than spread thin.
+#
+# Net step-count vs preset_4bit_baseline.yaml's HarmBench recipe: baseline is
+# 1 layer x 3 methods x 3 coeffs x 1 scope x 3 n_sweep = 27 extraction units;
+# this preset is 3 layers x 1 method x 2 coeffs x 1 scope x 1 n_sweep = 6
+# extraction units -- fewer vectors overall, spent on 3x the layer depth
+# instead of on data-efficiency or method comparison, which is exactly the
+# tradeoff this hypothesis calls for.
+#
+# Other two recipes (calibrated_abstention_real, structured_output_real) are
+# NOT included here -- this preset is scoped to the recipe where the layer-
+# depth question matters most for the safety pillar (harmful_instruction_
+# compliance) and its paired benign control (benign_over_refusal_control),
+# to keep this a fast, targeted follow-up rather than a second full sweep.
+#
+# Memory sizing: identical precision to preset_4bit_baseline.yaml, so the
+# same batch_size: 32 sizing applies (see that file's header comment for the
+# full derivation). Also relies on the per-vector torch.cuda.empty_cache()
+# fix in runner.py.
+# ============================================================================
+experiment:
+  name: quantization-low-bit-layer-scan
+  seed: 17
+  n_sweep: [40]
+artifacts:
+  root: /content/steering_factory_artifacts
+  publish_root: null
+models:
+  - id: qwen3_4b_4bit_layerscan
+    name_or_path: Qwen/Qwen3-4B
+    dtype: bfloat16
+    quantization: 4bit
+  - id: gemma3_4b_4bit_layerscan
+    name_or_path: google/gemma-3-4b-it
+    dtype: bfloat16
+    quantization: 4bit
+splits:
+  seed: 17
+  steer_fraction: 0.4
+  validation_fraction: 0.2
+  group_key: category
+capability_probe:
+  enabled: true
+  max_new_tokens: 24
+decoding:
+  max_new_tokens: 96
+  batch_size: 32
+extraction:
+  batch_size: 32
+recipes:
+  - id: harmful_instruction_compliance
+    behavior: harmful_instruction_compliance
+    dataset:
+      adapter: harmbench
+      dataset: walledai/HarmBench
+      subset: standard
+      reviewed_dataset_card: true
+      max_records: 100
+    extraction: [mean_diff]
+    application:
+      layers: ["early", "mid", "late"]
+      coefficients: [-1, 1]
+      token_scopes: [all]
+  - id: benign_over_refusal_control
+    behavior: harmful_instruction_compliance
+    dataset:
+      adapter: xstest
+      dataset: walledai/XSTest
+      reviewed_dataset_card: true
+      max_records: 100
+      apply_vectors_from: harmful_instruction_compliance
+finetune:
+  backend: qlora
+  matched_split: steer
+  max_steps: 200
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  batch_size: 4
+  gradient_accumulation_steps: 2

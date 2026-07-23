@@ -80,6 +80,7 @@ def run_capability_probe_steering(
 def run_capability_probe_qlora(
     model_name: str, adapter_dir: Optional[str], max_new_tokens: int = 24,
     trust_remote_code: bool = False, batch_size: int = 16,
+    quantization: Optional[str] = "4bit", dtype: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Runs every CAPABILITY_PROBES prompt through the QLoRA arm's
     generation path -- `adapter_dir=None` for the base-model (before)
@@ -88,6 +89,10 @@ def run_capability_probe_qlora(
     and generation code rather than a separate implementation; when
     `adapter_dir` is None, loads the plain base model instead of a PEFT
     model wrapping it.
+
+    `quantization`/`dtype` default to the pre-existing hardcoded 4bit
+    behavior and should match whatever the adapter (if any) was trained at
+    -- see the identical note on `evaluate_qlora_adapter`.
     """
     from .finetune import evaluate_base_model, evaluate_qlora_adapter
 
@@ -95,10 +100,12 @@ def run_capability_probe_qlora(
                        for probe in CAPABILITY_PROBES]
     if adapter_dir is None:
         result = evaluate_base_model(probe_examples, model_name, max_new_tokens=max_new_tokens,
-                                      trust_remote_code=trust_remote_code, batch_size=batch_size)
+                                      trust_remote_code=trust_remote_code, batch_size=batch_size,
+                                      quantization=quantization, dtype=dtype)
     else:
         result = evaluate_qlora_adapter(probe_examples, model_name, adapter_dir, max_new_tokens=max_new_tokens,
-                                         trust_remote_code=trust_remote_code, batch_size=batch_size)
+                                         trust_remote_code=trust_remote_code, batch_size=batch_size,
+                                         quantization=quantization, dtype=dtype)
 
     by_id = {probe.id: probe for probe in CAPABILITY_PROBES}
     rows = []

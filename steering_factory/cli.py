@@ -26,13 +26,28 @@ def _parser() -> argparse.ArgumentParser:
     comparison = sub.add_parser("compare")
     comparison.add_argument("runs", nargs="+")
     comparison.add_argument("--output-root", required=True)
+    human_eval = sub.add_parser("human-eval", help="Regenerate the paired human-evaluation package from an existing "
+                                                     "steering run + QLoRA run, without recomputing the comparison report.")
+    human_eval.add_argument("--steering-run", required=True)
+    human_eval.add_argument("--qlora-run", required=True)
+    human_eval.add_argument("--output-root", required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "compare":
-        print(compare(args.runs, args.output_root))
+        report_path = compare(args.runs, args.output_root)
+        print(report_path)
+        human_eval_dir = Path(args.output_root) / "human_eval"
+        if human_eval_dir.exists():
+            print(human_eval_dir)
+        return 0
+    if args.command == "human-eval":
+        from .human_eval_export import build_human_eval_records, write_human_eval_package
+        records = build_human_eval_records(args.steering_run, args.qlora_run)
+        output_dir = write_human_eval_package(records, args.output_root)
+        print(json.dumps({"human_eval_dir": str(output_dir), "records": len(records)}))
         return 0
     if args.command == "report":
         print(render_report(args.run_dir, args.output))

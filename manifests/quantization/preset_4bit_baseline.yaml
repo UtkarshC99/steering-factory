@@ -1,0 +1,108 @@
+# ============================================================================
+# PRESET: 4bit baseline (control / reference point)
+# ============================================================================
+# Hypothesis: none of its own -- this IS the reference every other preset in
+# this directory is measured AGAINST. It is the deployment-cheap regime
+# already validated end-to-end in manifests/benchmarks.yaml (real GPU runs,
+# schema-verified adapters), copied here verbatim under the quantization/
+# preset naming scheme so all four presets live side by side and can be
+# diffed against each other directly.
+#
+# Both arms run at matched precision (steering_factory/model_utils.py's
+# bnb_config_for + finetune.py's now-parameterized train/eval loaders):
+# quantization: 4bit, dtype: bfloat16 compute -- nf4 double-quant weights,
+# bf16 activations/KV-cache.
+#
+# Memory sizing (L4, 22.03 GiB actual capacity per a real OOM trace, not the
+# nominal 22.5 GiB): a live run measured 8.6 GiB used at batch_size=16 for a
+# ~4B-param model at 4bit (~2.0 GiB nf4 weights + ~6.6 GiB activations/KV
+# cache at that batch size). Scaling the activation term linearly with batch
+# size (0.4125 GiB/unit) and holding a 6.5 GiB safety margin (raised from an
+# earlier, thinner margin after a real fragmentation OOM at this exact
+# batch_size=32 -- see the per-vector torch.cuda.empty_cache() fix in
+# runner.py, which this preset now also relies on) gives a max safe batch
+# around 33 -- batch_size: 32 is kept as configured, at the edge of that
+# budget but under it.
+#
+# Step-count sanity (same math benchmarks.yaml already uses): 3 recipes x 3
+# extraction methods x 1 layer x 3 coefficients x 1 token_scope x 3 n_sweep
+# points, generation grid per (model, recipe, method) = 1 layer x 3
+# coefficients x 1 scope x n_test -- unchanged from benchmarks.yaml's own
+# validated sizing.
+# ============================================================================
+experiment:
+  name: quantization-4bit-baseline
+  seed: 17
+  n_sweep: [10, 20, 40]
+artifacts:
+  root: /content/steering_factory_artifacts
+  publish_root: null
+models:
+  - id: qwen3_4b_4bit
+    name_or_path: Qwen/Qwen3-4B
+    dtype: bfloat16
+    quantization: 4bit
+  - id: gemma3_4b_4bit
+    name_or_path: google/gemma-3-4b-it
+    dtype: bfloat16
+    quantization: 4bit
+splits:
+  seed: 17
+  steer_fraction: 0.4
+  validation_fraction: 0.2
+  group_key: category
+capability_probe:
+  enabled: true
+  max_new_tokens: 24
+decoding:
+  max_new_tokens: 96
+  batch_size: 32
+extraction:
+  batch_size: 32
+recipes:
+  - id: harmful_instruction_compliance
+    behavior: harmful_instruction_compliance
+    dataset:
+      adapter: harmbench
+      dataset: walledai/HarmBench
+      subset: standard
+      reviewed_dataset_card: true
+      max_records: 100
+    extraction: [mean_diff, pca, whitened_mean_diff]
+    application:
+      layers: ["mid"]
+      coefficients: [-1, 0, 1]
+      token_scopes: [all]
+  - id: calibrated_abstention_real
+    behavior: appropriate_abstention
+    dataset:
+      adapter: abstentionbench
+      dataset: facebook/AbstentionBench
+      reviewed_dataset_card: true
+      on_load_error: skip
+      max_records: 100
+    extraction: [mean_diff, pca, whitened_mean_diff]
+  - id: structured_output_real
+    behavior: structured_output
+    dataset:
+      adapter: jsonschemabench
+      dataset: epfl-dlab/JSONSchemaBench
+      subset: default
+      reviewed_dataset_card: true
+      max_records: 100
+    extraction: [mean_diff, pca, whitened_mean_diff]
+  - id: benign_over_refusal_control
+    behavior: harmful_instruction_compliance
+    dataset:
+      adapter: xstest
+      dataset: walledai/XSTest
+      reviewed_dataset_card: true
+      max_records: 100
+      apply_vectors_from: harmful_instruction_compliance
+finetune:
+  backend: qlora
+  matched_split: steer
+  max_steps: 200
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  batch_size: 4
+  gradient_accumulation_steps: 2
