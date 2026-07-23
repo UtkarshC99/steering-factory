@@ -7,7 +7,15 @@ experiment:
   # Validation/test are never subsampled, so quality at each N is always
   # measured on identical held-out data. Remove this key to fall back to a
   # single run at the full steer/train pool size (the pre-n_sweep default).
-  n_sweep: [8, 16, 32, 64, 128, 256, 512]
+  #
+  # [10, 20, 40] instead of [8, 16, 32, 64, 128, 256, 512]: _subsample_n
+  # returns the WHOLE steer pool unchanged whenever n >= len(steer)
+  # (runner.py) -- with a ~40-example steer pool (see steer_fraction
+  # below), every sweep point above 40 was silently re-extracting and
+  # re-training on the identical subsample, 6 times over, for zero new
+  # information. [10, 20, 40] gives 3 genuinely distinct points spanning
+  # the full pool instead of 7 points where only the smallest 1-2 differ.
+  n_sweep: [10, 20, 40]
 artifacts:
   root: /content/steering_factory_artifacts
   publish_root: null
@@ -22,7 +30,16 @@ models:
     quantization: 4bit
 splits:
   seed: 17
-  steer_fraction: 0.2
+  # Raised from the framework default (0.2) to 0.4: this does NOT increase
+  # generation cost (that scales with validation+test, not steer) -- it
+  # only costs a little more extraction/training time -- but it directly
+  # controls how many n_sweep points are non-redundant (see the n_sweep
+  # comment above). At max_records: 100 below, steer_fraction: 0.4 gives
+  # steer=40, validation=20, test=40 -- n_test clears the comparison
+  # report's own min_split_size=20 honesty floor with margin, and the
+  # n_sweep=[10,20,40] points span the whole steer pool instead of being
+  # bunched at the low end of a ~12-example pool.
+  steer_fraction: 0.4
   validation_fraction: 0.2
   group_key: category
 capability_probe:
@@ -67,11 +84,31 @@ recipes:
       dataset: walledai/HarmBench
       subset: standard
       reviewed_dataset_card: true
-    extraction: [mean_diff, pca, whitened_mean_diff, optimized]
+      # Caps the loaded pool BEFORE stable_split runs, so steer/validation/
+      # test still land in the manifest's configured fractions of this
+      # smaller pool -- capping after splitting would instead shrink each
+      # split unevenly. Deterministic: same splits.seed -> same subsample
+      # (steering_factory.runner._subsample_n), so results are reproducible
+      # and comparable across a re-run at the same value. Raised from 60 to
+      # 100 alongside steer_fraction: 0.4 above -- spends the larger pool
+      # on held-out volume (n_test=40, double the report's floor) rather
+      # than grid density.
+      max_records: 100
+    # Dropped `optimized` (BiPO-lite) for this first pass: it's the one
+    # extraction method with an unbatched per-pair gradient loop (~40 steps
+    # each), the single most expensive method per vector by a wide margin,
+    # and orthogonal to the sizing fix here. Re-add it once a cheap first
+    # pass confirms the rest of the pipeline end to end.
+    extraction: [mean_diff, pca, whitened_mean_diff]
     application:
-      layers: ["early_mid", "mid", "late_mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
-      token_scopes: [all, generated_only]
+      # Trimmed from 3 layers x 7 coefficients x 2 token_scopes (42-point
+      # grid) to 1 x 3 x 1 for a first pass -- layers/coefficients/scopes
+      # are all still real ablation axes worth sweeping, just not all at
+      # once against a 224-vector extraction bill on the first run. Widen
+      # this back out once one config is confirmed trustworthy.
+      layers: ["mid"]
+      coefficients: [-1, 0, 1]
+      token_scopes: [all]
   - id: calibrated_abstention_real
     behavior: appropriate_abstention
     dataset:
@@ -86,7 +123,8 @@ recipes:
       # OTHER recipe in this manifest keeps the default (on_load_error:
       # raise, i.e. unset) -- a broken dataset there still stops the run.
       on_load_error: skip
-    extraction: [mean_diff, pca, whitened_mean_diff, optimized]
+      max_records: 100
+    extraction: [mean_diff, pca, whitened_mean_diff]
   - id: structured_output_real
     behavior: structured_output
     dataset:
@@ -94,18 +132,25 @@ recipes:
       dataset: epfl-dlab/JSONSchemaBench
       subset: default  # confirmed against the live dataset viewer: 9.56K rows, train split 5.75K
       reviewed_dataset_card: true
-    extraction: [mean_diff, pca, whitened_mean_diff, optimized]
+      max_records: 100
+    extraction: [mean_diff, pca, whitened_mean_diff]
   - id: benign_over_refusal_control
     # XSTest is a benign control set, not a steer source -- see
     # XSTestAdapter's docstring. Every row normalizes to split="test"
-    # regardless of the split plan, so this recipe measures false-refusal
-    # under whatever vector the harmful_instruction_compliance recipe
-    # extracted; it does not extract its own vector.
+    # regardless of the split plan, so this recipe has zero steer examples
+    # and extracts no vector of its own. `apply_vectors_from` (runner.py's
+    # _apply_vectors_cross_recipe) is what actually wires it up: it
+    # evaluates harmful_instruction_compliance's already-extracted vectors,
+    # under harmful_instruction_compliance's own application grid, against
+    # THIS recipe's benign prompts -- that's the false-refusal measurement.
+    # No `extraction`/`application` block needed here.
     behavior: harmful_instruction_compliance
     dataset:
       adapter: xstest
       dataset: walledai/XSTest
       reviewed_dataset_card: true
+      max_records: 100
+      apply_vectors_from: harmful_instruction_compliance
 finetune:
   backend: qlora
   matched_split: steer

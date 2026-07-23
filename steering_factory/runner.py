@@ -71,6 +71,20 @@ def _load_normalized_records(manifest: Dict[str, Any], store: ArtifactStore) -> 
             })
             logger.warning("Recipe %r: dataset load failed, skipping (on_load_error: skip): %s", recipe["id"], error)
             continue
+
+        max_records = dataset_cfg.get("max_records")
+        if max_records is not None and int(max_records) < len(records):
+            # Subsample the WHOLE pool before splitting, not after -- this
+            # keeps steer/validation/test proportions (SplitPlan) meaning
+            # the same fractions of a smaller pool, rather than skewing
+            # them. Same _subsample_n helper the N-sweep uses (seeded on
+            # splits.seed, so it's reproducible and shares its seed source
+            # with every other sampling decision in a run), sorted by a
+            # stable key first so the chosen subset doesn't depend on
+            # whatever order the adapter happened to return rows in.
+            seed = manifest.get("splits", {}).get("seed", 17)
+            records = _subsample_n(records, int(max_records), seed)
+
         split = SplitPlan(**recipe.get("splits", manifest.get("splits", {})))
         assignments = stable_split(records, split)
         report = leakage_report(records, assignments)
@@ -430,6 +444,67 @@ def _run_capability_probe_for_vector(
     return rows
 
 
+def _recipe_applies_cross_recipe(recipe: Dict[str, Any]) -> Optional[str]:
+    """Returns the source recipe id a recipe borrows vectors from
+    (`apply_vectors_from`, accepted at either the recipe top level or
+    inside its `dataset` block for convenience), or None."""
+    return recipe.get("dataset", {}).get("apply_vectors_from") or recipe.get("apply_vectors_from")
+
+
+def _apply_vectors_cross_recipe(
+    manifest: Dict[str, Any], examples: List[Dict[str, Any]], vector_rows: List[Dict[str, Any]],
+    resolve_vector, get_loaded, max_new_tokens: int, batch_size: int,
+    callback: Optional[RunCallback], progress: Dict[str, int], judge: Optional[Any],
+) -> List[Dict[str, Any]]:
+    """Evaluate one recipe's already-extracted vectors against a DIFFERENT
+    recipe's examples, for recipes that declare `apply_vectors_from:
+    <source_recipe_id>`.
+
+    This is what an evaluation-only control set (XSTest, whose adapter
+    forces every row to split="test" and so extracts no vector of its own)
+    needs: it measures how the *source* recipe's steering vectors affect
+    THIS recipe's inputs -- e.g. does the harmful-instruction-compliance
+    refusal vector, applied to XSTest's benign prompts, cause false
+    refusals. Without this, such a recipe contributes zero rows: the main
+    per-recipe loops filter vectors and eval examples strictly by matching
+    recipe_id, so a recipe with no vectors of its own is silently skipped.
+
+    The source recipe's application grid (coefficients/token_scopes)
+    governs the sweep; rows are tagged with the APPLICATOR recipe's
+    recipe_id/behavior_id (already on each example) so the safety metric
+    bundle scores them as that recipe's results. `resolve_vector(vrow)`
+    loads the tensor for an index row; `get_loaded(model_id, model_name)`
+    returns the cached LoadedModel -- both supplied by the caller so this
+    works identically inside run_evaluate (vectors on disk) and run_steering
+    (vectors in memory).
+    """
+    recipe_map = {r["id"]: r for r in manifest["recipes"]}
+    rows: List[Dict[str, Any]] = []
+    for recipe in manifest["recipes"]:
+        source_id = _recipe_applies_cross_recipe(recipe)
+        if not source_id:
+            continue
+        applicator_id = recipe["id"]
+        eval_examples = [e for e in examples if e["recipe_id"] == applicator_id and e["split"] in ("validation", "test")]
+        if not eval_examples:
+            continue
+        source_recipe = recipe_map.get(source_id, {})
+        grid = source_recipe.get("application", {})
+        coefficients = grid.get("coefficients", [0.0, 1.0])
+        token_scopes = grid.get("token_scopes", ["all"])
+        for vrow in vector_rows:
+            if vrow.get("recipe_id") != source_id:
+                continue
+            loaded = get_loaded(vrow["model_id"], vrow["model"])
+            vector = resolve_vector(vrow)
+            rows.extend(_evaluate_vector_grid(
+                loaded, vector, vrow["layer_idx"], vrow["method"], applicator_id,
+                vrow["model_id"], vrow["model"], eval_examples, coefficients, token_scopes,
+                max_new_tokens, batch_size, callback, progress, judge,
+            ))
+    return rows
+
+
 def run_evaluate(
     manifest: Dict[str, Any], vectors_run: str | Path, command: str | None = None,
     callback: Optional[RunCallback] = None, judge: Optional[Any] = None,
@@ -474,16 +549,19 @@ def run_evaluate(
                 loaded_models[model_id] = load_model(TargetModelConfig(**fields))
             return loaded_models[model_id]
 
+        def _resolve_vector(vrow):
+            vector_path = Path(vrow["vector_path"])
+            if not vector_path.is_absolute():
+                vector_path = source / vector_path.relative_to(source) if str(vector_path).startswith(str(source)) else vector_path
+            return torch.load(vector_path, map_location="cpu")
+
         for vrow in vector_rows:
             recipe_id = vrow["recipe_id"]
             recipe = recipe_map.get(recipe_id)
             if recipe is None:
                 continue
             loaded = _get_loaded(vrow["model_id"], vrow["model"])
-            vector_path = Path(vrow["vector_path"])
-            if not vector_path.is_absolute():
-                vector_path = source / vector_path.relative_to(source) if str(vector_path).startswith(str(source)) else vector_path
-            vector = torch.load(vector_path, map_location="cpu")
+            vector = _resolve_vector(vrow)
 
             recipe_examples = [e for e in examples if e["recipe_id"] == recipe_id]
             evaluate_examples = [e for e in recipe_examples if e["split"] in ("validation", "test")]
@@ -499,6 +577,11 @@ def run_evaluate(
                 loaded, vector, layer_idx, method, recipe_id, vrow["model_id"], vrow["model"],
                 evaluate_examples, coefficients, token_scopes, max_new_tokens, batch_size, callback, progress, judge,
             ))
+
+        rows.extend(_apply_vectors_cross_recipe(
+            manifest, examples, vector_rows, _resolve_vector, _get_loaded,
+            max_new_tokens, batch_size, callback, progress, judge,
+        ))
         del loaded_models
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -647,6 +730,37 @@ def run_steering(
             del loaded
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+        # Cross-recipe application (apply_vectors_from) -- e.g. XSTest's
+        # benign prompts evaluated against harmful_instruction_compliance's
+        # vectors, for false-refusal. Done after the per-model extraction
+        # loop (which del'd each `loaded`), reloading vectors from the disk
+        # index just written, so it reuses the exact same code path as
+        # run_evaluate rather than keeping every model resident. Only runs
+        # if some recipe actually declares apply_vectors_from (the vast
+        # majority of manifests don't, so this is a no-op for them).
+        if any(_recipe_applies_cross_recipe(r) for r in manifest["recipes"]):
+            cross_loaded: Dict[str, Any] = {}
+
+            def _get_loaded_cross(model_id: str, model_name: str):
+                if model_id not in cross_loaded:
+                    model_cfg = next((m for m in manifest["models"] if m.get("id") == model_id), {"name_or_path": model_name})
+                    fields = {key: value for key, value in model_cfg.items() if key in TargetModelConfig.__dataclass_fields__}
+                    cross_loaded[model_id] = load_model(TargetModelConfig(**fields))
+                return cross_loaded[model_id]
+
+            def _resolve_vector_cross(vrow):
+                return torch.load(Path(vrow["vector_path"]), map_location="cpu")
+
+            cross_progress = {"done": 0, "total": 0}
+            rows.extend(_apply_vectors_cross_recipe(
+                manifest, examples, vector_rows, _resolve_vector_cross, _get_loaded_cross,
+                max_new_tokens, batch_size, callback, cross_progress, judge,
+            ))
+            del cross_loaded
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         store.write_table("results/generations", rows)
         store.write_json("results/summary.json", aggregate(rows))
         if any("safe_refusal" in row for row in rows):
