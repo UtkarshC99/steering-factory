@@ -71,6 +71,18 @@ experiment:
 
 Runs the steering arm's extraction and the QLoRA arm's training at each labeled-example count in the list (subsampling the steer/train pool deterministically per point), while validation/test are never subsampled — quality at every N is measured on identical held-out data across the whole sweep and both arms. This is what makes the comparison report's data-efficiency curve real rather than a single point. Absent (every manifest before this existed), the run is exactly one iteration at the full steer/train pool size.
 
+### Capping total examples per recipe (`dataset.max_records`)
+
+```yaml
+recipes:
+  - id: harmful_instruction_compliance
+    dataset:
+      adapter: harmbench
+      max_records: 60
+```
+
+A real benchmark's natural size (HarmBench, JSONSchemaBench, etc.) can be hundreds to thousands of rows — every one of them multiplies into the generation grid (`layers × methods × token_scopes × coefficients × n_sweep_points × len(evaluate)`), so this is usually the single biggest lever on total wall time. `dataset.max_records` caps the loaded pool to N records **before** `stable_split` runs, so steer/validation/test still land in the manifest's configured fractions of the smaller pool rather than being skewed by capping after the split. The subsample is deterministic — seeded on `splits.seed`, the same shared-seed mechanism `experiment.n_sweep` already uses (`runner._subsample_n`) — so re-running at the same value reproduces the same subset, and it's a no-op if the pool is already smaller than the cap. Absent (the default), the whole loaded pool is used, unchanged from every manifest before this existed.
+
 ## Benign capability-regression control (`capability_probe`)
 
 ```yaml

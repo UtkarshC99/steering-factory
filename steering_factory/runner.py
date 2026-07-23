@@ -71,6 +71,20 @@ def _load_normalized_records(manifest: Dict[str, Any], store: ArtifactStore) -> 
             })
             logger.warning("Recipe %r: dataset load failed, skipping (on_load_error: skip): %s", recipe["id"], error)
             continue
+
+        max_records = dataset_cfg.get("max_records")
+        if max_records is not None and int(max_records) < len(records):
+            # Subsample the WHOLE pool before splitting, not after -- this
+            # keeps steer/validation/test proportions (SplitPlan) meaning
+            # the same fractions of a smaller pool, rather than skewing
+            # them. Same _subsample_n helper the N-sweep uses (seeded on
+            # splits.seed, so it's reproducible and shares its seed source
+            # with every other sampling decision in a run), sorted by a
+            # stable key first so the chosen subset doesn't depend on
+            # whatever order the adapter happened to return rows in.
+            seed = manifest.get("splits", {}).get("seed", 17)
+            records = _subsample_n(records, int(max_records), seed)
+
         split = SplitPlan(**recipe.get("splits", manifest.get("splits", {})))
         assignments = stable_split(records, split)
         report = leakage_report(records, assignments)
