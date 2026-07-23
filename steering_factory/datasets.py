@@ -170,20 +170,54 @@ class HarmBenchAdapter:
         )
 
 
+def _check_datasets_version_for_legacy_script(max_version: str, dataset_id: str) -> None:
+    """AbstentionBench's dataset card states it "only supports datasets
+    versions <= 3.6.0" because loading it relies on a legacy dataset-script
+    mechanism `datasets` removed in later releases -- on a newer install
+    (this project's requirements.txt previously pinned only `>=2.19`, no
+    upper bound, and a fresh Colab install pulls the current release,
+    5.x+) `load_dataset(..., trust_remote_code=True)` would fail with an
+    error about the removed script API, not a clear message about the
+    version mismatch that caused it. This raises the clear message first.
+    """
+    import datasets as datasets_pkg
+    from packaging.version import Version
+
+    installed = Version(datasets_pkg.__version__)
+    if installed > Version(max_version):
+        raise RuntimeError(
+            f"{dataset_id} requires the 'datasets' package at version <= {max_version} "
+            f"(it relies on a legacy dataset-script loading mechanism removed in later "
+            f"releases) but {installed} is installed. Run: pip install 'datasets<={max_version}' "
+            f"in this environment before loading this adapter."
+        )
+
+
 class AbstentionBenchAdapter:
     """AbstentionBench (facebook/AbstentionBench, cc-by-nc-4.0, requires
     `trust_remote_code=True` per its dataset card) for the
     `appropriate_abstention` behavior.
 
-    Schema (confirmed from the dataset card): `question` (str),
-    `reference_answers` (list[str] | None), `should_abstain` (bool),
-    `metadata_json` (dict). `positive` is an abstention phrase when
-    `should_abstain` is True, else the first reference answer; `negative`
-    is the opposite, so the extracted direction points toward
-    *appropriate* abstention rather than abstention in general.
+    Schema (confirmed from the dataset card, including a live example row):
+    `question` (str), `reference_answers` (list[str] | None),
+    `should_abstain` (bool), `metadata_json` (str -- a JSON-encoded string
+    per the dataset card's own example row, e.g.
+    '{"ALCUNA_entity_id": -171}', NOT a live dict; this adapter does not
+    currently read it, so its exact shape doesn't affect normalize()).
+    `positive` is an abstention phrase when `should_abstain` is True, else
+    the first reference answer; `negative` is the opposite, so the
+    extracted direction points toward *appropriate* abstention rather than
+    abstention in general.
+
+    The dataset card also states this dataset "only supports datasets
+    versions <= 3.6.0" (a legacy dataset-script mechanism) -- `load` checks
+    the installed `datasets` version explicitly and raises a clear error
+    before calling `load_dataset` if it's too new, rather than surfacing
+    whatever opaque error the removed-script-API path would raise instead.
     """
     name = "abstentionbench"
     default_dataset = "facebook/AbstentionBench"
+    max_datasets_version = "3.6.0"
 
     def load(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
         _require_reviewed_dataset_card(config, "AbstentionBenchAdapter", config.get("dataset", self.default_dataset), "cc-by-nc-4.0")
@@ -191,6 +225,7 @@ class AbstentionBenchAdapter:
             from datasets import load_dataset
         except ImportError as exc:
             raise RuntimeError("Install the optional 'datasets' dependency to load benchmark adapters.") from exc
+        _check_datasets_version_for_legacy_script(self.max_datasets_version, config.get("dataset", self.default_dataset))
         ds = load_dataset(config.get("dataset", self.default_dataset), config.get("subset"),
                            split=config.get("split", "train"), cache_dir=config.get("cache_dir"),
                            trust_remote_code=True)
@@ -225,15 +260,17 @@ class JSONSchemaBenchAdapter:
     """JSONSchemaBench (epfl-dlab/JSONSchemaBench, MIT license, public) for
     the `structured_output` behavior.
 
-    Schema (confirmed from the dataset card): `json_schema` (str, the
-    schema definition), `unique_id` (str). Has real train/validation/test
-    splits and 11 domain subsets (Github_*, Glaiveai2K, JsonSchemaStore,
-    Kubernetes, Snowplow, WashingtonPost) -- pass `subset` in the manifest
-    to pick one. `positive` is a request-formatted prompt whose target is
-    "produce valid JSON for this schema" (the actual instance is not
-    generated here -- evaluation scores parse/schema-validity against the
-    schema itself, same as the existing structured_output evaluator);
-    `negative` is a deliberately non-JSON free-text stub.
+    Schema (CONFIRMED against the live dataset viewer, 2026): `json_schema`
+    (str, the schema definition), `unique_id` (str). The live viewer shows
+    a `default` subset (9.56K rows total) with a `train` split (5.75K
+    rows) -- this replaces an earlier version of this adapter that
+    defaulted to a `JsonSchemaStore` subset name sourced from the paper's
+    described 11 domain-specific subsets (Github_*, Glaiveai2K,
+    JsonSchemaStore, Kubernetes, Snowplow, WashingtonPost, ...), which is
+    NOT confirmed to be a valid `datasets.load_dataset` config name for
+    this HF mirror and would have failed to load. `subset` is still
+    manifest-overridable in case a domain-specific config is confirmed
+    valid later; `default` is what's confirmed to exist now.
     """
     name = "jsonschemabench"
     default_dataset = "epfl-dlab/JSONSchemaBench"
@@ -244,7 +281,7 @@ class JSONSchemaBenchAdapter:
             from datasets import load_dataset
         except ImportError as exc:
             raise RuntimeError("Install the optional 'datasets' dependency to load benchmark adapters.") from exc
-        ds = load_dataset(config.get("dataset", self.default_dataset), config.get("subset", "JsonSchemaStore"),
+        ds = load_dataset(config.get("dataset", self.default_dataset), config.get("subset", "default"),
                            split=config.get("split", "train"), cache_dir=config.get("cache_dir"))
         rows = []
         for row in ds:

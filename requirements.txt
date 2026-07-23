@@ -16,6 +16,7 @@ anthropic
 openai
 pytest
 datasets>=2.19
+packaging   # version check in datasets.py's AbstentionBenchAdapter (needs `datasets` pinned <=3.6.0 separately, see its docstring)
 jsonschema>=4.22
 psutil
 pyarrow>=15

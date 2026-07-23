@@ -172,15 +172,33 @@ and terms of use, not just a runtime check.
    real harmful-request text in the "contrast" half; review before use).
 2. **Verify the adapter's column mapping against the live dataset viewer**, not just this
    README or the adapter's docstring. All four schemas are now confirmed against the live
-   dataset viewer: AbstentionBench's (`question`/`reference_answers`/`should_abstain`/
-   `metadata_json`), JSONSchemaBench's (`json_schema`/`unique_id`), walledai/HarmBench's
-   (`prompt`/`context`/`category`, with `standard` and `contextual` subsets — `context` is
-   present only in `contextual`), and walledai/XSTest's (`prompt`/`focus`/`type`/`note`/
-   `label` — `label` is the actual safe/unsafe discriminator; `type` is a fine-grained
-   category, not a `contrast_`-prefixed safe/unsafe marker as earlier documentation implied).
-   `manifests/benchmarks.yaml` sets `reviewed_dataset_card: true` for HarmBench and XSTest
-   accordingly; re-verify against the live viewer yourself before a real run if a schema may
-   have changed since, and update the adapter's column-read logic in `datasets.py` to match.
+   dataset viewer, and `manifests/benchmarks.yaml` sets `reviewed_dataset_card: true` for all
+   four recipes accordingly:
+   - **AbstentionBench**: `question`/`reference_answers`/`should_abstain`/`metadata_json`
+     (the last is a JSON-*encoded string*, not a live dict — unused by this adapter either
+     way). Requires `trust_remote_code=True` **and** the `datasets` package pinned at
+     **`<= 3.6.0`** — the dataset card states it relies on a legacy dataset-script mechanism
+     removed in later `datasets` releases. `AbstentionBenchAdapter.load` checks the installed
+     version and raises a clear error before calling `load_dataset` if it's too new; if you
+     hit that error on Colab, run `pip install "datasets<=3.6.0"` first (this will downgrade
+     the version every other adapter and the rest of the pipeline uses too — only run
+     benchmark recipes that need AbstentionBench in that same environment, or use a separate
+     session).
+   - **JSONSchemaBench**: `json_schema`/`unique_id`. An 11-subset dropdown exists
+     (`Github_easy/hard/medium/trivial/ultra`, `Glaiveai2K`, `JsonSchemaStore`, `Kubernetes`,
+     `Snowplow`, `WashingtonPost`, plus the aggregate `default` — 9.56K rows total, 5.75K in
+     the `train` split). The adapter defaults to `default`; override `subset` in the manifest
+     to target one domain.
+   - **HarmBench** (`walledai/HarmBench`): `prompt`/`context`/`category`, with `standard` and
+     `contextual` subsets — `context` (supplied reference material) is present only in
+     `contextual` and is prepended to the prompt when it exists.
+   - **XSTest** (`walledai/XSTest`): `prompt`/`focus`/`type`/`note`/`label`, single `test`
+     split (450 rows) — `label` (`"safe"`/`"unsafe"`) is the actual safe/unsafe discriminator;
+     `type` is a fine-grained category (e.g. `"homonyms"`) shared by both safe and unsafe rows,
+     not a `contrast_`-prefixed marker as earlier documentation assumed.
+
+   Re-verify against the live viewer yourself before a real run if a schema may have changed
+   since, and update the adapter's column-read logic in `datasets.py` to match.
 3. Request access where required (HarmBench) and confirm you're authorized to use the data
    for this research purpose.
 4. Only then set `reviewed_dataset_card: true` for that recipe in your manifest.

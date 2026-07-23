@@ -47,13 +47,19 @@ recipes:
   # human reviewed the dataset card (terms of use, license, any access
   # request) BEFORE this manifest is run.
   #
-  # HarmBench and XSTest below are set to `true`: their exact column
-  # schemas (walledai/HarmBench: prompt/context/category, "standard" and
-  # "contextual" subsets; walledai/XSTest: prompt/focus/type/note/label,
-  # single "test" split, label is the safe/unsafe discriminator) were
-  # confirmed directly against the live HuggingFace dataset viewer and the
-  # adapters in datasets.py were corrected to match. AbstentionBench and
-  # JSONSchemaBench remain `false` below pending the same direct review.
+  # All four recipes below are set to `true`: every schema (walledai/
+  # HarmBench: prompt/context/category, "standard"/"contextual" subsets;
+  # walledai/XSTest: prompt/focus/type/note/label, single "test" split,
+  # label is the safe/unsafe discriminator; facebook/AbstentionBench:
+  # question/reference_answers/should_abstain/metadata_json, requires
+  # trust_remote_code=True AND datasets<=3.6.0 -- see
+  # AbstentionBenchAdapter's version guard in datasets.py; epfl-dlab/
+  # JSONSchemaBench: json_schema/unique_id, "default" subset [9.56K rows,
+  # train split 5.75K] plus 10 domain-specific subsets) was confirmed
+  # directly against the live HuggingFace dataset viewer and the adapters
+  # in datasets.py were corrected to match. Re-verify against the live
+  # viewer yourself before trusting a real run if a schema may have
+  # changed since.
   - id: harmful_instruction_compliance
     behavior: harmful_instruction_compliance
     dataset:
@@ -71,15 +77,15 @@ recipes:
     dataset:
       adapter: abstentionbench
       dataset: facebook/AbstentionBench
-      reviewed_dataset_card: false  # set true only after reviewing the AbstentionBench dataset card yourself (cc-by-nc-4.0)
+      reviewed_dataset_card: true  # cc-by-nc-4.0; requires datasets<=3.6.0 -- see AbstentionBenchAdapter's version guard
     extraction: [mean_diff, pca, whitened_mean_diff, optimized]
   - id: structured_output_real
     behavior: structured_output
     dataset:
       adapter: jsonschemabench
       dataset: epfl-dlab/JSONSchemaBench
-      subset: JsonSchemaStore
-      reviewed_dataset_card: false  # set true only after reviewing the JSONSchemaBench dataset card yourself (MIT)
+      subset: default  # confirmed against the live dataset viewer: 9.56K rows, train split 5.75K
+      reviewed_dataset_card: true
     extraction: [mean_diff, pca, whitened_mean_diff, optimized]
   - id: benign_over_refusal_control
     # XSTest is a benign control set, not a steer source -- see
