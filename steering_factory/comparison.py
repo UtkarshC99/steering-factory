@@ -30,6 +30,15 @@ _QUALITY_KEY_BY_BEHAVIOR = {
 }
 _DEFAULT_QUALITY_KEYS = ("leaf_exact_match", "exact_match", "correct_answer", "safe_refusal")
 
+# Below this many held-out rows, a quality number is noise, not signal -- a
+# 0-vs-1 result on a single test example proved exactly this on a real run
+# (Qwen3/Gemma3 safety_refusal at n_test=1). Entries below the floor on
+# EITHER split are excluded from the winner table entirely rather than
+# reported as if they meant something. Overridable per call for smaller
+# smoke-test fixtures, but the report-facing entry point (build_comparison)
+# defaults to this.
+DEFAULT_MIN_SPLIT_SIZE = 20
+
 
 def _quality_key(behavior_id: Optional[str], rows: List[Dict[str, Any]]) -> Optional[str]:
     if behavior_id and behavior_id in _QUALITY_KEY_BY_BEHAVIOR:
@@ -79,6 +88,16 @@ def best_steering_config(
     weights on validation only"). Returns the winning config's held-out TEST
     quality, plus its own validation quality for transparency, or None if
     there is no validation data to select on.
+
+    The unsteered baseline (coefficient == 0.0) is excluded from selection:
+    on a real run (Qwen3/Gemma3 safety_refusal, n_test=1) the baseline won
+    validation simply because every real coefficient scored 0 on a single
+    noisy example, and the base model got reported as "the steering
+    result" -- which it is not. `baseline_quality` (the c=0.0 config's own
+    held-out test quality, computed separately, independent of which
+    config wins) and `beat_baseline` (whether the winning steered config's
+    test quality exceeds it) are returned alongside the winner so a caller
+    can tell "steering achieved X, doing nothing achieves Y" apart.
     """
     quality_key = _quality_key(behavior_id, rows)
     if quality_key is None:
@@ -90,19 +109,29 @@ def best_steering_config(
     for row in val_rows:
         by_config.setdefault(_steering_config_key(row), []).append(row)
 
-    scored = [(cfg, _mean(group, quality_key)) for cfg, group in by_config.items()]
+    steered_configs = {cfg: group for cfg, group in by_config.items() if cfg[2] != 0.0}
+    scored = [(cfg, _mean(group, quality_key)) for cfg, group in steered_configs.items()]
     scored = [(cfg, q) for cfg, q in scored if q is not None]
+
+    baseline_cfg = next((cfg for cfg in by_config if cfg[2] == 0.0), None)
+    baseline_test_rows = [r for r in rows if r.get("split") == "test" and baseline_cfg is not None and _steering_config_key(r) == baseline_cfg]
+    baseline_quality = _mean(baseline_test_rows, quality_key) if baseline_test_rows else None
+
     if not scored:
         return None
     best_cfg, best_val_quality = max(scored, key=lambda item: item[1])
 
     test_rows = [r for r in rows if r.get("split") == "test" and _steering_config_key(r) == best_cfg]
     test_quality = _mean(test_rows, quality_key)
+    beat_baseline = None
+    if test_quality is not None and baseline_quality is not None:
+        beat_baseline = test_quality > baseline_quality
     method, layer_idx, coefficient, token_scope = best_cfg
     return {
         "quality_key": quality_key,
         "method": method, "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope,
         "validation_quality": best_val_quality, "test_quality": test_quality,
+        "baseline_quality": baseline_quality, "beat_baseline": beat_baseline,
         "n_validation": len(by_config[best_cfg]), "n_test": len(test_rows),
     }
 
@@ -124,7 +153,22 @@ def qlora_quality(rows: List[Dict[str, Any]], behavior_id: Optional[str]) -> Opt
     }
 
 
-def _steering_cost(run_dir: Path, model_id: str, recipe_id: str, vector_rows: List[Dict[str, Any]], gen_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _steering_cost(
+    run_dir: Path, model_id: str, recipe_id: str, vector_rows: List[Dict[str, Any]],
+    gen_rows: List[Dict[str, Any]], selected_config: Optional[Tuple] = None,
+) -> Dict[str, Any]:
+    """`full_sweep_wall_time_s` is the entire run's telemetry wall time --
+    every method/layer/coefficient/token_scope this manifest evaluated, not
+    just the winning config. That is exploration cost, not deployment cost,
+    and reporting it as "steering's cost" against QLoRA's one-trained-
+    adapter time is a category error (a real run showed 7247s of sweep vs
+    177s of one QLoRA training run, which reads as "steering is 40x
+    slower" when it measured 12 configs vs 1). `selected_config_extraction_cost_s`
+    amortizes the full sweep's wall time evenly across every extracted
+    vector -- a rough but honest per-vector share when telemetry only
+    tracks one whole-run timer -- so it can be compared to QLoRA's one
+    training run on the same footing.
+    """
     telemetry = _read_json(run_dir / "telemetry.json")
     own_vectors = [v for v in vector_rows if v.get("model_id") == model_id and v.get("recipe_id") == recipe_id]
     own_rows = [r for r in gen_rows if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id]
@@ -133,16 +177,38 @@ def _steering_cost(run_dir: Path, model_id: str, recipe_id: str, vector_rows: Li
     ms_per_token = None
     if latencies and tokens and sum(tokens) > 0:
         ms_per_token = 1000.0 * sum(latencies) / sum(tokens)
-    artifact_bytes = sum(Path(v["vector_path"]).stat().st_size for v in own_vectors if Path(v["vector_path"]).exists())
-    labeled_examples = max((v.get("num_pairs", 0) for v in own_vectors), default=0)
+
+    selected_vector = None
+    if selected_config is not None:
+        method, layer_idx, _coefficient, _token_scope = selected_config
+        selected_vector = next(
+            (v for v in own_vectors if v.get("method") == method and v.get("layer_idx") == layer_idx), None,
+        )
+    artifact_bytes = (
+        Path(selected_vector["vector_path"]).stat().st_size
+        if selected_vector is not None and Path(selected_vector["vector_path"]).exists()
+        else sum(Path(v["vector_path"]).stat().st_size for v in own_vectors if Path(v["vector_path"]).exists())
+    )
+    labeled_examples = (
+        selected_vector.get("num_pairs", 0) if selected_vector is not None
+        else max((v.get("num_pairs", 0) for v in own_vectors), default=0)
+    )
+
+    full_sweep_wall_time_s = telemetry.get("wall_time_s")
+    num_configs = len(own_vectors)
+    selected_config_extraction_cost_s = (
+        full_sweep_wall_time_s / num_configs if full_sweep_wall_time_s is not None and num_configs else None
+    )
+
     return {
         "arm": "steering",
-        "wall_time_s": telemetry.get("wall_time_s"),
+        "selected_config_extraction_cost_s": selected_config_extraction_cost_s,
+        "full_sweep_wall_time_s": full_sweep_wall_time_s,
         "gpu_peak_allocated_bytes": telemetry.get("gpu_peak_allocated_bytes"),
         "gpu_peak_reserved_bytes": telemetry.get("gpu_peak_reserved_bytes"),
         "artifact_bytes": artifact_bytes,
         "labeled_examples": labeled_examples,
-        "num_configs_evaluated": len(own_vectors),
+        "num_configs_evaluated": num_configs,
         "per_request_ms_per_token": ms_per_token,
     }
 
@@ -170,9 +236,19 @@ def _qlora_cost(qlora_results: List[Dict[str, Any]], model_id: str, recipe_id: s
     }
 
 
-def build_comparison(steering_run: str | Path, qlora_run: str | Path) -> Dict[str, Any]:
+def build_comparison(
+    steering_run: str | Path, qlora_run: str | Path, min_split_size: int = DEFAULT_MIN_SPLIT_SIZE,
+) -> Dict[str, Any]:
     """Joins a steering run and a QLoRA run on (model_id, recipe_id) and
-    returns the matched quality/cost report as a plain dict (JSON-safe)."""
+    returns the matched quality/cost report as a plain dict (JSON-safe).
+
+    Entries where either arm's `n_test` or `n_validation` falls below
+    `min_split_size` are routed to `excluded`, not `comparisons` -- a
+    quality number computed on a handful of held-out examples is noise, and
+    the previous behavior of reporting it as a normal "winner" row is
+    exactly how a real run turned "n_test=1" into a false 0.0-vs-1.0
+    result. Pass `min_split_size=0` to disable the floor (e.g. for tests
+    that intentionally exercise tiny fixtures)."""
     steer_dir = Path(steering_run)
     qlora_dir = Path(qlora_run)
 
@@ -192,6 +268,7 @@ def build_comparison(steering_run: str | Path, qlora_run: str | Path) -> Dict[st
                    {(r.get("model_id"), r.get("recipe_id")) for r in qlora_gen_rows})
 
     entries = []
+    excluded = []
     for model_id, recipe_id in pairs:
         behavior_id = behavior_by_recipe.get(recipe_id)
         steer_rows = [r for r in steer_gen_rows if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id]
@@ -202,16 +279,29 @@ def build_comparison(steering_run: str | Path, qlora_run: str | Path) -> Dict[st
         if steer_quality is None or qlora_q is None:
             continue
 
+        min_n = min(steer_quality["n_test"], steer_quality["n_validation"], qlora_q["n_test"], qlora_q["n_validation"])
+        if min_n < min_split_size:
+            excluded.append({
+                "model_id": model_id, "recipe_id": recipe_id, "behavior_id": behavior_id,
+                "reason": "insufficient_data", "min_split_size": min_split_size,
+                "n_test_steering": steer_quality["n_test"], "n_validation_steering": steer_quality["n_validation"],
+                "n_test_qlora": qlora_q["n_test"], "n_validation_qlora": qlora_q["n_validation"],
+            })
+            continue
+
+        selected_config = (steer_quality["method"], steer_quality["layer_idx"], steer_quality["coefficient"], steer_quality["token_scope"])
         entries.append({
             "model_id": model_id, "recipe_id": recipe_id, "behavior_id": behavior_id,
-            "steering": {**steer_quality, **_steering_cost(steer_dir, model_id, recipe_id, vector_rows, steer_gen_rows)},
+            "steering": {**steer_quality, **_steering_cost(steer_dir, model_id, recipe_id, vector_rows, steer_gen_rows, selected_config)},
             "qlora": {**qlora_q, **_qlora_cost(qlora_results, model_id, recipe_id, qlora_gen_rows)},
         })
 
     return {
         "created_at": time.time(),
         "steering_run": str(steer_dir), "qlora_run": str(qlora_dir),
+        "min_split_size": min_split_size,
         "comparisons": entries,
+        "excluded": excluded,
     }
 
 
