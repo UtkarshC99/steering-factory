@@ -69,16 +69,20 @@ def _steering_rows(model_id="m1", recipe_id="r1", behavior_id="domain_classifica
     return rows
 
 
-def _qlora_rows(model_id="m1", recipe_id="r1", behavior_id="domain_classification", test_quality=0.5, n=N_PER_SPLIT):
+def _qlora_rows(model_id="m1", recipe_id="r1", behavior_id="domain_classification", test_quality=0.5, n=N_PER_SPLIT, num_train_records=200):
+    # num_train_records is tagged on every row (matching real run_qlora
+    # output -- see runner.py's eval_rows construction) because
+    # data_efficiency_curve/build_comparison filter QLoRA rows by it to
+    # distinguish multiple N-sweep adapters' eval rows apart.
     rows = []
     for i in range(n):
         rows.append({"model_id": model_id, "recipe_id": recipe_id, "behavior_id": behavior_id,
                      "split": "validation", "example_id": f"qval-{i}", "exact_match": 1.0,
-                     "latency_s": 0.2, "tokens_generated": 20})
+                     "latency_s": 0.2, "tokens_generated": 20, "num_train_records": num_train_records})
     for i in range(n):
         rows.append({"model_id": model_id, "recipe_id": recipe_id, "behavior_id": behavior_id,
                      "split": "test", "example_id": f"qtest-{i}", "exact_match": test_quality,
-                     "latency_s": 0.2, "tokens_generated": 20})
+                     "latency_s": 0.2, "tokens_generated": 20, "num_train_records": num_train_records})
     return rows
 
 
@@ -396,3 +400,101 @@ def test_degenerate_real_run_produces_zero_winner_rows(tmp_path):
     markdown = render_comparison_markdown(comparison)
     assert "Matched quality" not in markdown  # no winner section rendered at all
     assert "Excluded (insufficient data)" in markdown
+
+
+# --- N-sweep: build_comparison must pin to max-N, not pool across N -----------
+
+def _multi_n_steering_run(root: Path):
+    """Two vectors for the same (method=mean_diff, layer=5) at different
+    N -- N=8 (worse quality) and N=24 (better, above the min-split floor)
+    -- exactly what an experiment.n_sweep run produces. build_comparison's
+    winner table must use ONLY the N=24 rows/vector, not pool both N's
+    generation rows together as if they were one config."""
+    small_n_rows, large_n_rows = [], []
+    for i in range(N_PER_SPLIT):
+        # N=8 vector: worse quality (simulates less labeled data -> worse steering).
+        small_n_rows.append({"model_id": "m1", "recipe_id": "r1", "behavior_id": "domain_classification",
+                              "split": "validation", "method": "mean_diff", "layer_idx": 5, "coefficient": 1.0,
+                              "token_scope": "all", "example_id": f"n8-val-{i}", "exact_match": 0.0})
+        small_n_rows.append({"model_id": "m1", "recipe_id": "r1", "behavior_id": "domain_classification",
+                              "split": "test", "method": "mean_diff", "layer_idx": 5, "coefficient": 1.0,
+                              "token_scope": "all", "example_id": f"n8-test-{i}", "exact_match": 0.0})
+        # N=24 vector: better quality.
+        large_n_rows.append({"model_id": "m1", "recipe_id": "r1", "behavior_id": "domain_classification",
+                              "split": "validation", "method": "mean_diff", "layer_idx": 8, "coefficient": 1.0,
+                              "token_scope": "all", "example_id": f"n24-val-{i}", "exact_match": 1.0})
+        large_n_rows.append({"model_id": "m1", "recipe_id": "r1", "behavior_id": "domain_classification",
+                              "split": "test", "method": "mean_diff", "layer_idx": 8, "coefficient": 1.0,
+                              "token_scope": "all", "example_id": f"n24-test-{i}", "exact_match": 1.0})
+    _write_jsonl(root / "results" / "generations.jsonl", small_n_rows + large_n_rows)
+    _write_jsonl(root / "vectors" / "index.jsonl", [
+        {"model_id": "m1", "recipe_id": "r1", "method": "mean_diff", "layer_idx": 5, "num_pairs": 8,
+         "vector_path": str(root / "vectors" / "n8.pt")},
+        {"model_id": "m1", "recipe_id": "r1", "method": "mean_diff", "layer_idx": 8, "num_pairs": 24,
+         "vector_path": str(root / "vectors" / "n24.pt")},
+    ])
+    (root / "vectors" / "n8.pt").write_bytes(b"0" * 50)
+    (root / "vectors" / "n24.pt").write_bytes(b"0" * 100)
+    _write_json(root / "telemetry.json", {"wall_time_s": 20.0})
+    _write_json(root / "run.json", {"run_id": "steer-nsweep", "status": "completed", "manifest_hash": "abc"})
+
+
+def _multi_n_qlora_run(root: Path):
+    small_n_rows = _qlora_rows(test_quality=0.3, num_train_records=8)
+    large_n_rows = _qlora_rows(test_quality=0.6, num_train_records=200)
+    for row in small_n_rows:
+        row["example_id"] = "n8-" + row["example_id"]
+    for row in large_n_rows:
+        row["example_id"] = "n200-" + row["example_id"]
+    _write_jsonl(root / "results" / "generations.jsonl", small_n_rows + large_n_rows)
+    _write_json(root / "results" / "qlora.json", [
+        {"model_id": "m1", "recipe_id": "r1", "num_train_records": 8, "wall_time_s": 10.0,
+         "eval_wall_time_s": 1.0, "adapter_size_bytes": 100, "adapter_dir": "x8"},
+        {"model_id": "m1", "recipe_id": "r1", "num_train_records": 200, "wall_time_s": 90.0,
+         "eval_wall_time_s": 5.0, "adapter_size_bytes": 4096, "adapter_dir": "x200"},
+    ])
+    _write_json(root / "run.json", {"run_id": "qlora-nsweep", "status": "completed", "manifest_hash": "abc"})
+
+
+def test_build_comparison_pins_winner_table_to_max_n_not_pooled_across_n(tmp_path):
+    steer_dir = tmp_path / "steer_run"
+    qlora_dir = tmp_path / "qlora_run"
+    _multi_n_steering_run(steer_dir)
+    _multi_n_qlora_run(qlora_dir)
+
+    comparison = build_comparison(steer_dir, qlora_dir)
+    assert len(comparison["comparisons"]) == 1
+    entry = comparison["comparisons"][0]
+
+    # Must reflect the N=24 (better) config, not a blend of N=8 and N=24 --
+    # pooling both would give exact_match=0.5 (worse than either alone,
+    # correctness-wise the wrong number entirely) instead of 1.0.
+    assert entry["steering"]["test_quality"] == 1.0
+    assert entry["steering"]["layer_idx"] == 8
+    assert entry["steering"]["labeled_examples"] == 24
+    assert entry["qlora"]["test_quality"] == pytest.approx(0.6)
+    assert entry["qlora"]["labeled_examples"] == 200
+
+    # config_grid still reports only the max-N vector's own configs (L8),
+    # not the N=8 vector's L5 config mixed in as if comparable.
+    assert {row["layer_idx"] for row in entry["config_grid"]} == {8}
+
+
+def test_data_efficiency_curve_reports_both_n_points_for_each_arm(tmp_path):
+    steer_dir = tmp_path / "steer_run"
+    qlora_dir = tmp_path / "qlora_run"
+    _multi_n_steering_run(steer_dir)
+    _multi_n_qlora_run(qlora_dir)
+
+    curve = data_efficiency_curve(steer_dir, qlora_dir, "m1", "r1")
+    steer_ns = sorted(p["labeled_examples"] for p in curve["steering"])
+    qlora_ns = sorted(p["labeled_examples"] for p in curve["qlora"])
+    assert steer_ns == [8, 24]
+    assert qlora_ns == [8, 200]
+    # Each qlora point's quality must reflect only ITS OWN adapter's eval
+    # rows, not rows from the other N -- this is the num_train_records
+    # filter fix; without it, both points would report the same
+    # (incorrectly pooled) quality.
+    by_n = {p["labeled_examples"]: p["quality"] for p in curve["qlora"]}
+    assert by_n[8] == pytest.approx(0.3)
+    assert by_n[200] == pytest.approx(0.6)

@@ -250,6 +250,11 @@ def _steering_cost(
 
 
 def _qlora_cost(qlora_results: List[Dict[str, Any]], model_id: str, recipe_id: str, gen_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """`gen_rows` and `qlora_results` are expected to already be filtered
+    to a single (model, recipe, num_train_records) point by the caller
+    (build_comparison pins every entry to the max-N adapter when an
+    N-sweep produced more than one) -- this function itself has no
+    N-awareness, it just reports whatever single config it's handed."""
     match = next((r for r in qlora_results if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id), {})
     own_rows = [r for r in gen_rows if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id]
     latencies = [r["latency_s"] for r in own_rows if r.get("latency_s") is not None]
@@ -307,8 +312,38 @@ def build_comparison(
     excluded = []
     for model_id, recipe_id in pairs:
         behavior_id = behavior_by_recipe.get(recipe_id)
-        steer_rows = [r for r in steer_gen_rows if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id]
-        qlora_rows = [r for r in qlora_gen_rows if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id]
+        all_steer_rows = [r for r in steer_gen_rows if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id]
+        all_qlora_rows = [r for r in qlora_gen_rows if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id]
+        own_vectors = [v for v in vector_rows if v.get("model_id") == model_id and v.get("recipe_id") == recipe_id]
+
+        # An N-sweep (experiment.n_sweep) can produce multiple vectors/
+        # adapters per (model, recipe), one per labeled-example count. The
+        # headline quality/cost table pins to the MAX N each arm reached --
+        # the "best shot" each arm gets with the most labeled data it was
+        # given -- while `data_efficiency_curve` below still reports every
+        # point. Without this, best_steering_config/qlora_quality would
+        # silently pool rows from every N together as if they were one
+        # config, which is exactly the kind of scope-mixing Part 1 fixed
+        # for cost; the same discipline applies here.
+        steer_ns = {v.get("num_pairs") for v in own_vectors if v.get("num_pairs") is not None}
+        max_steer_n = max(steer_ns) if steer_ns else None
+        if max_steer_n is not None:
+            max_n_configs = {(v.get("method"), v.get("layer_idx")) for v in own_vectors if v.get("num_pairs") == max_steer_n}
+            steer_rows = [r for r in all_steer_rows if (r.get("method"), r.get("layer_idx")) in max_n_configs]
+            vector_rows_at_max_n = [v for v in own_vectors if v.get("num_pairs") == max_steer_n]
+        else:
+            steer_rows, vector_rows_at_max_n = all_steer_rows, own_vectors
+
+        qlora_ns = {r.get("num_train_records") for r in all_qlora_rows if r.get("num_train_records") is not None}
+        max_qlora_n = max(qlora_ns) if qlora_ns else None
+        qlora_rows = (
+            [r for r in all_qlora_rows if r.get("num_train_records") == max_qlora_n]
+            if max_qlora_n is not None else all_qlora_rows
+        )
+        qlora_results_at_max_n = (
+            [r for r in qlora_results if r.get("num_train_records") == max_qlora_n]
+            if max_qlora_n is not None else qlora_results
+        )
 
         steer_quality = best_steering_config(steer_rows, behavior_id)
         qlora_q = qlora_quality(qlora_rows, behavior_id)
@@ -328,8 +363,8 @@ def build_comparison(
         selected_config = (steer_quality["method"], steer_quality["layer_idx"], steer_quality["coefficient"], steer_quality["token_scope"])
         entries.append({
             "model_id": model_id, "recipe_id": recipe_id, "behavior_id": behavior_id,
-            "steering": {**steer_quality, **_steering_cost(steer_dir, model_id, recipe_id, vector_rows, steer_gen_rows, selected_config)},
-            "qlora": {**qlora_q, **_qlora_cost(qlora_results, model_id, recipe_id, qlora_gen_rows)},
+            "steering": {**steer_quality, **_steering_cost(steer_dir, model_id, recipe_id, vector_rows_at_max_n, steer_rows, selected_config)},
+            "qlora": {**qlora_q, **_qlora_cost(qlora_results_at_max_n, model_id, recipe_id, qlora_rows)},
             "config_grid": full_config_grid(steer_rows, behavior_id),
             "data_efficiency": data_efficiency_curve(steer_dir, qlora_dir, model_id, recipe_id),
         })
@@ -383,7 +418,13 @@ def data_efficiency_curve(steering_run: str | Path, qlora_run: str | Path, model
             if result.get("model_id") != model_id or result.get("recipe_id") != recipe_id:
                 continue
             n = result.get("num_train_records")
-            matching = [r for r in qlora_gen_rows if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id and r.get("split") == "test"]
+            # Filtering by num_train_records too (not just model_id/recipe_id)
+            # matters once an N-sweep trains multiple adapters for the same
+            # (model, recipe): every adapter's eval rows carry the same
+            # model_id/recipe_id, so without this an N=512 adapter's quality
+            # would get averaged in as if it were the N=8 adapter's point.
+            matching = [r for r in qlora_gen_rows if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id
+                        and r.get("split") == "test" and r.get("num_train_records") == n]
             q = _mean(matching, quality_key)
             if n is not None and q is not None:
                 qlora_points.append((n, q))
