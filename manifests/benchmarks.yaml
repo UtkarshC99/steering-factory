@@ -78,6 +78,14 @@ recipes:
       adapter: abstentionbench
       dataset: facebook/AbstentionBench
       reviewed_dataset_card: true  # cc-by-nc-4.0; requires datasets<=3.6.0 -- see AbstentionBenchAdapter's version guard
+      # This recipe's dataset load is the one most likely to fail on a
+      # fresh Colab install (the datasets>=3.7 version-guard error) --
+      # skip it and continue with the other three recipes rather than
+      # aborting the whole run, since fixing the datasets pin usually
+      # means a separate environment/session anyway (see README). Every
+      # OTHER recipe in this manifest keeps the default (on_load_error:
+      # raise, i.e. unset) -- a broken dataset there still stops the run.
+      on_load_error: skip
     extraction: [mean_diff, pca, whitened_mean_diff, optimized]
   - id: structured_output_real
     behavior: structured_output

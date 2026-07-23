@@ -1,7 +1,9 @@
 """High-level orchestration that is usable from a CLI, notebook, or Python."""
 from __future__ import annotations
 
+import logging
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -12,6 +14,8 @@ from .datasets import build_adapter, leakage_report, stable_split
 from .experiment_types import SplitPlan
 from .evaluators import aggregate, safety_metric_bundle
 from .evaluators import abstention_score, classification_score, refusal_score_judge, refusal_score_substring, structured_score
+
+logger = logging.getLogger(__name__)
 
 # behavior_ids scored as safe-refusal-vs-unsafe-compliance -- the original
 # defensive_refusal plus the safety sub-taxonomy added in behaviors.py.
@@ -25,7 +29,28 @@ _REFUSAL_SCORED_BEHAVIORS = frozenset({
 
 
 def _load_normalized_records(manifest: Dict[str, Any], store: ArtifactStore) -> List[Dict[str, Any]]:
-    """Load, split, normalize, and persist data inside the current run."""
+    """Load, split, normalize, and persist data inside the current run.
+
+    Default behavior is unchanged: `adapter.load(dataset_cfg)` raising (e.g.
+    AbstentionBenchAdapter's datasets-version guard) propagates straight up
+    and aborts the whole run -- a broken dataset stops the run, the safer
+    default for a research pipeline. Silently dropping a recipe on error
+    could produce a report that looks complete but is missing a whole arm,
+    exactly the kind of silent-degradation failure mode the report-honesty
+    work elsewhere in this codebase (comparison.py's n-floor guard,
+    baseline exclusion, held-out assertion) exists to catch, not add.
+
+    Set `dataset.on_load_error: skip` in a recipe to opt out of that
+    default for just that recipe: the load error is still raised
+    internally, caught here, and persisted LOUDLY to
+    `data/<recipe_id>.load_error.json` (not silently swallowed) before
+    the loop continues to the next recipe. A recipe that contributes zero
+    records this way is structurally identical to a recipe whose steer/
+    eval split turned out empty -- every downstream consumer
+    (run_steering/run_evaluate/run_qlora) already `continue`s past that
+    case, so skipping is safe without further changes, but the artifact
+    always shows which recipes were skipped and why.
+    """
     all_records: List[Dict[str, Any]] = []
     for recipe in manifest["recipes"]:
         behavior_data = recipe["behavior"]
@@ -34,7 +59,18 @@ def _load_normalized_records(manifest: Dict[str, Any], store: ArtifactStore) -> 
         behavior = get_behavior(behavior_id, description)
         dataset_cfg = recipe["dataset"]
         adapter = build_adapter(dataset_cfg.get("adapter", "huggingface"))
-        records = adapter.load(dataset_cfg)
+        try:
+            records = adapter.load(dataset_cfg)
+        except Exception as error:
+            if dataset_cfg.get("on_load_error", "raise") != "skip":
+                raise
+            store.write_json(f"data/{recipe['id']}.load_error.json", {
+                "recipe_id": recipe["id"], "adapter": adapter.name, "dataset": dataset_cfg,
+                "error": "".join(traceback.format_exception_only(type(error), error)).strip(),
+                "skipped": True,
+            })
+            logger.warning("Recipe %r: dataset load failed, skipping (on_load_error: skip): %s", recipe["id"], error)
+            continue
         split = SplitPlan(**recipe.get("splits", manifest.get("splits", {})))
         assignments = stable_split(records, split)
         report = leakage_report(records, assignments)

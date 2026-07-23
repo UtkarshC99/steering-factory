@@ -206,6 +206,26 @@ and terms of use, not just a runtime check.
 This step needs a GPU session with network access (e.g. Colab) — it cannot be validated
 offline or in a CI environment.
 
+### If a dataset fails to load (`dataset.on_load_error`)
+
+By default, a dataset adapter raising (a version mismatch, a network error, a schema that
+changed upstream) aborts the **entire run** — every recipe, both models — not just the
+recipe whose dataset failed. That is the deliberate default for a research pipeline:
+silently dropping a recipe and continuing could produce a report that looks complete but is
+quietly missing a whole arm, exactly the kind of silent-degradation failure mode the
+report-honesty work elsewhere in this codebase (`comparison.py`'s n-floor guard, baseline
+exclusion, held-out assertion) exists to catch, not add.
+
+Set `dataset.on_load_error: skip` on a specific recipe to opt out of that default for just
+that recipe: the run continues with the other recipes, and the failure is recorded loudly at
+`data/<recipe_id>.load_error.json` (never silently swallowed) — a recipe skipped this way is
+structurally identical to a recipe whose steer/eval split turned out empty, which every
+runner entrypoint already tolerates. `manifests/benchmarks.yaml` sets this for
+`calibrated_abstention_real` (AbstentionBench) specifically, since a `datasets>=3.7`
+version-guard failure there is the single most likely load error in this manifest and fixing
+it usually means a separate environment/session anyway — every other recipe keeps the
+default (`on_load_error` unset ≡ `raise`).
+
 ## Extending the framework
 
 - Add a `DatasetAdapter` in `steering_factory/datasets.py`, normalize records to `ContrastiveExample`, and preserve source/revision/license metadata. Follow the `HarmBenchAdapter`/`AbstentionBenchAdapter`/`JSONSchemaBenchAdapter`/`XSTestAdapter` pattern for a benchmark that ships prompts/labels but not ready-made contrastive pairs: `normalize` is where the (positive, negative) contrast is synthesized, and that construction is the substantive per-benchmark logic, not just column renaming.
