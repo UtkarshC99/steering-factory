@@ -1,6 +1,13 @@
 experiment:
   name: qwen-gemma-safety-and-benchmark-study
   seed: 17
+  # Labeled-example-count axis for the data-efficiency curve: run_steering
+  # extracts one vector per point (subsampling the steer pool) and
+  # run_qlora trains one adapter per point (subsampling the train pool).
+  # Validation/test are never subsampled, so quality at each N is always
+  # measured on identical held-out data. Remove this key to fall back to a
+  # single run at the full steer/train pool size (the pre-n_sweep default).
+  n_sweep: [8, 16, 32, 64, 128, 256, 512]
 artifacts:
   root: /content/steering_factory_artifacts
   publish_root: null
@@ -18,6 +25,14 @@ splits:
   steer_fraction: 0.2
   validation_fraction: 0.2
   group_key: category
+capability_probe:
+  # Benign general-capability regression control (steering_factory/
+  # capability_probe.py): measures collateral damage from steering, not
+  # just target-behavior quality. Opt-in and off by default because it
+  # multiplies generation cost roughly by (num_probes / num_eval_examples)
+  # on top of the existing coefficient/layer/method sweep.
+  enabled: true
+  max_new_tokens: 24
 decoding:
   max_new_tokens: 96
   batch_size: 16

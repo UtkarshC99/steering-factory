@@ -328,6 +328,51 @@ def _evaluate_vector_grid(
     return rows
 
 
+def _run_capability_probe_for_vector(
+    loaded: Any, vector: Any, layer_idx: int, method: str, recipe_id: str,
+    model_id: Optional[str], model_name: Optional[str], coefficients: List[float], token_scope: str,
+    max_new_tokens: int, base_cache: Dict[str, List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Runs the benign capability probe (capability_probe.py) at every
+    coefficient already being evaluated for this vector (reusing the same
+    grid `_evaluate_vector_grid` used, not a separately-configured one),
+    plus the base model once per model_id (cached in `base_cache` across
+    every recipe/vector for that model, since the base model's own
+    capability never changes across recipes -- no reason to re-measure it
+    once per vector).
+
+    Returns rows keyed the same way `full_config_grid` keys the quality
+    grid -- (model_id, recipe_id, method, layer_idx, coefficient) -- so
+    comparison.py can join capability retention onto the same config a
+    quality point belongs to, without a separate lookup scheme.
+    """
+    from .capability_probe import capability_quality, capability_retention, run_capability_probe_steering
+
+    rows: List[Dict[str, Any]] = []
+    cache_key = model_id or "model"
+    if cache_key not in base_cache:
+        base_cache[cache_key] = run_capability_probe_steering(
+            loaded, vector, layer_idx, 0.0, token_scope, max_new_tokens,
+        )
+    base_rows = base_cache[cache_key]
+    base_quality = capability_quality(base_rows)
+
+    for coefficient in coefficients:
+        steered_rows = (
+            base_rows if coefficient == 0.0
+            else run_capability_probe_steering(loaded, vector, layer_idx, coefficient, token_scope, max_new_tokens)
+        )
+        rows.append({
+            "model_id": model_id, "model_name": model_name, "recipe_id": recipe_id,
+            "method": method, "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope,
+            "base_capability_quality": base_quality,
+            "steered_capability_quality": capability_quality(steered_rows),
+            "capability_retention": capability_retention(base_rows, steered_rows),
+            "n_probes": len(steered_rows),
+        })
+    return rows
+
+
 def run_evaluate(manifest: Dict[str, Any], vectors_run: str | Path, command: str | None = None, callback: Optional[RunCallback] = None) -> ArtifactStore:
     """Load vectors saved by `run_extract` and execute the generation/eval grid.
 
@@ -436,12 +481,23 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None, callback:
         recipe_map = {r["id"]: r for r in manifest["recipes"]}
         rows: List[Dict[str, Any]] = []
         vector_rows: List[Dict[str, Any]] = []
+        capability_rows: List[Dict[str, Any]] = []
         vectors_done = 0
         generations_done = 0
         decoding_cfg = manifest.get("decoding", {})
         max_new_tokens = decoding_cfg.get("max_new_tokens", 96)
         batch_size = decoding_cfg.get("batch_size", 16)
         extraction_batch_size = manifest.get("extraction", {}).get("batch_size", 16)
+        # Opt-in (default off): probing every extracted vector's full
+        # coefficient grid multiplies generation cost roughly by
+        # len(CAPABILITY_PROBES) / len(evaluate_examples) on top of the
+        # existing sweep -- proportional, not a new order of magnitude, but
+        # real cost a manifest should choose deliberately rather than pay
+        # by default on every run written before this existed.
+        capability_cfg = manifest.get("capability_probe", {})
+        capability_probe_enabled = bool(capability_cfg.get("enabled", False))
+        probe_max_new_tokens = capability_cfg.get("max_new_tokens", 24)
+        base_capability_cache: Dict[str, List[Dict[str, Any]]] = {}
         for model_cfg in manifest["models"]:
             fields = {key: value for key, value in model_cfg.items() if key in TargetModelConfig.__dataclass_fields__}
             loaded = load_model(TargetModelConfig(**fields))
@@ -464,7 +520,8 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None, callback:
                 token_scopes = grid.get("token_scopes", ["all"])
                 layers = grid.get("layers", [0.6])
                 resolved_layers = _resolve_layers(layers, loaded.num_layers)
-                n_coeffs = len(sorted(set([float(c) for c in coefficients] + [0.0])))
+                all_coefficients_for_probe = sorted(set([float(c) for c in coefficients] + [0.0]))
+                n_coeffs = len(all_coefficients_for_probe)
                 # generations_total is the per-recipe denominator (unchanged
                 # from before batching existed) -- generations_done keeps
                 # counting across the whole run, so "i" is monotonic but
@@ -504,12 +561,22 @@ def run_steering(manifest: Dict[str, Any], command: str | None = None, callback:
                             )
                             rows.extend(new_rows)
                             generations_done = progress["done"]
+
+                            if capability_probe_enabled:
+                                capability_rows.extend(_run_capability_probe_for_vector(
+                                    loaded, result.vector, layer_idx, method, recipe_id,
+                                    model_cfg.get("id"), model_cfg.get("name_or_path"),
+                                    all_coefficients_for_probe, token_scopes[0], probe_max_new_tokens,
+                                    base_capability_cache,
+                                ))
             del loaded
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         store.write_table("results/generations", rows)
         store.write_json("results/summary.json", aggregate(rows))
         store.write_table("vectors/index", vector_rows)
+        if capability_probe_enabled:
+            store.write_table("results/capability_probe", capability_rows)
         telemetry = {"wall_time_s": time.perf_counter() - started, "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
                      "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0,
                      "rows": len(rows), "vectors": len(vector_rows)}
