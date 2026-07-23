@@ -94,6 +94,10 @@ recipes:
       reviewed_dataset_card: true
       max_records: 100
     extraction: [mean_diff, pca, whitened_mean_diff]
+    # Same long-prompt OOM risk as preset_4bit_baseline.yaml's identical
+    # recipe -- halved relative to this preset's own batch_size: 24.
+    decoding:
+      batch_size: 12
   - id: benign_over_refusal_control
     behavior: harmful_instruction_compliance
     dataset:

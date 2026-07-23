@@ -146,6 +146,15 @@ recipes:
       reviewed_dataset_card: true
       max_records: 100
     extraction: [mean_diff, pca, whitened_mean_diff]
+    # This recipe's prompts embed a full JSON schema and routinely approach
+    # the 1024-token truncation cap, unlike HarmBench's short prompts --
+    # decoding.batch_size: 32 above was sized from HarmBench's own observed
+    # VRAM usage and is NOT safe here. A real run OOM'd specifically on this
+    # recipe (VRAM swinging ~21.8GB -> ~11-14GB -> ~11.5GB batch-to-batch, a
+    # real variable-size spike from long-prompt batches, not fragmentation).
+    # Halved relative to the manifest default as a conservative fix.
+    decoding:
+      batch_size: 16
   - id: benign_over_refusal_control
     # XSTest is a benign control set, not a steer source -- see
     # XSTestAdapter's docstring. Every row normalizes to split="test"
