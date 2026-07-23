@@ -144,7 +144,14 @@ def _generate_batched_rows(
         original_padding_side = tokenizer.padding_side
         tokenizer.padding_side = "left"
         try:
-            enc = tokenizer(prompt_texts, return_tensors="pt", padding=True).to(device)
+            # truncation=True, max_length=1024: see the identical guard in
+            # sweep.generate_with_steering_batch -- without a length cap, a
+            # single oversized prompt in the batch pads every other row out
+            # to match it, which is what caused a real CUDA OOM (~26 GiB
+            # requested in one torch.embedding call) during a steering
+            # sweep. Same fix applies here since this loop uses the same
+            # padding=True batching pattern.
+            enc = tokenizer(prompt_texts, return_tensors="pt", truncation=True, max_length=1024, padding=True).to(device)
         finally:
             tokenizer.padding_side = original_padding_side
         prompt_len = enc["input_ids"].shape[1]

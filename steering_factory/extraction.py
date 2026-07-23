@@ -206,8 +206,13 @@ def _completion_logprob(loaded: LoadedModel, prompt_text: str, completion_text: 
     only (teacher-forced), under whatever steering hook is currently active
     on the model. Returns a scalar tensor that supports backprop."""
     tokenizer = loaded.tokenizer
-    prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids
-    full_ids = tokenizer(prompt_text + completion_text, return_tensors="pt").input_ids
+    # Same truncation cap as _encode/_pooled_activations_batch above: an
+    # unbounded prompt+completion here isn't a batch-padding risk (this is
+    # always batch size 1), but a single pathologically long pair could
+    # still blow up attention memory on its own, so it gets the same
+    # defensive bound as every other tokenizer call site in this module.
+    prompt_ids = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=1024).input_ids
+    full_ids = tokenizer(prompt_text + completion_text, return_tensors="pt", truncation=True, max_length=1024).input_ids
     prompt_len = prompt_ids.shape[1]
 
     full_ids = full_ids.to(device)
