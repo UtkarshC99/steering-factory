@@ -91,6 +91,13 @@ recipes:
       reviewed_dataset_card: true
       max_records: 100
     extraction: [mean_diff, pca, whitened_mean_diff]
+    # Prompts embed a full JSON schema and routinely approach the 1024-token
+    # truncation cap, unlike this preset's other recipes -- a real run OOM'd
+    # specifically here at the manifest-wide batch_size=32 (VRAM swinging
+    # ~21.8GB -> ~11-14GB -> ~11.5GB batch-to-batch, a genuine variable-size
+    # spike, not fragmentation). Halved as a conservative fix.
+    decoding:
+      batch_size: 16
   - id: benign_over_refusal_control
     behavior: harmful_instruction_compliance
     dataset:

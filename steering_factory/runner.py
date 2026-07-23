@@ -191,6 +191,50 @@ def _count_extract_units(manifest: Dict[str, Any], examples: List[Dict[str, Any]
     return total
 
 
+def _count_generation_units(manifest: Dict[str, Any], examples: List[Dict[str, Any]], num_layers_by_model: Dict[str, int]) -> int:
+    """Total generation+score rows the whole run will produce, across every
+    model/recipe/n_sweep-point/method/layer/coefficient/token_scope/eval
+    example -- computed ONCE up front so the "i/n" progress pair printed by
+    PrintSummaryCallback stays meaningful for the entire run, not just the
+    current recipe.
+
+    Before this existed, `run_steering`'s progress["total"] was recomputed
+    inside the per-recipe loop from THAT recipe's own grid size alone
+    (`generations_total = len(resolved_layers) * len(methods) *
+    len(token_scopes) * len(evaluate) * n_coeffs`), while `i`
+    (`generations_done`) kept counting across every recipe and model in the
+    run without ever resetting. The two were mismatched by construction --
+    "n" silently shrank back down every time a new recipe started even
+    though "i" was still climbing from every recipe processed before it,
+    producing exactly the "2030/1080" nonsense a real run showed (i was
+    real cumulative progress; n was just the third recipe's own total,
+    already smaller than i from the first two). Mirrors
+    `_count_extract_units`'s existing run-wide-total pattern."""
+    recipe_map = {r["id"]: r for r in manifest["recipes"]}
+    n_sweep = _n_sweep_values(manifest, default_n=None)
+    total = 0
+    for model_cfg in manifest["models"]:
+        num_layers = num_layers_by_model.get(model_cfg.get("id"))
+        if num_layers is None:
+            continue
+        for recipe_id, recipe in recipe_map.items():
+            recipe_examples = [e for e in examples if e["recipe_id"] == recipe_id]
+            steer = [e for e in recipe_examples if e["split"] == "steer"]
+            evaluate = [e for e in recipe_examples if e["split"] in ("validation", "test")]
+            if not steer or not evaluate:
+                continue
+            methods = recipe.get("extraction", ["mean_diff"])
+            grid = recipe.get("application", {})
+            coefficients = grid.get("coefficients", [0.0, 1.0])
+            token_scopes = grid.get("token_scopes", ["all"])
+            layers = grid.get("layers", [0.6])
+            resolved_layers = _resolve_layers(layers, num_layers)
+            n_coeffs = len(sorted(set([float(c) for c in coefficients] + [0.0])))
+            points = n_sweep or [len(steer)]
+            total += len(resolved_layers) * len(methods) * len(token_scopes) * len(evaluate) * n_coeffs * len(points)
+    return total
+
+
 def _n_sweep_values(manifest: Dict[str, Any], default_n: Optional[int]) -> Optional[List[int]]:
     """`experiment.n_sweep` (e.g. [8, 16, 32, 64, 128, 256, 512]) is the
     labeled-example-count axis the comparison report's data-efficiency
@@ -589,10 +633,13 @@ def run_evaluate(
             token_scopes = grid.get("token_scopes", ["all"])
             layer_idx = vrow["layer_idx"]
             method = vrow["method"]
+            # Per-recipe decoding.batch_size override -- see the identical
+            # comment in run_steering's equivalent loop.
+            recipe_batch_size = recipe.get("decoding", {}).get("batch_size", batch_size)
 
             rows.extend(_evaluate_vector_grid(
                 loaded, vector, layer_idx, method, recipe_id, vrow["model_id"], vrow["model"],
-                evaluate_examples, coefficients, token_scopes, max_new_tokens, batch_size, callback, progress, judge,
+                evaluate_examples, coefficients, token_scopes, max_new_tokens, recipe_batch_size, callback, progress, judge,
             ))
             # Same per-vector cache clear as run_steering's equivalent loop
             # -- see the comment there for the fragmentation OOM this
@@ -665,7 +712,6 @@ def run_steering(
         vector_rows: List[Dict[str, Any]] = []
         capability_rows: List[Dict[str, Any]] = []
         vectors_done = 0
-        generations_done = 0
         decoding_cfg = manifest.get("decoding", {})
         max_new_tokens = decoding_cfg.get("max_new_tokens", 96)
         batch_size = decoding_cfg.get("batch_size", 16)
@@ -690,6 +736,19 @@ def run_steering(
                 "tokenizer_revision": getattr(loaded.tokenizer, "init_kwargs", {}).get("_commit_hash"),
             })
             vectors_total = _count_extract_units(manifest, examples, {model_cfg.get("id"): loaded.num_layers})
+            # Computed once per model (mirrors vectors_total immediately
+            # above), covering every recipe THIS model will process --
+            # fixes a real progress-counter bug: generations_total used to
+            # be recomputed inside the recipe loop below from that recipe's
+            # OWN grid size alone, while generations_done/i kept counting
+            # across every recipe (and model) in the run without resetting,
+            # so "n" silently shrank every time a new recipe started even
+            # though "i" was still climbing from recipes already finished --
+            # a real run showed this as a nonsensical "2030/1080". i is
+            # reset to 0 per model (see generations_done reset below) so
+            # this total and i stay in the same scope throughout.
+            generations_total_for_model = _count_generation_units(manifest, examples, {model_cfg.get("id"): loaded.num_layers})
+            generations_done = 0
             for recipe_id, recipe in recipe_map.items():
                 recipe_examples = [e for e in examples if e["recipe_id"] == recipe_id]
                 steer = [e for e in recipe_examples if e["split"] == "steer"]
@@ -704,12 +763,21 @@ def run_steering(
                 resolved_layers = _resolve_layers(layers, loaded.num_layers)
                 all_coefficients_for_probe = sorted(set([float(c) for c in coefficients] + [0.0]))
                 n_coeffs = len(all_coefficients_for_probe)
-                # generations_total is the per-recipe denominator (unchanged
-                # from before batching existed) -- generations_done keeps
-                # counting across the whole run, so "i" is monotonic but
-                # "n" changes when a new recipe starts. Preserved as-is;
-                # not something this batching change is meant to alter.
-                generations_total = len(resolved_layers) * len(methods) * len(token_scopes) * len(evaluate) * n_coeffs
+                # Per-recipe override for decoding.batch_size, falling back
+                # to the manifest-level default. Recipes whose prompts run
+                # much longer than others (e.g. structured_output's JSON
+                # schemas, which routinely approach the 1024-token
+                # truncation cap, vs. HarmBench's short prompts) need a
+                # SMALLER batch at the same VRAM budget -- a single manifest-
+                # wide batch_size sized for the short-prompt recipes is
+                # exactly what produced a real CUDA OOM specifically on
+                # structured_output_real (observed VRAM swinging
+                # ~21.8GB -> ~11-14GB -> ~11.5GB batch-to-batch, a real
+                # variable-size spike, not fragmentation -- fragmentation
+                # would show a floor that doesn't come back down). Defaults
+                # to the run-wide batch_size when unset, so every existing
+                # manifest is unaffected.
+                recipe_batch_size = recipe.get("decoding", {}).get("batch_size", batch_size)
 
                 # n_points is the labeled-example-count axis (experiment.n_sweep);
                 # absent, this is exactly [len(steer)] -- one iteration using
@@ -736,10 +804,10 @@ def run_steering(
                                               "model_id": model_cfg.get("id"), "recipe_id": recipe_id,
                                               "method": method, "layer_idx": layer_idx, "num_pairs": len(pairs),
                                               "vector_norm": float(result.vector.norm())})
-                            progress = {"done": generations_done, "total": generations_total * len(n_points)}
+                            progress = {"done": generations_done, "total": generations_total_for_model}
                             new_rows = _evaluate_vector_grid(
                                 loaded, result.vector, layer_idx, method, recipe_id, model_cfg.get("id"), model_cfg.get("name_or_path"),
-                                evaluate, coefficients, token_scopes, max_new_tokens, batch_size, callback, progress, judge,
+                                evaluate, coefficients, token_scopes, max_new_tokens, recipe_batch_size, callback, progress, judge,
                             )
                             rows.extend(new_rows)
                             generations_done = progress["done"]
@@ -896,11 +964,23 @@ def run_qlora(
 
                     if not eval_examples:
                         continue
+                    # Per-recipe decoding.batch_size override, same as
+                    # run_steering/run_evaluate's identical loops -- without
+                    # this, a recipe with much longer prompts than the
+                    # manifest's other recipes (e.g. structured_output_real's
+                    # JSON-schema prompts, which routinely approach the
+                    # 1024-token truncation cap) would still run QLoRA eval
+                    # at the full manifest-wide batch size, exposed to the
+                    # identical variable-size-prompt VRAM spike that
+                    # produced a real OOM on the steering arm before its own
+                    # override was added -- _generate_batched_rows uses the
+                    # same padding=True batching pattern.
+                    recipe_eval_batch_size = recipe.get("decoding", {}).get("batch_size", eval_batch_size)
                     eval_started = _time.perf_counter()
                     eval_result = evaluate_qlora_adapter(
                         eval_examples, model["name_or_path"], train_result["adapter_dir"],
                         max_new_tokens=max_new_tokens, trust_remote_code=bool(model.get("trust_remote_code", False)),
-                        batch_size=eval_batch_size,
+                        batch_size=recipe_eval_batch_size,
                         quantization=model.get("quantization", "4bit"), dtype=model.get("dtype"),
                     )
                     for row in eval_result["rows"]:
