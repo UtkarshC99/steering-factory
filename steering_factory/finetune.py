@@ -209,3 +209,37 @@ def evaluate_qlora_adapter(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return {"rows": rows, "wall_time_s": time.perf_counter() - started}
+
+
+def evaluate_base_model(
+    examples: List[Dict[str, Any]],
+    model_name: str,
+    max_new_tokens: int = 96,
+    trust_remote_code: bool = False,
+    batch_size: int = 16,
+) -> Dict[str, Any]:
+    """Same as `evaluate_qlora_adapter` but loads the plain base model with
+    no PEFT adapter -- used for the "before" half of the QLoRA arm's
+    capability-regression measurement (capability_probe.py), so the
+    before/after comparison is exactly base-model vs base-model+adapter,
+    not base-model vs some other loading path."""
+    if not qlora_available():
+        raise RuntimeError("QLoRA requires optional dependencies: pip install peft trl datasets")
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+    started = time.perf_counter()
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
+    model = AutoModelForCausalLM.from_pretrained(model_name, quantization_config=quant, device_map="auto",
+                                                  trust_remote_code=trust_remote_code)
+    model.eval()
+
+    rows = _generate_batched_rows(model, tokenizer, examples, max_new_tokens, batch_size)
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"rows": rows, "wall_time_s": time.perf_counter() - started}

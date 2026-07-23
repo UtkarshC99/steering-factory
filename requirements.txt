@@ -11,6 +11,7 @@ streamlit>=1.36
 pandas
 plotly
 ipywidgets>=8.0   # required for plotly FigureWidget live updates in live_plot.py (notebook-only)
+matplotlib>=3.8   # static PNGs for comparison_plots.py (report.md images); comparison.py/comparison_report.py stay plot-free without it
 anthropic
 openai
 pytest

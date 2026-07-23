@@ -175,3 +175,170 @@ def apply_steering(
     hook = SteeringHook(layer_module, vector, coefficient, token_scope)
     with hook:
         yield
+
+
+class AblationHook:
+    """Projects `vector`'s direction OUT of the residual stream instead of
+    adding it in -- the defensive-hardening counterpart to SteeringHook's
+    additive intervention (directional ablation / "abliteration"): for
+    unit vector v_hat, h -> h - strength * (h . v_hat) * v_hat.
+
+    `strength` (0-1, default 1.0) scales how much of the projected
+    component is removed: 1.0 is full ablation (the component is
+    completely zeroed regardless of its sign/magnitude in that position);
+    values below 1.0 partially damp it. Unlike SteeringHook's additive
+    push (which can overshoot arbitrarily with a large enough coefficient),
+    ablation is bounded by construction -- it can only remove what's
+    already there, never add a new arbitrary-magnitude push -- which is
+    exactly the property that makes it a defensive/hardening operation
+    rather than another attack surface.
+
+    `token_scope` has the same meaning as SteeringHook's ("all",
+    "generated_only", "last")."""
+
+    def __init__(
+        self,
+        layer_module: torch.nn.Module,
+        vector: torch.Tensor,
+        strength: float = 1.0,
+        token_scope: TokenScope = "all",
+    ):
+        self.layer_module = layer_module
+        self.vector = vector
+        self.strength = strength
+        self.token_scope = token_scope
+        self._handle = None
+
+    def _ablate(self, hidden_states: torch.Tensor, v_hat: torch.Tensor) -> torch.Tensor:
+        projection = torch.matmul(hidden_states, v_hat)  # (..., seq) or (..., 1) depending on shape
+        return hidden_states - self.strength * projection.unsqueeze(-1) * v_hat
+
+    def _hook(self, module, inputs, output):
+        hidden_states, rest, was_tuple = _unwrap_output(output)
+        v_hat = self.vector.to(hidden_states.dtype).to(hidden_states.device)
+        v_hat = v_hat / v_hat.norm().clamp_min(1e-8)
+
+        if self.token_scope in ("generated_only", "last"):
+            seq_len = hidden_states.shape[1]
+            if self.token_scope == "generated_only" and seq_len > 1:
+                return _rewrap_output(hidden_states, rest, was_tuple)
+            hidden_states = hidden_states.clone()
+            hidden_states[:, -1, :] = self._ablate(hidden_states[:, -1, :], v_hat)
+            return _rewrap_output(hidden_states, rest, was_tuple)
+
+        hidden_states = self._ablate(hidden_states, v_hat)
+        return _rewrap_output(hidden_states, rest, was_tuple)
+
+    def __enter__(self):
+        self._handle = self.layer_module.register_forward_hook(self._hook)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._handle is not None:
+            self._handle.remove()
+            self._handle = None
+
+
+class ConditionalSteeringHook:
+    """CAST-style gated steering: adds `coefficient * vector` only at
+    positions whose activation projects onto `condition_vector` above
+    `threshold` -- everywhere else the intervention is a no-op for that
+    position. This is the mechanism for cutting benign over-refusal: a
+    plain additive SteeringHook pushes every input toward the behavior
+    regardless of whether that input actually needs it; gating on a
+    condition direction (e.g. "this input looks like an actual harmful
+    request", learned/extracted the same way a steering vector is)
+    confines the push to inputs that trigger the condition.
+
+    `condition_vector` is normalized internally; the projection is a
+    signed dot product against the RAW (non-unit) activation, following
+    CAST's own formulation, since the threshold is calibrated in whatever
+    scale the activations naturally live in. `vector` (the behavior
+    direction) is used as-is, matching SteeringHook's own convention (its
+    magnitude is meaningful -- it is what "coefficient" scales).
+    """
+
+    def __init__(
+        self,
+        layer_module: torch.nn.Module,
+        vector: torch.Tensor,
+        coefficient: float,
+        condition_vector: torch.Tensor,
+        threshold: float,
+        token_scope: TokenScope = "all",
+    ):
+        self.layer_module = layer_module
+        self.vector = vector
+        self.coefficient = coefficient
+        self.condition_vector = condition_vector
+        self.threshold = threshold
+        self.token_scope = token_scope
+        self._handle = None
+
+    def _gate_mask(self, hidden_states: torch.Tensor, cond_hat: torch.Tensor) -> torch.Tensor:
+        projection = torch.matmul(hidden_states, cond_hat)  # (batch, seq)
+        return (projection > self.threshold).unsqueeze(-1)  # (batch, seq, 1), broadcasts over hidden
+
+    def _hook(self, module, inputs, output):
+        hidden_states, rest, was_tuple = _unwrap_output(output)
+        vec = self.vector.to(hidden_states.dtype).to(hidden_states.device)
+        cond = self.condition_vector.to(hidden_states.dtype).to(hidden_states.device)
+        cond_hat = cond / cond.norm().clamp_min(1e-8)
+
+        if self.token_scope in ("generated_only", "last"):
+            seq_len = hidden_states.shape[1]
+            if self.token_scope == "generated_only" and seq_len > 1:
+                return _rewrap_output(hidden_states, rest, was_tuple)
+            hidden_states = hidden_states.clone()
+            last = hidden_states[:, -1:, :]
+            gate = self._gate_mask(last, cond_hat).to(last.dtype)
+            hidden_states[:, -1:, :] = last + gate * self.coefficient * vec
+            return _rewrap_output(hidden_states, rest, was_tuple)
+
+        gate = self._gate_mask(hidden_states, cond_hat).to(hidden_states.dtype)
+        hidden_states = hidden_states + gate * self.coefficient * vec
+        return _rewrap_output(hidden_states, rest, was_tuple)
+
+    def __enter__(self):
+        self._handle = self.layer_module.register_forward_hook(self._hook)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._handle is not None:
+            self._handle.remove()
+            self._handle = None
+
+
+@contextmanager
+def apply_ablation(
+    layer_module: torch.nn.Module,
+    vector: Optional[torch.Tensor],
+    strength: float = 1.0,
+    token_scope: TokenScope = "all",
+):
+    """No-op if vector is None or strength == 0, matching apply_steering's
+    baseline-path convention."""
+    if vector is None or strength == 0:
+        yield
+        return
+    hook = AblationHook(layer_module, vector, strength, token_scope)
+    with hook:
+        yield
+
+
+@contextmanager
+def apply_conditional_steering(
+    layer_module: torch.nn.Module,
+    vector: Optional[torch.Tensor],
+    coefficient: float,
+    condition_vector: Optional[torch.Tensor],
+    threshold: float,
+    token_scope: TokenScope = "all",
+):
+    """No-op if vector or condition_vector is None or coefficient == 0."""
+    if vector is None or condition_vector is None or coefficient == 0:
+        yield
+        return
+    hook = ConditionalSteeringHook(layer_module, vector, coefficient, condition_vector, threshold, token_scope)
+    with hook:
+        yield
