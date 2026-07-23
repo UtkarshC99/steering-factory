@@ -2,12 +2,19 @@
 the accompanying JSON. Kept separate from `comparison.py` so the pure
 data-joining logic (easy to unit test without touching disk formatting) is
 not tangled with presentation.
+
+`render_comparison_markdown` itself has no plotting dependency -- it only
+knows how to format an already-computed `{"model__recipe": [filenames]}`
+mapping (produced by `comparison_plots.render_comparison_plots`, which
+requires matplotlib) into Markdown image links. This keeps the plotting
+library import confined to `comparison_plots.py`, the same isolation
+`live_plot.py` already applies for plotly.
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 
 def _fmt(value: Any, digits: int = 4) -> str:
@@ -32,7 +39,7 @@ def _winner(entry: Dict[str, Any]) -> str:
     return "steering" if sq > qq else ("qlora" if qq > sq else "tie")
 
 
-def render_comparison_markdown(comparison: Dict[str, Any]) -> str:
+def render_comparison_markdown(comparison: Dict[str, Any], plot_paths: Optional[Dict[str, List[str]]] = None) -> str:
     lines = ["# Steering vs QLoRA comparison", "",
              f"- Steering run: `{comparison.get('steering_run')}`",
              f"- QLoRA run: `{comparison.get('qlora_run')}`",
@@ -61,6 +68,28 @@ def render_comparison_markdown(comparison: Dict[str, Any]) -> str:
                 f"{config} | {_fmt(qq)} | {n_test} | {_winner(entry)} |"
             )
         lines.append("")
+
+        if plot_paths:
+            lines.append("## Visualizations")
+            lines.append("")
+            lines.append(
+                "The data-efficiency curve shows at what labeled-example count (if any) one arm's "
+                "quality overtakes the other's. The layer x coefficient heatmap shows how robust the "
+                "validation-selected steering config is -- a lone bright cell surrounded by much worse "
+                "neighbors is a fragile pick; a broad bright region is a robust one -- and how many "
+                "configs in the grid actually beat QLoRA's quality, not just the single selected point."
+            )
+            lines.append("")
+            for entry in entries:
+                key = f"{entry['model_id']}__{entry['recipe_id']}"
+                paths = plot_paths.get(key)
+                if not paths:
+                    continue
+                lines.append(f"### {entry['model_id']} / {entry['recipe_id']}")
+                lines.append("")
+                for filename in paths:
+                    lines.append(f"![{filename}]({filename})")
+                lines.append("")
 
         lines.append("## Cost")
         lines.append("")
@@ -114,6 +143,15 @@ def write_comparison_report(comparison: Dict[str, Any], output_root: str | Path)
     output = Path(output_root)
     output.mkdir(parents=True, exist_ok=True)
     (output / "report.json").write_text(json.dumps(comparison, indent=2, default=str), encoding="utf-8")
+
+    # Imported here, not at module level, so this module (and everything
+    # that transitively imports it, e.g. runner.compare) never requires
+    # matplotlib just to join/format a report -- only actually rendering
+    # plots does. A minimal install without the plotting extra still gets
+    # a full report.md/report.json, just without embedded images.
+    from .comparison_plots import render_comparison_plots
+    plot_paths = render_comparison_plots(comparison, output)
+
     markdown_path = output / "report.md"
-    markdown_path.write_text(render_comparison_markdown(comparison), encoding="utf-8")
+    markdown_path.write_text(render_comparison_markdown(comparison, plot_paths), encoding="utf-8")
     return markdown_path

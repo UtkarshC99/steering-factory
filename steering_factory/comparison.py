@@ -136,6 +136,42 @@ def best_steering_config(
     }
 
 
+def full_config_grid(rows: List[Dict[str, Any]], behavior_id: Optional[str]) -> List[Dict[str, Any]]:
+    """Every (method, layer, coefficient, token_scope) config's held-out
+    TEST quality, not just the validation-selected winner -- this is what a
+    layer/coefficient response-surface plot needs (best_steering_config only
+    returns the single winning point; a plot needs the whole grid to show
+    how close the runner-up configs are, i.e. whether the winner is robust
+    or a fluke on this data). Selection discipline is unchanged: this
+    reports each config's own test rows, it does not re-select anything, so
+    it never substitutes for validation-based selection -- it is a
+    diagnostic surface, not a second selection path.
+
+    Returns one row per (method, layer_idx, coefficient, token_scope) with
+    its mean test quality and row count, sorted by (method, layer, coefficient)
+    for stable, deterministic plot ordering.
+    """
+    quality_key = _quality_key(behavior_id, rows)
+    if quality_key is None:
+        return []
+    test_rows = [r for r in rows if r.get("split") == "test"]
+    by_config: Dict[Tuple, List[Dict[str, Any]]] = {}
+    for row in test_rows:
+        by_config.setdefault(_steering_config_key(row), []).append(row)
+
+    grid = []
+    for cfg, group in sorted(by_config.items(), key=lambda item: (str(item[0][0]), item[0][1] or 0, item[0][2] or 0)):
+        method, layer_idx, coefficient, token_scope = cfg
+        quality = _mean(group, quality_key)
+        if quality is None:
+            continue
+        grid.append({
+            "method": method, "layer_idx": layer_idx, "coefficient": coefficient,
+            "token_scope": token_scope, "test_quality": quality, "n_test": len(group),
+        })
+    return grid
+
+
 def qlora_quality(rows: List[Dict[str, Any]], behavior_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """QLoRA has exactly one trained config per (model, recipe) -- no
     layer/coefficient grid to select over -- so this just reports its
@@ -294,6 +330,8 @@ def build_comparison(
             "model_id": model_id, "recipe_id": recipe_id, "behavior_id": behavior_id,
             "steering": {**steer_quality, **_steering_cost(steer_dir, model_id, recipe_id, vector_rows, steer_gen_rows, selected_config)},
             "qlora": {**qlora_q, **_qlora_cost(qlora_results, model_id, recipe_id, qlora_gen_rows)},
+            "config_grid": full_config_grid(steer_rows, behavior_id),
+            "data_efficiency": data_efficiency_curve(steer_dir, qlora_dir, model_id, recipe_id),
         })
 
     return {
