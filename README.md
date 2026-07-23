@@ -171,21 +171,60 @@ and terms of use, not just a runtime check.
    (MIT), [walledai/XSTest](https://huggingface.co/datasets/walledai/XSTest) (CC-BY-4.0 prompts —
    real harmful-request text in the "contrast" half; review before use).
 2. **Verify the adapter's column mapping against the live dataset viewer**, not just this
-   README or the adapter's docstring. AbstentionBench's schema
-   (`question`/`reference_answers`/`should_abstain`/`metadata_json`) and JSONSchemaBench's
-   (`json_schema`/`unique_id`) were confirmed against their live dataset cards during
-   development. **HarmBench's (`Behavior`/`SemanticCategory`/`BehaviorID`) and XSTest's
-   (`prompt`/`type`) were sourced from published paper/repo documentation only** — both
-   datasets are access-gated and could not be independently verified against the live schema
-   from the development environment that built these adapters. Check the actual column names
-   in the HuggingFace dataset viewer before trusting a real run's results; if they've
-   changed, update the adapter's `mapping`/column-read logic in `datasets.py` to match.
+   README or the adapter's docstring. All four schemas are now confirmed against the live
+   dataset viewer, and `manifests/benchmarks.yaml` sets `reviewed_dataset_card: true` for all
+   four recipes accordingly:
+   - **AbstentionBench**: `question`/`reference_answers`/`should_abstain`/`metadata_json`
+     (the last is a JSON-*encoded string*, not a live dict — unused by this adapter either
+     way). Requires `trust_remote_code=True` **and** the `datasets` package pinned at
+     **`<= 3.6.0`** — the dataset card states it relies on a legacy dataset-script mechanism
+     removed in later `datasets` releases. `AbstentionBenchAdapter.load` checks the installed
+     version and raises a clear error before calling `load_dataset` if it's too new; if you
+     hit that error on Colab, run `pip install "datasets<=3.6.0"` first (this will downgrade
+     the version every other adapter and the rest of the pipeline uses too — only run
+     benchmark recipes that need AbstentionBench in that same environment, or use a separate
+     session).
+   - **JSONSchemaBench**: `json_schema`/`unique_id`. An 11-subset dropdown exists
+     (`Github_easy/hard/medium/trivial/ultra`, `Glaiveai2K`, `JsonSchemaStore`, `Kubernetes`,
+     `Snowplow`, `WashingtonPost`, plus the aggregate `default` — 9.56K rows total, 5.75K in
+     the `train` split). The adapter defaults to `default`; override `subset` in the manifest
+     to target one domain.
+   - **HarmBench** (`walledai/HarmBench`): `prompt`/`context`/`category`, with `standard` and
+     `contextual` subsets — `context` (supplied reference material) is present only in
+     `contextual` and is prepended to the prompt when it exists.
+   - **XSTest** (`walledai/XSTest`): `prompt`/`focus`/`type`/`note`/`label`, single `test`
+     split (450 rows) — `label` (`"safe"`/`"unsafe"`) is the actual safe/unsafe discriminator;
+     `type` is a fine-grained category (e.g. `"homonyms"`) shared by both safe and unsafe rows,
+     not a `contrast_`-prefixed marker as earlier documentation assumed.
+
+   Re-verify against the live viewer yourself before a real run if a schema may have changed
+   since, and update the adapter's column-read logic in `datasets.py` to match.
 3. Request access where required (HarmBench) and confirm you're authorized to use the data
    for this research purpose.
 4. Only then set `reviewed_dataset_card: true` for that recipe in your manifest.
 
 This step needs a GPU session with network access (e.g. Colab) — it cannot be validated
 offline or in a CI environment.
+
+### If a dataset fails to load (`dataset.on_load_error`)
+
+By default, a dataset adapter raising (a version mismatch, a network error, a schema that
+changed upstream) aborts the **entire run** — every recipe, both models — not just the
+recipe whose dataset failed. That is the deliberate default for a research pipeline:
+silently dropping a recipe and continuing could produce a report that looks complete but is
+quietly missing a whole arm, exactly the kind of silent-degradation failure mode the
+report-honesty work elsewhere in this codebase (`comparison.py`'s n-floor guard, baseline
+exclusion, held-out assertion) exists to catch, not add.
+
+Set `dataset.on_load_error: skip` on a specific recipe to opt out of that default for just
+that recipe: the run continues with the other recipes, and the failure is recorded loudly at
+`data/<recipe_id>.load_error.json` (never silently swallowed) — a recipe skipped this way is
+structurally identical to a recipe whose steer/eval split turned out empty, which every
+runner entrypoint already tolerates. `manifests/benchmarks.yaml` sets this for
+`calibrated_abstention_real` (AbstentionBench) specifically, since a `datasets>=3.7`
+version-guard failure there is the single most likely load error in this manifest and fixing
+it usually means a separate environment/session anyway — every other recipe keeps the
+default (`on_load_error` unset ≡ `raise`).
 
 ## Extending the framework
 

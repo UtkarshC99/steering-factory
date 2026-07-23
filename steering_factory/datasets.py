@@ -111,41 +111,49 @@ def _require_reviewed_dataset_card(config: Dict[str, Any], adapter_name: str, da
 
 
 class HarmBenchAdapter:
-    """HarmBench (Mazeika et al. 2024, MIT-licensed harness/code; dataset
-    access is gated on HuggingFace and requires agreeing to share contact
-    info) behavior prompts, for the `harmful_instruction_compliance` /
+    """HarmBench (Mazeika et al. 2024) via the walledai/HarmBench mirror on
+    HuggingFace, for the `harmful_instruction_compliance` /
     `jailbreak_susceptibility` safety behaviors.
 
-    Schema (as documented by the HarmBench paper/repo -- VERIFY against the
-    live dataset card / viewer once you have gated access on Colab, before
-    trusting a real run; this adapter cannot be validated against live
-    rows from this environment): `Behavior` (the harmful instruction
-    text), `FunctionalCategory`, `SemanticCategory`, `Tags`, `BehaviorID`.
+    Schema (CONFIRMED against the live dataset viewer, 2026 -- this
+    replaces an earlier version of this adapter that used the original
+    paper/repo's Behavior/SemanticCategory/BehaviorID column names, which
+    do NOT match this HF mirror): `prompt` (str, the harmful instruction),
+    `context` (str, present for the `contextual` subset's behaviors that
+    reference supplied material -- empty/absent for `standard`), `category`
+    (str; observed values include chemical_biological,
+    misinformation_disinformation, cybercrime_intrusion, and others).
+    Subsets observed: `standard`, `contextual` (at least 3 total per the
+    dataset viewer); `contextual` rows carry a `context` field that
+    `standard` rows don't. Single `train` split. No stable per-row id
+    column -- this adapter uses the row index, consistent with every other
+    adapter's fallback when a benchmark has no id field.
 
     HarmBench ships prompts, not (positive, negative) completions -- this
     adapter synthesizes the contrast: `positive` is a short, generic
     refusal (the SAFE completion, matching this taxonomy's sign
     convention), `negative` is a short, generic compliance stub. Neither
-    string reproduces or elaborates on the harmful behavior itself.
+    string reproduces or elaborates on the harmful behavior itself. For
+    `contextual`-subset rows, `context` is prepended to the prompt so the
+    steering pair reflects the same input the model would actually see.
     """
     name = "harmbench"
     default_dataset = "walledai/HarmBench"
 
     def load(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
-        _require_reviewed_dataset_card(config, "HarmBenchAdapter", config.get("dataset", self.default_dataset), "MIT (code) / gated access (data)")
+        _require_reviewed_dataset_card(config, "HarmBenchAdapter", config.get("dataset", self.default_dataset), "gated access (data)")
         try:
             from datasets import load_dataset
         except ImportError as exc:
             raise RuntimeError("Install the optional 'datasets' dependency to load benchmark adapters.") from exc
         ds = load_dataset(config.get("dataset", self.default_dataset), config.get("subset", "standard"),
                            split=config.get("split", "train"), cache_dir=config.get("cache_dir"))
-        mapping = config.get("columns", {"prompt": "Behavior", "category": "SemanticCategory", "id": "BehaviorID"})
         rows = []
         for index, row in enumerate(ds):
+            context = row.get("context") or ""
+            prompt = f"{context}\n\n{row.get('prompt')}" if context else row.get("prompt")
             rows.append({
-                "id": str(row.get(mapping.get("id", "BehaviorID"), index)),
-                "prompt": row.get(mapping.get("prompt", "Behavior")),
-                "category": row.get(mapping.get("category", "SemanticCategory")),
+                "id": str(index), "prompt": prompt, "category": row.get("category"),
                 "source": config.get("dataset", self.default_dataset),
             })
         return rows
@@ -162,20 +170,54 @@ class HarmBenchAdapter:
         )
 
 
+def _check_datasets_version_for_legacy_script(max_version: str, dataset_id: str) -> None:
+    """AbstentionBench's dataset card states it "only supports datasets
+    versions <= 3.6.0" because loading it relies on a legacy dataset-script
+    mechanism `datasets` removed in later releases -- on a newer install
+    (this project's requirements.txt previously pinned only `>=2.19`, no
+    upper bound, and a fresh Colab install pulls the current release,
+    5.x+) `load_dataset(..., trust_remote_code=True)` would fail with an
+    error about the removed script API, not a clear message about the
+    version mismatch that caused it. This raises the clear message first.
+    """
+    import datasets as datasets_pkg
+    from packaging.version import Version
+
+    installed = Version(datasets_pkg.__version__)
+    if installed > Version(max_version):
+        raise RuntimeError(
+            f"{dataset_id} requires the 'datasets' package at version <= {max_version} "
+            f"(it relies on a legacy dataset-script loading mechanism removed in later "
+            f"releases) but {installed} is installed. Run: pip install 'datasets<={max_version}' "
+            f"in this environment before loading this adapter."
+        )
+
+
 class AbstentionBenchAdapter:
     """AbstentionBench (facebook/AbstentionBench, cc-by-nc-4.0, requires
     `trust_remote_code=True` per its dataset card) for the
     `appropriate_abstention` behavior.
 
-    Schema (confirmed from the dataset card): `question` (str),
-    `reference_answers` (list[str] | None), `should_abstain` (bool),
-    `metadata_json` (dict). `positive` is an abstention phrase when
-    `should_abstain` is True, else the first reference answer; `negative`
-    is the opposite, so the extracted direction points toward
-    *appropriate* abstention rather than abstention in general.
+    Schema (confirmed from the dataset card, including a live example row):
+    `question` (str), `reference_answers` (list[str] | None),
+    `should_abstain` (bool), `metadata_json` (str -- a JSON-encoded string
+    per the dataset card's own example row, e.g.
+    '{"ALCUNA_entity_id": -171}', NOT a live dict; this adapter does not
+    currently read it, so its exact shape doesn't affect normalize()).
+    `positive` is an abstention phrase when `should_abstain` is True, else
+    the first reference answer; `negative` is the opposite, so the
+    extracted direction points toward *appropriate* abstention rather than
+    abstention in general.
+
+    The dataset card also states this dataset "only supports datasets
+    versions <= 3.6.0" (a legacy dataset-script mechanism) -- `load` checks
+    the installed `datasets` version explicitly and raises a clear error
+    before calling `load_dataset` if it's too new, rather than surfacing
+    whatever opaque error the removed-script-API path would raise instead.
     """
     name = "abstentionbench"
     default_dataset = "facebook/AbstentionBench"
+    max_datasets_version = "3.6.0"
 
     def load(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
         _require_reviewed_dataset_card(config, "AbstentionBenchAdapter", config.get("dataset", self.default_dataset), "cc-by-nc-4.0")
@@ -183,6 +225,7 @@ class AbstentionBenchAdapter:
             from datasets import load_dataset
         except ImportError as exc:
             raise RuntimeError("Install the optional 'datasets' dependency to load benchmark adapters.") from exc
+        _check_datasets_version_for_legacy_script(self.max_datasets_version, config.get("dataset", self.default_dataset))
         ds = load_dataset(config.get("dataset", self.default_dataset), config.get("subset"),
                            split=config.get("split", "train"), cache_dir=config.get("cache_dir"),
                            trust_remote_code=True)
@@ -217,15 +260,17 @@ class JSONSchemaBenchAdapter:
     """JSONSchemaBench (epfl-dlab/JSONSchemaBench, MIT license, public) for
     the `structured_output` behavior.
 
-    Schema (confirmed from the dataset card): `json_schema` (str, the
-    schema definition), `unique_id` (str). Has real train/validation/test
-    splits and 11 domain subsets (Github_*, Glaiveai2K, JsonSchemaStore,
-    Kubernetes, Snowplow, WashingtonPost) -- pass `subset` in the manifest
-    to pick one. `positive` is a request-formatted prompt whose target is
-    "produce valid JSON for this schema" (the actual instance is not
-    generated here -- evaluation scores parse/schema-validity against the
-    schema itself, same as the existing structured_output evaluator);
-    `negative` is a deliberately non-JSON free-text stub.
+    Schema (CONFIRMED against the live dataset viewer, 2026): `json_schema`
+    (str, the schema definition), `unique_id` (str). The live viewer shows
+    a `default` subset (9.56K rows total) with a `train` split (5.75K
+    rows) -- this replaces an earlier version of this adapter that
+    defaulted to a `JsonSchemaStore` subset name sourced from the paper's
+    described 11 domain-specific subsets (Github_*, Glaiveai2K,
+    JsonSchemaStore, Kubernetes, Snowplow, WashingtonPost, ...), which is
+    NOT confirmed to be a valid `datasets.load_dataset` config name for
+    this HF mirror and would have failed to load. `subset` is still
+    manifest-overridable in case a domain-specific config is confirmed
+    valid later; `default` is what's confirmed to exist now.
     """
     name = "jsonschemabench"
     default_dataset = "epfl-dlab/JSONSchemaBench"
@@ -236,7 +281,7 @@ class JSONSchemaBenchAdapter:
             from datasets import load_dataset
         except ImportError as exc:
             raise RuntimeError("Install the optional 'datasets' dependency to load benchmark adapters.") from exc
-        ds = load_dataset(config.get("dataset", self.default_dataset), config.get("subset", "JsonSchemaStore"),
+        ds = load_dataset(config.get("dataset", self.default_dataset), config.get("subset", "default"),
                            split=config.get("split", "train"), cache_dir=config.get("cache_dir"))
         rows = []
         for row in ds:
@@ -259,17 +304,21 @@ class JSONSchemaBenchAdapter:
 
 
 class XSTestAdapter:
-    """XSTest (paul-rottger/xstest via walledai/XSTest mirror, CC-BY-4.0
-    prompts) -- a BENIGN OVER-REFUSAL control set, not an extraction
+    """XSTest (Rottger et al. 2024) via the walledai/XSTest mirror on
+    HuggingFace -- a BENIGN OVER-REFUSAL control set, not an extraction
     source. 250 safe prompts across 10 categories that a model should
     answer, paired with 200 matched "contrast" prompts (superficially
-    similar, genuinely unsafe) that a model should refuse.
+    similar, genuinely unsafe) that a model should refuse. Single `test`
+    split, 450 rows total.
 
-    Schema (confirmed from the paper/repo): `prompt` (str), `type` (str;
-    unsafe/contrast categories are `contrast_`-prefixed, matching each safe
-    category by suffix) -- VERIFY exact column names against the live
-    dataset card once you have access, since the HF mirror's exact field
-    names were not independently confirmed from this environment (gated).
+    Schema (CONFIRMED against the live dataset viewer, 2026 -- this
+    replaces an earlier version of this adapter that inferred safe/unsafe
+    from a `contrast_`-prefixed `type` string, which does NOT exist in this
+    schema): `prompt` (str), `focus` (str, e.g. the homonym/trigger word),
+    `type` (str, fine-grained category, e.g. "homonyms" -- NOT a safe/
+    unsafe discriminator here), `note` (str, category grouping), `label`
+    (str, exactly "safe" or "unsafe" -- THIS is the real safe/unsafe
+    discriminator, a separate column from `type`).
 
     Unlike the other three adapters, this one does not synthesize a
     (positive, negative) pair for steering extraction -- XSTest exists to
@@ -289,14 +338,14 @@ class XSTestAdapter:
             from datasets import load_dataset
         except ImportError as exc:
             raise RuntimeError("Install the optional 'datasets' dependency to load benchmark adapters.") from exc
-        ds = load_dataset(config.get("dataset", self.default_dataset), split=config.get("split", "train"),
+        ds = load_dataset(config.get("dataset", self.default_dataset), split=config.get("split", "test"),
                            cache_dir=config.get("cache_dir"))
         rows = []
         for index, row in enumerate(ds):
-            prompt_type = row.get("type", "")
+            label = str(row.get("label", "")).strip().lower()
             rows.append({
-                "id": str(index), "prompt": row.get("prompt"), "category": prompt_type,
-                "is_unsafe_contrast": str(prompt_type).startswith("contrast_"),
+                "id": str(index), "prompt": row.get("prompt"), "category": row.get("type"),
+                "is_unsafe_contrast": label == "unsafe",
                 "source": config.get("dataset", self.default_dataset),
             })
         return rows
