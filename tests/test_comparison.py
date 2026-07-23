@@ -7,7 +7,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
-from steering_factory.comparison import best_steering_config, build_comparison, data_efficiency_curve, qlora_quality
+from steering_factory.comparison import (
+    HeldOutViolation,
+    assert_disjoint_selection_and_test_rows,
+    best_steering_config,
+    build_comparison,
+    data_efficiency_curve,
+    qlora_quality,
+)
 from steering_factory.comparison_report import render_comparison_markdown, write_comparison_report
 from steering_factory.runner import _is_qlora_run, _is_steering_run, compare
 
@@ -498,3 +505,48 @@ def test_data_efficiency_curve_reports_both_n_points_for_each_arm(tmp_path):
     by_n = {p["labeled_examples"]: p["quality"] for p in curve["qlora"]}
     assert by_n[8] == pytest.approx(0.3)
     assert by_n[200] == pytest.approx(0.6)
+
+
+# --- Held-out vulnerability protocol guard --------------------------------------
+
+def test_assert_disjoint_selection_and_test_rows_passes_when_disjoint():
+    selection = [{"example_id": "a"}, {"example_id": "b"}]
+    test = [{"example_id": "c"}, {"example_id": "d"}]
+    assert_disjoint_selection_and_test_rows(selection, test)  # must not raise
+
+
+def test_assert_disjoint_selection_and_test_rows_raises_on_overlap():
+    selection = [{"example_id": "a"}, {"example_id": "b"}]
+    test = [{"example_id": "b"}, {"example_id": "c"}]  # "b" leaked into both
+    with pytest.raises(HeldOutViolation, match="b"):
+        assert_disjoint_selection_and_test_rows(selection, test)
+
+
+def test_assert_disjoint_selection_and_test_rows_ignores_missing_example_ids():
+    # Rows with no example_id at all shouldn't spuriously trigger the guard.
+    selection = [{"example_id": None}, {}]
+    test = [{"example_id": None}, {}]
+    assert_disjoint_selection_and_test_rows(selection, test)  # must not raise
+
+
+def test_best_steering_config_raises_if_validation_and_test_rows_share_example_ids():
+    # Constructs a deliberately-leaked fixture (same example_id appearing in
+    # both splits for the winning config) to prove the guard fires from
+    # inside the real call path, not just when called directly.
+    rows = [
+        {"split": "validation", "method": "mean_diff", "layer_idx": 5, "coefficient": 1.0,
+         "token_scope": "all", "example_id": "leaked", "exact_match": 1.0},
+        {"split": "test", "method": "mean_diff", "layer_idx": 5, "coefficient": 1.0,
+         "token_scope": "all", "example_id": "leaked", "exact_match": 1.0},  # same id, wrong split
+    ]
+    with pytest.raises(HeldOutViolation):
+        best_steering_config(rows, "domain_classification")
+
+
+def test_qlora_quality_raises_if_validation_and_test_rows_share_example_ids():
+    rows = [
+        {"split": "validation", "example_id": "leaked", "exact_match": 1.0},
+        {"split": "test", "example_id": "leaked", "exact_match": 1.0},
+    ]
+    with pytest.raises(HeldOutViolation):
+        qlora_quality(rows, "domain_classification")

@@ -79,6 +79,45 @@ def _steering_config_key(row: Dict[str, Any]) -> Tuple:
     return (row.get("method"), row.get("layer_idx"), row.get("coefficient"), row.get("token_scope"))
 
 
+class HeldOutViolation(RuntimeError):
+    """Raised when a reported test-split quality number is computed from
+    rows that overlap the validation rows used to select a config -- i.e.
+    the held-out vulnerability/quality protocol was violated somewhere
+    upstream of this call."""
+
+
+def assert_disjoint_selection_and_test_rows(
+    selection_rows: List[Dict[str, Any]], reported_test_rows: List[Dict[str, Any]],
+) -> None:
+    """Structural safety net for the holdout discipline the README
+    requires ("select on validation only"): `example_id` is the only
+    stable identity a row carries (`_steering_config_key` intentionally
+    does NOT include it -- it identifies a *config*, not an example), so
+    this checks that no example_id used to select a config also appears
+    among the rows whose quality is being reported as "held out".
+
+    In the current codebase this can never actually fire in normal use --
+    `best_steering_config`/`qlora_quality` already filter strictly by
+    `row["split"] == "validation"` vs `"test"`, and a `ContrastiveExample`
+    has exactly one `split` value, so the two sets are disjoint by
+    construction. This function exists as an explicit, testable assertion
+    of that invariant precisely so a FUTURE code change that accidentally
+    blurs the two (e.g. a refactor that stops filtering by split, or a new
+    adapter that assigns the same id to both a validation and a test
+    record) fails loudly with a clear error instead of silently reporting
+    a leaked, no-longer-held-out "test" quality number.
+    """
+    selection_ids = {row.get("example_id") for row in selection_rows if row.get("example_id") is not None}
+    test_ids = {row.get("example_id") for row in reported_test_rows if row.get("example_id") is not None}
+    overlap = selection_ids & test_ids
+    if overlap:
+        raise HeldOutViolation(
+            f"{len(overlap)} example_id(s) used for validation-based config selection also appear in the "
+            f"reported held-out test rows: {sorted(overlap)[:10]}{'...' if len(overlap) > 10 else ''}. "
+            "This would report a leaked, no-longer-held-out result -- refusing to proceed."
+        )
+
+
 def best_steering_config(
     rows: List[Dict[str, Any]], behavior_id: Optional[str]
 ) -> Optional[Dict[str, Any]]:
@@ -122,6 +161,7 @@ def best_steering_config(
     best_cfg, best_val_quality = max(scored, key=lambda item: item[1])
 
     test_rows = [r for r in rows if r.get("split") == "test" and _steering_config_key(r) == best_cfg]
+    assert_disjoint_selection_and_test_rows(val_rows, test_rows)
     test_quality = _mean(test_rows, quality_key)
     beat_baseline = None
     if test_quality is not None and baseline_quality is not None:
@@ -181,6 +221,7 @@ def qlora_quality(rows: List[Dict[str, Any]], behavior_id: Optional[str]) -> Opt
         return None
     val_rows = [r for r in rows if r.get("split") == "validation"]
     test_rows = [r for r in rows if r.get("split") == "test"]
+    assert_disjoint_selection_and_test_rows(val_rows, test_rows)
     return {
         "quality_key": quality_key,
         "validation_quality": _mean(val_rows, quality_key),
