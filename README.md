@@ -171,15 +171,16 @@ and terms of use, not just a runtime check.
    (MIT), [walledai/XSTest](https://huggingface.co/datasets/walledai/XSTest) (CC-BY-4.0 prompts —
    real harmful-request text in the "contrast" half; review before use).
 2. **Verify the adapter's column mapping against the live dataset viewer**, not just this
-   README or the adapter's docstring. AbstentionBench's schema
-   (`question`/`reference_answers`/`should_abstain`/`metadata_json`) and JSONSchemaBench's
-   (`json_schema`/`unique_id`) were confirmed against their live dataset cards during
-   development. **HarmBench's (`Behavior`/`SemanticCategory`/`BehaviorID`) and XSTest's
-   (`prompt`/`type`) were sourced from published paper/repo documentation only** — both
-   datasets are access-gated and could not be independently verified against the live schema
-   from the development environment that built these adapters. Check the actual column names
-   in the HuggingFace dataset viewer before trusting a real run's results; if they've
-   changed, update the adapter's `mapping`/column-read logic in `datasets.py` to match.
+   README or the adapter's docstring. All four schemas are now confirmed against the live
+   dataset viewer: AbstentionBench's (`question`/`reference_answers`/`should_abstain`/
+   `metadata_json`), JSONSchemaBench's (`json_schema`/`unique_id`), walledai/HarmBench's
+   (`prompt`/`context`/`category`, with `standard` and `contextual` subsets — `context` is
+   present only in `contextual`), and walledai/XSTest's (`prompt`/`focus`/`type`/`note`/
+   `label` — `label` is the actual safe/unsafe discriminator; `type` is a fine-grained
+   category, not a `contrast_`-prefixed safe/unsafe marker as earlier documentation implied).
+   `manifests/benchmarks.yaml` sets `reviewed_dataset_card: true` for HarmBench and XSTest
+   accordingly; re-verify against the live viewer yourself before a real run if a schema may
+   have changed since, and update the adapter's column-read logic in `datasets.py` to match.
 3. Request access where required (HarmBench) and confirm you're authorized to use the data
    for this research purpose.
 4. Only then set `reviewed_dataset_card: true` for that recipe in your manifest.

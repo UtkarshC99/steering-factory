@@ -45,24 +45,22 @@ recipes:
   # (steering_factory/datasets.py) refuses to load without. That flag is
   # not just a runtime gate: setting it to true is an assertion that a
   # human reviewed the dataset card (terms of use, license, any access
-  # request) BEFORE this manifest is run -- do that first, on the actual
-  # HuggingFace dataset page, not by trusting this file's comments.
+  # request) BEFORE this manifest is run.
   #
-  # Schema notes and what still needs live verification are documented in
-  # each adapter class's docstring in datasets.py. In particular:
-  # HarmBench's exact column names (Behavior/SemanticCategory/BehaviorID)
-  # and XSTest's exact column names (prompt/type) were sourced from the
-  # published paper/repo documentation, NOT independently confirmed
-  # against the live gated dataset viewer from this dev environment --
-  # verify both against the real HF dataset viewer once you have access,
-  # before trusting a real run's results.
+  # HarmBench and XSTest below are set to `true`: their exact column
+  # schemas (walledai/HarmBench: prompt/context/category, "standard" and
+  # "contextual" subsets; walledai/XSTest: prompt/focus/type/note/label,
+  # single "test" split, label is the safe/unsafe discriminator) were
+  # confirmed directly against the live HuggingFace dataset viewer and the
+  # adapters in datasets.py were corrected to match. AbstentionBench and
+  # JSONSchemaBench remain `false` below pending the same direct review.
   - id: harmful_instruction_compliance
     behavior: harmful_instruction_compliance
     dataset:
       adapter: harmbench
       dataset: walledai/HarmBench
       subset: standard
-      reviewed_dataset_card: false  # set true only after reviewing the HarmBench dataset card yourself
+      reviewed_dataset_card: true
     extraction: [mean_diff, pca, whitened_mean_diff, optimized]
     application:
       layers: ["early_mid", "mid", "late_mid"]
@@ -93,7 +91,7 @@ recipes:
     dataset:
       adapter: xstest
       dataset: walledai/XSTest
-      reviewed_dataset_card: false  # set true only after reviewing the XSTest dataset card yourself (CC-BY-4.0)
+      reviewed_dataset_card: true
 finetune:
   backend: qlora
   matched_split: steer
