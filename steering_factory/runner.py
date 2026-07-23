@@ -139,20 +139,37 @@ def _behavior_score(prediction: str, example: Dict[str, Any], judge: Optional[An
     return {}
 
 
+_NAMED_LAYER_FRACTIONS = {
+    "early_mid": 0.35,
+    "mid": 0.6,
+    "late_mid": 0.75,
+    # Aliases some manifests spell out explicitly (e.g. the quantization
+    # presets' layer-depth scan): "early"/"late" read more naturally than
+    # "early_mid"/"late_mid" when there's no true early/late band being
+    # skipped over, and previously silently fell through to the 0.6 default
+    # below instead of a distinct fraction -- a real bug (two supposedly
+    # different bands resolving to the identical layer). Now explicit.
+    "early": 0.35,
+    "late": 0.75,
+}
+
+
 def _resolve_layers(layers: List[Any], num_layers: int) -> List[int]:
-    """Named layer bands are resolved deterministically for each architecture."""
+    """Named layer bands are resolved deterministically for each architecture.
+    Any string not in `_NAMED_LAYER_FRACTIONS` (a typo, or simply not
+    recognized) falls back to the 0.6 ("mid") default -- unchanged
+    long-standing behavior -- so an unrecognized layer name degrades to a
+    reasonable default rather than raising, but every band this codebase's
+    own manifests actually use has an explicit, correct entry above."""
     from .model_utils import layer_index_from_fraction
 
     resolved = []
     for layer in layers:
         if isinstance(layer, int):
             resolved.append(layer)
-        elif layer == "early_mid":
-            resolved.append(layer_index_from_fraction(num_layers, 0.35))
-        elif layer == "late_mid":
-            resolved.append(layer_index_from_fraction(num_layers, 0.75))
         else:
-            resolved.append(layer_index_from_fraction(num_layers, 0.6))
+            fraction = _NAMED_LAYER_FRACTIONS.get(layer, 0.6)
+            resolved.append(layer_index_from_fraction(num_layers, fraction))
     return sorted(set(resolved))
 
 
@@ -577,6 +594,13 @@ def run_evaluate(
                 loaded, vector, layer_idx, method, recipe_id, vrow["model_id"], vrow["model"],
                 evaluate_examples, coefficients, token_scopes, max_new_tokens, batch_size, callback, progress, judge,
             ))
+            # Same per-vector cache clear as run_steering's equivalent loop
+            # -- see the comment there for the fragmentation OOM this
+            # addresses (previously only cleared once at the end of this
+            # whole loop, well past where a long vector_rows list could
+            # fragment the allocator).
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         rows.extend(_apply_vectors_cross_recipe(
             manifest, examples, vector_rows, _resolve_vector, _get_loaded,
@@ -727,6 +751,27 @@ def run_steering(
                                     all_coefficients_for_probe, token_scopes[0], probe_max_new_tokens,
                                     base_capability_cache,
                                 ))
+                            # Per-vector, not just per-model: a real run hit a
+                            # CUDA OOM ("Tried to allocate 11.59 GiB", 10.84
+                            # GiB free out of 22.03 GiB) at generation step
+                            # 2030/2030 -- late in a long sweep -- with only
+                            # 8.52 GiB actually allocated but 2.44 GiB
+                            # "reserved but unallocated" (PyTorch's own
+                            # fragmentation-diagnostic wording). Before this,
+                            # empty_cache() only ran once per MODEL (below),
+                            # so thousands of generate() calls' worth of
+                            # differently-shaped KV-cache/activation
+                            # allocations across the coefficient x method x
+                            # layer x n_sweep grid never got a chance to
+                            # release fragmented reserved memory back to the
+                            # allocator -- exactly the failure mode
+                            # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+                            # (mentioned in that error) works around, but
+                            # clearing here is the fix within our own control
+                            # and costs one cheap call per (method, layer,
+                            # n_value), not per generation batch.
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
             del loaded
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -833,10 +878,18 @@ def run_qlora(
                 for n_value in n_points:
                     train_subset = _subsample_n(train_records, n_value, manifest.get("splits", {}).get("seed", 17))
                     output_dir = store.path / "qlora" / model["id"] / recipe["id"] / f"N{len(train_subset)}"
-                    qlora_config = {**config, "model_name": model["name_or_path"], "output_dir": str(output_dir)}
+                    # quantization/dtype come from the model entry (the same
+                    # fields the steering arm's load_model reads), not the
+                    # finetune block -- this is what makes the QLoRA arm's
+                    # precision match the steering arm's per manifest model
+                    # entry instead of always training at a hardcoded 4bit,
+                    # so a quantization sweep varies both arms together.
+                    qlora_config = {**config, "model_name": model["name_or_path"], "output_dir": str(output_dir),
+                                     "quantization": model.get("quantization", "4bit"), "dtype": model.get("dtype")}
                     train_result = train_qlora(train_subset, qlora_config, callback=callback,
                                                 callback_context={"model_id": model["id"], "recipe_id": recipe["id"]})
-                    results.append({"model_id": model["id"], "recipe_id": recipe["id"], "num_train_records": len(train_subset), **train_result})
+                    results.append({"model_id": model["id"], "recipe_id": recipe["id"], "num_train_records": len(train_subset),
+                                     "quantization": model.get("quantization", "4bit"), "dtype": model.get("dtype"), **train_result})
                     _safe(callback, {"arm": "qlora", "event": "adapter_done", "model_id": model["id"], "recipe_id": recipe["id"],
                                       "num_train_records": len(train_subset),
                                       "train_loss": train_result.get("train_loss"), "global_step": train_result.get("global_step")})
@@ -848,6 +901,7 @@ def run_qlora(
                         eval_examples, model["name_or_path"], train_result["adapter_dir"],
                         max_new_tokens=max_new_tokens, trust_remote_code=bool(model.get("trust_remote_code", False)),
                         batch_size=eval_batch_size,
+                        quantization=model.get("quantization", "4bit"), dtype=model.get("dtype"),
                     )
                     for row in eval_result["rows"]:
                         example = next(e for e in eval_examples if e["id"] == row["example_id"])
@@ -856,6 +910,7 @@ def run_qlora(
                         eval_rows.append({"model_id": model["id"], "model_name": model["name_or_path"],
                                            "recipe_id": recipe["id"], "arm": "qlora",
                                            "num_train_records": len(train_subset),
+                                           "quantization": model.get("quantization", "4bit"), "dtype": model.get("dtype"),
                                            "benchmark": example_metadata.get("benchmark"),
                                            "is_safe_control": example_metadata.get("is_safe_control"),
                                            **row, **score})
@@ -990,7 +1045,12 @@ def compare(run_paths: Iterable[str | Path], output_root: str | Path) -> Path:
     `vectors/index.jsonl`) and the other is a QLoRA run (has
     `results/qlora.json`), builds the matched quality/cost comparison from
     `comparison.build_comparison` and writes it via
-    `comparison_report.write_comparison_report` (report.json + report.md).
+    `comparison_report.write_comparison_report` (report.json + report.md),
+    then builds the paired human-evaluation package (`human_eval/`) from
+    the same two run directories -- see `human_eval_export.py`. A failure
+    building the (best-effort, purely additive) human-eval package never
+    fails the whole `compare` call; the core comparison report is the part
+    callers depend on.
 
     Falls back to a plain run-metadata index (previous behavior) for any
     other combination -- e.g. two steering runs, more than two runs, or a
@@ -1007,6 +1067,14 @@ def compare(run_paths: Iterable[str | Path], output_root: str | Path) -> Path:
         qlora_path = next((p for p in paths if _is_qlora_run(p)), None)
         if steering_path is not None and qlora_path is not None and steering_path != qlora_path:
             comparison = build_comparison(steering_path, qlora_path)
-            return write_comparison_report(comparison, output_root)
+            report_path = write_comparison_report(comparison, output_root)
+            try:
+                from .human_eval_export import build_human_eval_records, write_human_eval_package
+                records = build_human_eval_records(steering_path, qlora_path)
+                if records:
+                    write_human_eval_package(records, output_root)
+            except Exception as exc:  # best-effort -- never block the core comparison report
+                logger.warning("Human-eval package generation failed (comparison report was still written): %s", exc)
+            return report_path
 
     return _run_metadata_index(run_paths, output_root)

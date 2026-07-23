@@ -130,23 +130,48 @@ class LoadedModel:
     device: str
 
 
+def resolve_dtype(dtype_name: Optional[str]) -> torch.dtype:
+    """Maps a manifest `dtype` string to a `torch.dtype`, defaulting to
+    bfloat16 for an unrecognized or missing value -- the same fallback
+    `load_model` has always used. Factored out so other loaders (QLoRA's
+    train/eval paths in finetune.py) can resolve the same string the same
+    way instead of re-deriving their own default."""
+    return _DTYPE_MAP.get(dtype_name, torch.bfloat16)
+
+
+def bnb_config_for(quantization: Optional[str], dtype: torch.dtype):
+    """Maps a manifest `quantization` string to a `BitsAndBytesConfig` (or
+    `None` for an unquantized load), given an already-resolved compute
+    `dtype`. This is the exact branch `load_model` below has always used --
+    factored out so `finetune.py`'s QLoRA train/eval loaders can match the
+    steering arm's precision instead of hardcoding 4bit regardless of what
+    the manifest's model entry says. Only "4bit" and "8bit" are recognized;
+    any other value (including "none", unset, or a typo) means "no
+    bitsandbytes config" -- load at `dtype` directly. There is no "16bit"
+    literal: full precision is expressed as `quantization: none` (or any
+    non-4/8bit value) plus `dtype: bfloat16`/`float16`/`float32`."""
+    if quantization not in ("4bit", "8bit"):
+        return None
+    from transformers import BitsAndBytesConfig
+
+    if quantization == "4bit":
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=dtype,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+    return BitsAndBytesConfig(load_in_8bit=True)
+
+
 def load_model(cfg: TargetModelConfig) -> LoadedModel:
     _patch_tokenizer_special_tokens_compat()
-    dtype = _DTYPE_MAP.get(cfg.dtype, torch.bfloat16)
+    dtype = resolve_dtype(cfg.dtype)
 
     quant_kwargs = {}
-    if cfg.quantization in ("4bit", "8bit"):
-        from transformers import BitsAndBytesConfig
-
-        if cfg.quantization == "4bit":
-            quant_kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=dtype,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
-        else:
-            quant_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+    quantization_config = bnb_config_for(cfg.quantization, dtype)
+    if quantization_config is not None:
+        quant_kwargs["quantization_config"] = quantization_config
 
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.name_or_path, trust_remote_code=cfg.trust_remote_code

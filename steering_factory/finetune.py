@@ -66,18 +66,37 @@ def train_qlora(
         raise ValueError(f"QLoRA config missing {sorted(missing)}")
     from datasets import Dataset
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
-                              DataCollatorForSeq2Seq, Trainer, TrainingArguments)
-    from .model_utils import format_chat
+    from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, Trainer, TrainingArguments
+    from .model_utils import bnb_config_for, format_chat, resolve_dtype
 
     started = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(config["model_name"], trust_remote_code=config.get("trust_remote_code", False))
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
-    model = AutoModelForCausalLM.from_pretrained(config["model_name"], quantization_config=quant, device_map="auto",
-                                                  trust_remote_code=config.get("trust_remote_code", False))
-    model = prepare_model_for_kbit_training(model)
+    # Reads the model entry's own quantization/dtype instead of hardcoding
+    # 4bit nf4 -- matches the steering arm's precision (model_utils.load_model
+    # uses the identical bnb_config_for/resolve_dtype pair) so a quantization
+    # sweep varies both arms together rather than only the steering side.
+    # "qlora" as a name stays literal ("Q" = 4-bit) only when quantization is
+    # actually 4bit/8bit; an unquantized entry runs plain LoRA on a full-
+    # precision base -- see the quantization/dtype fields recorded on this
+    # adapter's result row (runner.py) for the honest label per run.
+    # Default "4bit" (not None) when the key is simply absent from config --
+    # preserves the pre-existing hardcoded-4bit behavior for any caller that
+    # doesn't set quantization explicitly, exactly like
+    # evaluate_qlora_adapter/evaluate_base_model's own "4bit" default below.
+    dtype = resolve_dtype(config.get("dtype"))
+    quant = bnb_config_for(config.get("quantization", "4bit"), dtype)
+    quant_kwargs = {"quantization_config": quant} if quant is not None else {"torch_dtype": dtype}
+    model = AutoModelForCausalLM.from_pretrained(config["model_name"], device_map="auto",
+                                                  trust_remote_code=config.get("trust_remote_code", False), **quant_kwargs)
+    if quant is not None:
+        # prepare_model_for_kbit_training casts norms to fp32 and enables
+        # gradient checkpointing hooks specific to a quantized base -- it is
+        # only valid (and only needed) when the base is actually loaded
+        # k-bit; calling it on a full-precision model is unnecessary and, for
+        # some versions, mishandles a base that has no quantized layers.
+        model = prepare_model_for_kbit_training(model)
     model = get_peft_model(model, LoraConfig(r=int(config.get("rank", 16)), lora_alpha=int(config.get("alpha", 32)),
         lora_dropout=float(config.get("dropout", 0.05)), bias="none", task_type="CAUSAL_LM", target_modules=config["target_modules"]))
 
@@ -184,12 +203,20 @@ def evaluate_qlora_adapter(
     max_new_tokens: int = 96,
     trust_remote_code: bool = False,
     batch_size: int = 16,
+    quantization: Optional[str] = "4bit",
+    dtype: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate on `examples` (validation/test split) with the base model +
     trained QLoRA adapter, returning per-example rows in the same shape as
     the steering arm's `results/generations.jsonl` (minus steering-only
     fields like layer_idx/coefficient/method), so `comparison.py` can score
     both arms with the identical evaluator and join on quality.
+
+    `quantization`/`dtype` must match whatever `train_qlora` loaded the
+    adapter's base model at (default "4bit" preserves the pre-existing
+    hardcoded behavior for callers that don't pass these) -- reloading the
+    base at a DIFFERENT precision than it was trained on would silently
+    evaluate a mismatched model.
 
     Loaded lazily and released per call -- this is meant to run once per
     (model, recipe) after training, not kept resident.
@@ -198,15 +225,19 @@ def evaluate_qlora_adapter(
         raise RuntimeError("QLoRA requires optional dependencies: pip install peft trl datasets")
     import torch
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from .model_utils import bnb_config_for, resolve_dtype
 
     started = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
-    base = AutoModelForCausalLM.from_pretrained(model_name, quantization_config=quant, device_map="auto",
-                                                 trust_remote_code=trust_remote_code)
+    resolved_dtype = resolve_dtype(dtype)
+    quant = bnb_config_for(quantization, resolved_dtype)
+    quant_kwargs = {"quantization_config": quant} if quant is not None else {"torch_dtype": resolved_dtype}
+    base = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto",
+                                                 trust_remote_code=trust_remote_code, **quant_kwargs)
     model = PeftModel.from_pretrained(base, adapter_dir)
     model.eval()
 
@@ -224,24 +255,33 @@ def evaluate_base_model(
     max_new_tokens: int = 96,
     trust_remote_code: bool = False,
     batch_size: int = 16,
+    quantization: Optional[str] = "4bit",
+    dtype: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Same as `evaluate_qlora_adapter` but loads the plain base model with
     no PEFT adapter -- used for the "before" half of the QLoRA arm's
     capability-regression measurement (capability_probe.py), so the
     before/after comparison is exactly base-model vs base-model+adapter,
-    not base-model vs some other loading path."""
+    not base-model vs some other loading path. `quantization`/`dtype`
+    default to the pre-existing hardcoded 4bit behavior for callers that
+    don't pass these, and should match whatever the adapter itself was
+    trained/evaluated at."""
     if not qlora_available():
         raise RuntimeError("QLoRA requires optional dependencies: pip install peft trl datasets")
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from .model_utils import bnb_config_for, resolve_dtype
 
     started = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
-    model = AutoModelForCausalLM.from_pretrained(model_name, quantization_config=quant, device_map="auto",
-                                                  trust_remote_code=trust_remote_code)
+    resolved_dtype = resolve_dtype(dtype)
+    quant = bnb_config_for(quantization, resolved_dtype)
+    quant_kwargs = {"quantization_config": quant} if quant is not None else {"torch_dtype": resolved_dtype}
+    model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto",
+                                                  trust_remote_code=trust_remote_code, **quant_kwargs)
     model.eval()
 
     rows = _generate_batched_rows(model, tokenizer, examples, max_new_tokens, batch_size)
