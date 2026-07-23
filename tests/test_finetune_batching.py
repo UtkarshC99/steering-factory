@@ -74,3 +74,21 @@ def test_tokenizer_padding_side_restored(loaded):
 
 def test_empty_examples_returns_empty_rows(loaded):
     assert _generate_batched_rows(loaded.model, loaded.tokenizer, [], max_new_tokens=3, batch_size=4) == []
+
+
+def test_oversized_prompt_in_batch_does_not_blow_up_padding(loaded):
+    """Regression test matching test_sweep_batching's equivalent: this loop
+    uses the identical padding=True batching pattern as
+    generate_with_steering_batch, and was missing the same truncation cap
+    (same root cause as the production CUDA OOM). A prompt much longer than
+    its batch-mates must not force unbounded padding, and generation must
+    still complete for every row. Kept at 50 tokens (not 1024+) to stay
+    under the tiny fixture's own max_position_embeddings=64."""
+    huge_examples = [
+        {"id": "e1", "behavior_id": "domain_classification", "split": "test", "category": "a", "prompt": "w4 w5"},
+        {"id": "e2", "behavior_id": "domain_classification", "split": "test", "category": "a",
+         "prompt": " ".join(f"w{i}" for i in range(50))},
+        {"id": "e3", "behavior_id": "domain_classification", "split": "test", "category": "b", "prompt": "w4 w6"},
+    ]
+    rows = _generate_batched_rows(loaded.model, loaded.tokenizer, huge_examples, max_new_tokens=2, batch_size=3)
+    assert len(rows) == 3

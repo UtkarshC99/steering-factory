@@ -100,7 +100,17 @@ def generate_with_steering_batch(
     original_padding_side = loaded.tokenizer.padding_side
     loaded.tokenizer.padding_side = "left"
     try:
-        enc = loaded.tokenizer(prompt_texts, return_tensors="pt", padding=True).to(device)
+        # truncation=True, max_length=1024 (matching extraction.py's own
+        # prompt-length cap) is load-bearing, not cosmetic: with
+        # padding=True and no length bound, a SINGLE unusually long prompt
+        # in the batch (e.g. a JSONSchemaBench prompt embedding a schema up
+        # to ~1.28M characters, or a HarmBench `contextual`-subset prompt)
+        # pads every other row in the batch out to match it. At batch_size
+        # 32 that produced a real OOM (~26 GiB requested in one
+        # torch.embedding call) from a single oversized prompt, not from
+        # batch_size itself -- this was a missing guard, not a memory-
+        # capacity problem to solve by lowering batch_size.
+        enc = loaded.tokenizer(prompt_texts, return_tensors="pt", truncation=True, max_length=1024, padding=True).to(device)
     finally:
         loaded.tokenizer.padding_side = original_padding_side
 
