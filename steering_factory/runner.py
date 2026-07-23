@@ -964,11 +964,23 @@ def run_qlora(
 
                     if not eval_examples:
                         continue
+                    # Per-recipe decoding.batch_size override, same as
+                    # run_steering/run_evaluate's identical loops -- without
+                    # this, a recipe with much longer prompts than the
+                    # manifest's other recipes (e.g. structured_output_real's
+                    # JSON-schema prompts, which routinely approach the
+                    # 1024-token truncation cap) would still run QLoRA eval
+                    # at the full manifest-wide batch size, exposed to the
+                    # identical variable-size-prompt VRAM spike that
+                    # produced a real OOM on the steering arm before its own
+                    # override was added -- _generate_batched_rows uses the
+                    # same padding=True batching pattern.
+                    recipe_eval_batch_size = recipe.get("decoding", {}).get("batch_size", eval_batch_size)
                     eval_started = _time.perf_counter()
                     eval_result = evaluate_qlora_adapter(
                         eval_examples, model["name_or_path"], train_result["adapter_dir"],
                         max_new_tokens=max_new_tokens, trust_remote_code=bool(model.get("trust_remote_code", False)),
-                        batch_size=eval_batch_size,
+                        batch_size=recipe_eval_batch_size,
                         quantization=model.get("quantization", "4bit"), dtype=model.get("dtype"),
                     )
                     for row in eval_result["rows"]:
