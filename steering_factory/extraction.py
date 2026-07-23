@@ -65,7 +65,7 @@ def _pooled_activations_batch(
 
     with ActivationCapture(layer_module) as cap:
         with torch.no_grad():
-            loaded.model(**enc)
+            loaded.model(**enc, logits_to_keep=1)
     if pooling == "last":
         pooled = cap.last_token_activation(enc.get("attention_mask"))
     else:
