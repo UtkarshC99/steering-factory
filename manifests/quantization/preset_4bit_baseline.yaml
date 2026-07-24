@@ -24,16 +24,18 @@
 # around 33 -- batch_size: 32 is kept as configured, at the edge of that
 # budget but under it.
 #
-# Step-count sanity (same math benchmarks.yaml already uses): 3 recipes x 3
-# extraction methods x 1 layer x 3 coefficients x 1 token_scope x 3 n_sweep
-# points, generation grid per (model, recipe, method) = 1 layer x 3
-# coefficients x 1 scope x n_test -- unchanged from benchmarks.yaml's own
-# validated sizing.
+# Step-count sanity (same math benchmarks.yaml already uses): 3 recipes x 2
+# extraction methods x 1 layer x 7 coefficients x 1 token_scope x 2 n_sweep
+# points, generation grid per (model, recipe, method) = 1 layer x 7
+# coefficients x 1 scope x n_test. Matches benchmarks.yaml's own sizing:
+# pca dropped, n_sweep trimmed to [10, 40], coefficients widened to
+# [-2,-1,-0.5,0,0.5,1,2] on every extracting recipe (was 3 coeffs on
+# harmful only, [0.0, 1.0] implicit-default on the other two).
 # ============================================================================
 experiment:
   name: quantization-4bit-baseline
   seed: 17
-  n_sweep: [10, 20, 40]
+  n_sweep: [10, 40]
 artifacts:
   root: /content/steering_factory_artifacts
   publish_root: null
@@ -67,11 +69,19 @@ recipes:
       dataset: walledai/HarmBench
       subset: standard
       reviewed_dataset_card: true
-      max_records: 100
-    extraction: [mean_diff, pca, whitened_mean_diff]
+      # Raised from 100 to 150 uniformly across every extracting recipe --
+      # a real run's QLoRA n_validation fell to 17 (below min_split_size:
+      # 20) after the quality-key filter dropped None-scored rows, even at
+      # a nominal split of 20. 150 gives validation=30 with margin.
+      max_records: 150
+    # Dropped `pca`: least-motivated of the three methods for a first
+    # correctness pass. Coefficients widened from [-1,0,1] to
+    # [-2,-1,-0.5,0,0.5,1,2] -- cheap axis (1 layer x 1 scope), and this is
+    # the vector-validity/dose-response check.
+    extraction: [mean_diff, whitened_mean_diff]
     application:
       layers: ["mid"]
-      coefficients: [-1, 0, 1]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
       token_scopes: [all]
   - id: calibrated_abstention_real
     behavior: appropriate_abstention
@@ -80,8 +90,14 @@ recipes:
       dataset: facebook/AbstentionBench
       reviewed_dataset_card: true
       on_load_error: skip
-      max_records: 100
-    extraction: [mean_diff, pca, whitened_mean_diff]
+      max_records: 150
+    extraction: [mean_diff, whitened_mean_diff]
+    application:
+      # No grid existed here before -- defaulted to coefficient=1.0 only
+      # (plus implicit 0.0). Widened to match harmful's grid.
+      layers: ["mid"]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      token_scopes: [all]
   - id: structured_output_real
     behavior: structured_output
     dataset:
@@ -89,8 +105,12 @@ recipes:
       dataset: epfl-dlab/JSONSchemaBench
       subset: default
       reviewed_dataset_card: true
-      max_records: 100
-    extraction: [mean_diff, pca, whitened_mean_diff]
+      max_records: 150
+    extraction: [mean_diff, whitened_mean_diff]
+    application:
+      layers: ["mid"]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      token_scopes: [all]
     # Prompts embed a full JSON schema and routinely approach the 1024-token
     # truncation cap, unlike this preset's other recipes -- a real run OOM'd
     # specifically here at the manifest-wide batch_size=32 (VRAM swinging
@@ -98,6 +118,11 @@ recipes:
     # spike, not fragmentation). Halved as a conservative fix.
     decoding:
       batch_size: 16
+      # max_length: 2048 (was 1024 default) -- long schemas were being
+      # truncated mid-object. max_new_tokens: 256 (was 96) -- outputs were
+      # also cut off mid-object. See benchmarks.yaml's identical comment.
+      max_new_tokens: 256
+      max_length: 2048
   - id: benign_over_refusal_control
     behavior: harmful_instruction_compliance
     dataset:
@@ -106,10 +131,19 @@ recipes:
       reviewed_dataset_card: true
       max_records: 100
       apply_vectors_from: harmful_instruction_compliance
+      # QLoRA counterpart to apply_vectors_from above -- see
+      # benchmarks.yaml's full comment. Gives the QLoRA arm a benign-
+      # over-refusal check it previously had no way to run at all.
+      apply_adapter_from: harmful_instruction_compliance
 finetune:
   backend: qlora
   matched_split: steer
-  max_steps: 200
+  # Cut from 200 to 25: a real run's train-loss log showed loss=0.009 by
+  # step 15 and 1.6e-4 by step 20 -- fully memorized well before step 200,
+  # and eval confirmed it (QLoRA collapsed to the same canned refusal
+  # string on every held-out example). 25 leaves a small margin past the
+  # observed plateau.
+  max_steps: 25
   target_modules: [q_proj, k_proj, v_proj, o_proj]
   batch_size: 4
   gradient_accumulation_steps: 2

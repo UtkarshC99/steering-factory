@@ -65,8 +65,13 @@ def run_capability_probe_steering(
     `_evaluate_vector_grid` uses) rather than a separate generation path,
     so probe generations are produced identically to every other row."""
     from . import sweep
+    from .model_utils import format_chat
 
-    prompts = [probe.prompt for probe in CAPABILITY_PROBES]
+    # format_chat, matching _evaluate_vector_grid's own fix -- the QLoRA
+    # side of this same probe (run_capability_probe_qlora below) already
+    # templates via evaluate_qlora_adapter/evaluate_base_model, so this was
+    # the one capability-probe path still sending an un-templated prompt.
+    prompts = [format_chat(loaded.tokenizer, probe.prompt) for probe in CAPABILITY_PROBES]
     results = sweep.generate_with_steering_batch(loaded, layer_idx, vector, coefficient, prompts, max_new_tokens, token_scope)
     rows = []
     for probe, result in zip(CAPABILITY_PROBES, results):

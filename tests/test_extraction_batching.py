@@ -54,6 +54,43 @@ def test_pair_order_preserved_under_batching(loaded):
     assert torch.allclose(diffs[0], diffs[4], atol=1e-4)
 
 
+@pytest.mark.parametrize("pooling", ["last", "mean"])
+def test_pooled_activations_unaffected_by_logits_to_keep(loaded, pooling):
+    """_pooled_activations_batch passes logits_to_keep=1 to the forward
+    call -- a real CUDA OOM traced to this call materializing the full
+    (batch, seq_len, vocab) logits tensor on every extraction forward pass
+    even though only the hooked decoder layer's hidden states are ever
+    read (the LM head runs strictly AFTER the hooked layer, so slicing its
+    output can't affect what ActivationCapture captures). This proves that
+    claim directly rather than by architectural reasoning alone: pooled
+    activations must be bit-identical with and without the flag."""
+    texts = ["w4 w5 w6", "w10 w11", "w4 w5 w6 w7 w8"]
+    with_flag = extraction._pooled_activations_batch(loaded, 0, texts, pooling)
+
+    # Re-run the exact same forward pass without logits_to_keep, bypassing
+    # the function under test to get an independent reference.
+    device = next(loaded.model.parameters()).device
+    layer_module = loaded.layers[0]
+    original_padding_side = loaded.tokenizer.padding_side
+    loaded.tokenizer.padding_side = "left"
+    try:
+        enc = loaded.tokenizer(texts, return_tensors="pt", truncation=True, max_length=1024, padding=True)
+    finally:
+        loaded.tokenizer.padding_side = original_padding_side
+    enc = {k: v.to(device) for k, v in enc.items()}
+
+    from steering_factory.hooks import ActivationCapture
+    with ActivationCapture(layer_module) as cap:
+        with torch.no_grad():
+            loaded.model(**enc)
+    without_flag = (
+        cap.last_token_activation(enc.get("attention_mask"))
+        if pooling == "last" else cap.mean_activation(enc.get("attention_mask"))
+    ).float().cpu()
+
+    assert torch.equal(with_flag, without_flag)
+
+
 def test_last_token_activation_correct_under_left_padding_regression():
     """Direct regression test for the bug this batching work uncovered:
     ActivationCapture.last_token_activation must find each row's true last
