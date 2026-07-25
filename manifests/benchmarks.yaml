@@ -66,12 +66,21 @@ decoding:
   # doesn't scale perfectly linearly, and a mid-run OOM costs more time
   # than a conservative bump saves). Also used by the QLoRA eval arm. If
   # you see OOM at 32, drop back to 16 or 24.
-  batch_size: 32
+  #
+  # Raised 32 -> 64 for A100 40GB. Generation has OOM backoff
+  # (sweep.run_with_oom_backoff) and length bucketing, so overshooting here
+  # degrades throughput rather than killing the run.
+  batch_size: 64
 extraction:
-  # Extraction is plain forward passes (no autoregression, no retained
-  # scores) -- strictly cheaper per row than generation -- so it can safely
-  # match or exceed decoding.batch_size.
-  batch_size: 32
+  # NOTE: now deliberately LOWER than decoding.batch_size, reversing the
+  # claim this comment used to make. Extraction being "strictly cheaper per
+  # row" is true per row and irrelevant in practice: _collect_diffs batches
+  # pos+neg together (2*N texts per forward pass) and extraction.py's
+  # forward pass is the ONE generation path with no OOM backoff. That
+  # unprotected path at 64 texts x 2048 tokens produced the 2.38 GiB
+  # allocation behind four consecutive OOMs. Until it gets backoff too,
+  # this stays below decoding.
+  batch_size: 48
 recipes:
   # Real, gated/licensed benchmark data -- NOT the local_jsonl fixtures in
   # default_colab.yaml. Every recipe below requires
@@ -114,7 +123,7 @@ recipes:
       # floor) after the quality-key filter dropped None-scored rows, even
       # though the nominal split size was 20. 150 gives validation=30 with
       # margin for that attrition, on every recipe.
-      max_records: 150
+      max_records: 250
     # Dropped `pca` (kept mean_diff, whitened_mean_diff): pca was the
     # least-motivated of the three methods for a first correctness pass --
     # re-add once the pipeline is confirmed producing valid, parseable
@@ -152,7 +161,7 @@ recipes:
       # OTHER recipe in this manifest keeps the default (on_load_error:
       # raise, i.e. unset) -- a broken dataset there still stops the run.
       on_load_error: skip
-      max_records: 150
+      max_records: 250
     extraction: [mean_diff, whitened_mean_diff]
     application:
       # No application grid existed here before -- _evaluate_vector_grid's
@@ -188,6 +197,31 @@ recipes:
   # block to run it, ideally as its OWN manifest so its memory profile can
   # only take down its own run -- and give extraction its own smaller
   # batch size there, since extraction.py's forward pass has no OOM backoff.
+  - id: sycophancy_agreement
+    # Anthropic/model-written-evals, sycophancy subset (Perez et al. 2022).
+    # Replaces structured_output_real. One adapter covers the whole repo --
+    # `subset` is a path inside it -- so the 16
+    # advanced-ai-risk/human_generated_evals files (power-seeking,
+    # survival-instinct, corrigible-*-HHH, ...) and the ~135 persona files
+    # are each a pure-YAML addition needing no new adapter, behavior, or
+    # scorer. See ModelWrittenEvalsAdapter for the confirmed schema and for
+    # why positive = answer_NOT_matching_behavior.
+    behavior: multiple_choice_eval
+    dataset:
+      adapter: model_written_evals
+      dataset: Anthropic/model-written-evals
+      subset: sycophancy/sycophancy_on_political_typology_quiz.jsonl
+      reviewed_dataset_card: true  # cc-by-4.0
+      max_records: 250
+    extraction: [mean_diff, whitened_mean_diff]
+    application:
+      layers: ["mid"]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      token_scopes: [all]
+    decoding:
+      # Forced A/B answer -- 8 tokens is generous where the safety recipes
+      # need 96. The single biggest cost lever in this manifest.
+      max_new_tokens: 8
   - id: benign_over_refusal_control
     # XSTest is a benign control set, not a steer source -- see
     # XSTestAdapter's docstring. Every row normalizes to split="test"
@@ -213,7 +247,11 @@ recipes:
       adapter: xstest
       dataset: walledai/XSTest
       reviewed_dataset_card: true
-      max_records: 100
+      # Trimmed 100 -> 60: with harmful's 7-coefficient x 4-vector grid this
+      # control was the single biggest generation consumer in the run
+      # (~2800/model, more than the recipe it controls for). 60 is still
+      # ample for a false-refusal rate.
+      max_records: 60
       apply_vectors_from: harmful_instruction_compliance
       apply_adapter_from: harmful_instruction_compliance
 finetune:

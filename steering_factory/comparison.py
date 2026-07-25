@@ -27,8 +27,13 @@ _QUALITY_KEY_BY_BEHAVIOR = {
     "domain_classification": "exact_match",
     "appropriate_abstention": "correct_answer",
     "structured_output": "leaf_exact_match",
+    "multiple_choice_eval": "mc_correct",
 }
-_DEFAULT_QUALITY_KEYS = ("leaf_exact_match", "exact_match", "correct_answer", "safe_refusal")
+# mc_correct is listed FIRST: unlike every other key here it is never None
+# (evaluators.multiple_choice_score scores an unparseable answer as 0.0
+# rather than as missing), so when a row carries it, it is always the
+# safest key to fall back to.
+_DEFAULT_QUALITY_KEYS = ("mc_correct", "leaf_exact_match", "exact_match", "correct_answer", "safe_refusal")
 
 # Below this many held-out rows, a quality number is noise, not signal -- a
 # 0-vs-1 result on a single test example proved exactly this on a real run

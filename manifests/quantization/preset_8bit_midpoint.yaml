@@ -22,16 +22,21 @@
 # compute) -- steering via model_utils.bnb_config_for, QLoRA via the now-
 # parameterized finetune.py train/eval loaders (same helper, same inputs).
 #
-# Memory sizing (L4, 22.03 GiB actual capacity): 8bit weights are ~1
-# byte/param vs 4bit's ~0.5 byte/param -- roughly +2.0 GiB vs the 4bit
-# baseline's ~2.0 GiB weights (so ~4.0 GiB total weights) for a ~4B-param
-# model. Using the same linear activation-memory scaling derived from the
-# 4bit baseline's own real measurement (8.6 GiB at batch_size=16, ~0.4125
-# GiB/unit-batch) and the same 6.5 GiB safety margin, the max safe batch at
-# 8bit works out to ~28 -- batch_size: 24 is set here, below that estimate,
-# to keep a real cushion given the fragmentation OOM already observed once
-# at the (nominally "safe") 4bit/batch=32 setting. This preset also relies
-# on the per-vector torch.cuda.empty_cache() fix in runner.py.
+# Memory sizing -- A100 40GB (was an L4 at 22.03 GiB, ceiling ~28,
+# batch_size 24). 8bit weights are ~1 byte/param vs 4bit's ~0.5, so ~4.0
+# GiB for a ~4B model. Same slope and margin as preset_4bit_baseline.yaml:
+#   ceiling = (39.4 - 6.5 - 4.0) / 0.4125 ~= 70
+# batch_size: 48 is set below that, and below the 4bit preset's 64, because
+# bitsandbytes' LLM.int8() keeps an extra fp16 outlier path resident per
+# layer on top of the int8 weights.
+#
+# EXPECT THIS TO BE THE SLOWEST PRESET, and not because of the weights.
+# LLM.int8() decomposes each matmul into an int8 part plus a separate fp16
+# outlier matmul and recombines them -- extra kernels and extra memory
+# traffic per layer. It was designed to make models FIT, explicitly trading
+# throughput. On a 40 GB card, where a 4B model never needed to be shrunk,
+# that trade buys nothing. See preset_4bit_baseline.yaml's speed caveat:
+# wall-time across these presets is not a clean measure of precision.
 # ============================================================================
 experiment:
   name: quantization-8bit-midpoint
@@ -64,9 +69,15 @@ capability_probe:
   max_new_tokens: 24
 decoding:
   max_new_tokens: 96
-  batch_size: 24
+  # A100 40GB (was 24 on the L4). Lower than the 4bit preset's 64: int8
+  # weights are ~2x nf4, and bitsandbytes' LLM.int8() keeps an extra fp16
+  # outlier path resident per layer. Generation has OOM backoff, so this
+  # is a starting point.
+  batch_size: 48
 extraction:
-  batch_size: 24
+  # Below decoding on purpose -- extraction has NO OOM backoff. See
+  # preset_4bit_baseline.yaml's comment for the full reasoning.
+  batch_size: 32
 recipes:
   - id: harmful_instruction_compliance
     behavior: harmful_instruction_compliance
@@ -75,7 +86,7 @@ recipes:
       dataset: walledai/HarmBench
       subset: standard
       reviewed_dataset_card: true
-      max_records: 150
+      max_records: 250
     extraction: [mean_diff, whitened_mean_diff]
     application:
       layers: ["mid"]
@@ -88,7 +99,7 @@ recipes:
       dataset: facebook/AbstentionBench
       reviewed_dataset_card: true
       on_load_error: skip
-      max_records: 150
+      max_records: 250
     extraction: [mean_diff, whitened_mean_diff]
     application:
       layers: ["mid"]
@@ -118,13 +129,32 @@ recipes:
   # block to run it, ideally as its OWN manifest so its memory profile can
   # only take down its own run -- and give extraction its own smaller
   # batch size there, since extraction.py's forward pass has no OOM backoff.
+  - id: sycophancy_agreement
+    # See preset_4bit_baseline.yaml for the full rationale. Held identical
+    # to the baseline, per this preset's own header: the ONLY variable that
+    # may differ across the precision presets is precision.
+    behavior: multiple_choice_eval
+    dataset:
+      adapter: model_written_evals
+      dataset: Anthropic/model-written-evals
+      subset: sycophancy/sycophancy_on_political_typology_quiz.jsonl
+      reviewed_dataset_card: true  # cc-by-4.0
+      max_records: 250
+    extraction: [mean_diff, whitened_mean_diff]
+    application:
+      layers: ["mid"]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      token_scopes: [all]
+    decoding:
+      max_new_tokens: 8
   - id: benign_over_refusal_control
     behavior: harmful_instruction_compliance
     dataset:
       adapter: xstest
       dataset: walledai/XSTest
       reviewed_dataset_card: true
-      max_records: 100
+      # Trimmed 100 -> 60 -- see preset_4bit_baseline.yaml's comment.
+      max_records: 60
       apply_vectors_from: harmful_instruction_compliance
       apply_adapter_from: harmful_instruction_compliance
 finetune:

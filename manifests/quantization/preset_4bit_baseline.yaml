@@ -13,16 +13,24 @@
 # quantization: 4bit, dtype: bfloat16 compute -- nf4 double-quant weights,
 # bf16 activations/KV-cache.
 #
-# Memory sizing (L4, 22.03 GiB actual capacity per a real OOM trace, not the
-# nominal 22.5 GiB): a live run measured 8.6 GiB used at batch_size=16 for a
-# ~4B-param model at 4bit (~2.0 GiB nf4 weights + ~6.6 GiB activations/KV
-# cache at that batch size). Scaling the activation term linearly with batch
-# size (0.4125 GiB/unit) and holding a 6.5 GiB safety margin (raised from an
-# earlier, thinner margin after a real fragmentation OOM at this exact
-# batch_size=32 -- see the per-vector torch.cuda.empty_cache() fix in
-# runner.py, which this preset now also relies on) gives a max safe batch
-# around 33 -- batch_size: 32 is kept as configured, at the edge of that
-# budget but under it.
+# Memory sizing -- NOW TARGETING A100 40GB (this preset previously targeted
+# an L4 at 22.03 GiB, where the ceiling was ~33 and batch_size was 32).
+# Same derivation, new capacity: a live L4 run measured 8.6 GiB at
+# batch_size=16 for a ~4B model at 4bit (~2.0 GiB nf4 weights + ~0.4125 GiB
+# per unit of batch), and the same absolute 6.5 GiB safety margin is kept:
+#   ceiling = (39.4 - 6.5 - 2.0) / 0.4125 ~= 75
+# batch_size: 64 sits under that deliberately rather than at it.
+#
+# A SPEED CAVEAT THAT MATTERS FOR READING THIS MATRIX: on a 40 GB card a 4B
+# model was never memory-constrained (bf16 weights are only ~8 GiB), so
+# quantization here buys nothing and costs dequantization on every forward
+# pass. At batch 64 the weight read is amortized across the batch, which is
+# the regime where nf4's bandwidth saving mostly evaporates while its
+# dequant cost does not. Expect bf16 to be the FASTEST per token and
+# LLM.int8() the slowest. Preset wall-times therefore measure bitsandbytes
+# kernel efficiency at least as much as they measure precision -- the
+# QUALITY comparison across presets is the sound one; the speed comparison
+# is not a clean quantization result.
 #
 # Step-count sanity: 2 extracting recipes x 2 extraction methods x 1 layer x
 # 7 coefficients x 1 token_scope x 2 n_sweep points. In practice
@@ -60,9 +68,20 @@ capability_probe:
   max_new_tokens: 24
 decoding:
   max_new_tokens: 96
-  batch_size: 32
+  # A100 40GB (was 32 on the L4's 22GB). Generation has OOM backoff
+  # (sweep.run_with_oom_backoff) plus length bucketing, so overshooting
+  # here degrades throughput instead of killing the run -- which is why
+  # this side can be sized optimistically.
+  batch_size: 64
 extraction:
-  batch_size: 32
+  # Deliberately LOWER than decoding.batch_size, inverting the old comment
+  # that extraction is "strictly cheaper". Extraction has NO OOM backoff --
+  # extraction.py's forward pass is the one generation path never wrapped --
+  # and _collect_diffs batches pos+neg together, so this number is doubled
+  # into 2*N texts per forward pass. That unprotected path, at 64 texts x
+  # 2048 tokens, is what produced the 2.38 GiB allocation behind four
+  # straight OOMs. Until it gets backoff too, it stays conservative.
+  batch_size: 48
 recipes:
   - id: harmful_instruction_compliance
     behavior: harmful_instruction_compliance
@@ -75,7 +94,7 @@ recipes:
       # a real run's QLoRA n_validation fell to 17 (below min_split_size:
       # 20) after the quality-key filter dropped None-scored rows, even at
       # a nominal split of 20. 150 gives validation=30 with margin.
-      max_records: 150
+      max_records: 250
     # Dropped `pca`: least-motivated of the three methods for a first
     # correctness pass. Coefficients widened from [-1,0,1] to
     # [-2,-1,-0.5,0,0.5,1,2] -- cheap axis (1 layer x 1 scope), and this is
@@ -92,7 +111,7 @@ recipes:
       dataset: facebook/AbstentionBench
       reviewed_dataset_card: true
       on_load_error: skip
-      max_records: 150
+      max_records: 250
     extraction: [mean_diff, whitened_mean_diff]
     application:
       # No grid existed here before -- defaulted to coefficient=1.0 only
@@ -124,13 +143,55 @@ recipes:
   # block to run it, ideally as its OWN manifest so its memory profile can
   # only take down its own run -- and give extraction its own smaller
   # batch size there, since extraction.py's forward pass has no OOM backoff.
+  - id: sycophancy_agreement
+    # Anthropic/model-written-evals, sycophancy subset (Perez et al. 2022).
+    # Replaces structured_output_real, and was chosen against the criteria
+    # that recipe's failure produced:
+    #   - forced A/B answer, so max_new_tokens: 8 instead of 96 -- roughly
+    #     1/12 the decode work per row, which is why adding a whole recipe
+    #     costs only ~8% more token budget.
+    #   - mc_correct is 0.0/1.0 and NEVER None, so this recipe cannot be
+    #     silently dropped from the comparison the way a never-parsing
+    #     structured_output was.
+    #   - structurally uniform prompts (biography + question + "Choices:"),
+    #     so batch memory is predictable. They are NOT short -- the
+    #     biography preamble runs to ~600 tokens -- but they sit inside the
+    #     1024 default cap and do not vary by an order of magnitude the way
+    #     JSON schemas did.
+    #   - it is the canonical CAA behavior (Rimsky et al.), so there is
+    #     published evidence the steering signal exists at this scale --
+    #     unlike structured output, where we had no prior reason to expect
+    #     a 4B model to succeed at all.
+    behavior: multiple_choice_eval
+    dataset:
+      adapter: model_written_evals
+      dataset: Anthropic/model-written-evals
+      # One adapter serves the whole repo; `subset` is a path inside it, so
+      # the 16 advanced-ai-risk/human_generated_evals files and the persona
+      # set are each a pure-YAML addition with no new code.
+      subset: sycophancy/sycophancy_on_political_typology_quiz.jsonl
+      reviewed_dataset_card: true  # cc-by-4.0
+      max_records: 250
+    extraction: [mean_diff, whitened_mean_diff]
+    application:
+      layers: ["mid"]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      token_scopes: [all]
+    decoding:
+      # The answer is a single "(A)"/"(B)" token group -- 8 is generous.
+      # This is the single biggest cost lever in the manifest.
+      max_new_tokens: 8
   - id: benign_over_refusal_control
     behavior: harmful_instruction_compliance
     dataset:
       adapter: xstest
       dataset: walledai/XSTest
       reviewed_dataset_card: true
-      max_records: 100
+      # Trimmed 100 -> 60: with the harmful grid at 7 coefficients x 4
+      # vectors this control was the single biggest generation consumer in
+      # the run (~2800/model, more than the recipe it controls for). 60 is
+      # still ample for a false-refusal rate.
+      max_records: 60
       apply_vectors_from: harmful_instruction_compliance
       # QLoRA counterpart to apply_vectors_from above -- see
       # benchmarks.yaml's full comment. Gives the QLoRA arm a benign-

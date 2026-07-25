@@ -53,9 +53,9 @@
 # to keep this a fast, targeted follow-up rather than a second full sweep.
 #
 # Memory sizing: identical precision to preset_4bit_baseline.yaml, so the
-# same batch_size: 32 sizing applies (see that file's header comment for the
-# full derivation). Also relies on the per-vector torch.cuda.empty_cache()
-# fix in runner.py.
+# same A100 40GB sizing applies -- batch_size 64 decoding / 48 extraction
+# (see that file's header for the derivation and for why extraction is
+# sized BELOW decoding despite being cheaper per row).
 # ============================================================================
 experiment:
   name: quantization-low-bit-layer-scan
@@ -83,9 +83,12 @@ capability_probe:
   max_new_tokens: 24
 decoding:
   max_new_tokens: 96
-  batch_size: 32
+  # Matches preset_4bit_baseline.yaml (same 4bit precision) -- A100 40GB.
+  batch_size: 64
 extraction:
-  batch_size: 32
+  # Below decoding on purpose -- extraction has NO OOM backoff. See
+  # preset_4bit_baseline.yaml's comment.
+  batch_size: 48
 recipes:
   - id: harmful_instruction_compliance
     behavior: harmful_instruction_compliance
@@ -94,10 +97,10 @@ recipes:
       dataset: walledai/HarmBench
       subset: standard
       reviewed_dataset_card: true
-      # Raised from 100 to 150, matching every other preset -- see
-      # preset_4bit_baseline.yaml's comment (real run's QLoRA n_validation
-      # fell below the min_split_size floor at max_records: 100).
-      max_records: 150
+      # Matches every other preset -- see preset_4bit_baseline.yaml's
+      # comment (a real run's QLoRA n_validation fell below the
+      # min_split_size floor at max_records: 100).
+      max_records: 250
     extraction: [mean_diff]
     application:
       layers: ["early", "mid", "late"]
@@ -109,7 +112,8 @@ recipes:
       adapter: xstest
       dataset: walledai/XSTest
       reviewed_dataset_card: true
-      max_records: 100
+      # Trimmed 100 -> 60 -- see preset_4bit_baseline.yaml's comment.
+      max_records: 60
       apply_vectors_from: harmful_instruction_compliance
       apply_adapter_from: harmful_instruction_compliance
 finetune:

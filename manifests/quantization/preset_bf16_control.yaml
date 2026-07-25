@@ -27,16 +27,22 @@
 # range, not weight fidelity) and is likewise deliberately excluded --
 # see docs/quantization_matrix.md.
 #
-# Memory sizing (L4, 22.03 GiB actual capacity): bf16 weights are ~2
-# bytes/param -- ~8.0 GiB total for a ~4B-param model (4x the 4bit baseline's
-# ~2.0 GiB). Using the same linear activation scaling (0.4125 GiB/unit-batch,
-# derived from the 4bit baseline's real 8.6 GiB @ batch_size=16 measurement)
-# and the same 6.5 GiB safety margin, the max safe batch at bf16 works out to
-# ~18 -- batch_size: 16 is set here, a clean number below that estimate, the
-# most conservative of the three precision presets since this file ALSO
-# widens the layer grid below (more forward/backward passes resident at
-# once during a wider sweep). Also relies on the per-vector
-# torch.cuda.empty_cache() fix in runner.py.
+# Memory sizing -- A100 40GB (was an L4 at 22.03 GiB, ceiling ~18,
+# batch_size 16). bf16 weights are ~2 bytes/param, ~8.0 GiB for a ~4B model
+# (4x the 4bit baseline's ~2.0 GiB). Same slope and margin:
+#   ceiling = (39.4 - 6.5 - 8.0) / 0.4125 ~= 60
+# batch_size: 48 is set below that. Note what this does NOT mean: 48 < the
+# 4bit preset's 64 purely because the weights are 6 GiB larger, not because
+# bf16 is slower.
+#
+# ON SPEED, THIS PRESET IS THE OPPOSITE OF WHAT ITS BATCH SIZE SUGGESTS.
+# bf16 is the FASTEST per token of the three -- no dequantization, native
+# tensor-core matmuls -- because on a 40 GB card an 8 GiB model was never
+# memory-constrained, so the other two presets pay unpacking costs for a
+# saving that buys nothing here. Despite that, this preset will likely post
+# one of the LONGEST wall times in the matrix, because its layer grid below
+# is 3x wider than the others'. Per-token throughput and total wall time
+# rank differently, and conflating them would misread the result.
 #
 # WHY THIS PRESET ALSO CARRIES A WIDER LAYER SWEEP: bf16 has the most VRAM
 # headroom of the three precision levels even at a smaller batch size (no
@@ -77,9 +83,16 @@ capability_probe:
   max_new_tokens: 24
 decoding:
   max_new_tokens: 96
-  batch_size: 16
+  # A100 40GB (was 16 on the L4). Lower than the 4bit preset's 64 only
+  # because bf16 weights are ~8 GB vs ~2.2 GB, not because bf16 is slower --
+  # it is the FASTEST per token here (no dequantization, native tensor
+  # cores). This preset's long wall time comes from its 3x wider layer
+  # grid, not its precision.
+  batch_size: 48
 extraction:
-  batch_size: 16
+  # Below decoding on purpose -- extraction has NO OOM backoff. See
+  # preset_4bit_baseline.yaml's comment for the full reasoning.
+  batch_size: 32
 recipes:
   - id: harmful_instruction_compliance
     behavior: harmful_instruction_compliance
@@ -88,7 +101,7 @@ recipes:
       dataset: walledai/HarmBench
       subset: standard
       reviewed_dataset_card: true
-      max_records: 150
+      max_records: 250
     extraction: [mean_diff, whitened_mean_diff]
     application:
       # Widened vs the other two presets (see header comment): establishes
@@ -103,7 +116,7 @@ recipes:
       dataset: facebook/AbstentionBench
       reviewed_dataset_card: true
       on_load_error: skip
-      max_records: 150
+      max_records: 250
     extraction: [mean_diff, whitened_mean_diff]
     application:
       layers: ["mid"]
@@ -133,13 +146,35 @@ recipes:
   # block to run it, ideally as its OWN manifest so its memory profile can
   # only take down its own run -- and give extraction its own smaller
   # batch size there, since extraction.py's forward pass has no OOM backoff.
+  - id: sycophancy_agreement
+    # See preset_4bit_baseline.yaml for the full rationale. Kept at ONE
+    # layer even though this preset widens harmful's layer grid to three:
+    # the layer sweep exists to answer H3 (is the best layer
+    # quantization-dependent?), which is asked of the safety recipe, not
+    # of every recipe -- and tripling this one too would triple the
+    # cheapest recipe in the run for no additional hypothesis.
+    behavior: multiple_choice_eval
+    dataset:
+      adapter: model_written_evals
+      dataset: Anthropic/model-written-evals
+      subset: sycophancy/sycophancy_on_political_typology_quiz.jsonl
+      reviewed_dataset_card: true  # cc-by-4.0
+      max_records: 250
+    extraction: [mean_diff, whitened_mean_diff]
+    application:
+      layers: ["mid"]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      token_scopes: [all]
+    decoding:
+      max_new_tokens: 8
   - id: benign_over_refusal_control
     behavior: harmful_instruction_compliance
     dataset:
       adapter: xstest
       dataset: walledai/XSTest
       reviewed_dataset_card: true
-      max_records: 100
+      # Trimmed 100 -> 60 -- see preset_4bit_baseline.yaml's comment.
+      max_records: 60
       apply_vectors_from: harmful_instruction_compliance
       apply_adapter_from: harmful_instruction_compliance
 finetune:
