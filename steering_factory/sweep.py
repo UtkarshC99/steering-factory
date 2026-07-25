@@ -61,6 +61,100 @@ def _reduce_scores(scores, gen_ids_row: torch.Tensor) -> tuple[List[float], Opti
     return token_logprobs, first_step_probs
 
 
+def length_bucketed_chunks(
+    tokenizer, texts: List[str], chunk_size: int, max_length: int = 1024,
+) -> List[List[int]]:
+    """Groups `texts` into chunks of at most `chunk_size` ORIGINAL indices,
+    sorted so each chunk holds similar-length texts. Returns index lists,
+    not the texts -- callers scatter results back to original positions, so
+    row order is never disturbed.
+
+    Batched generation left-pads every row out to the longest row in its
+    batch, so a chunk mixing a 30-token prompt with a 2000-token one pays
+    2000 tokens of KV cache and attention for BOTH. On a recipe with
+    heterogeneous prompt lengths (JSONSchemaBench schemas run from tiny to
+    the truncation cap; HarmBench prompts are uniformly short) that wastes
+    most of the memory budget on padding, and makes per-chunk memory
+    unpredictable -- the same chunk size costs wildly different amounts
+    depending on which prompts happen to land together, which is exactly
+    why a statically-tuned batch_size kept OOMing mid-recipe rather than
+    immediately.
+
+    Bucketing by length makes chunk cost track actual content: short
+    prompts batch densely and cheaply, and only the genuinely long bucket
+    is expensive (where `run_with_oom_backoff` below takes over).
+
+    Does not change any generated token -- greedy decoding is per-row
+    independent and left-padding is already attention-masked, so which
+    rows share a batch is a pure cost decision (see
+    tests/test_eval_grid_chunking.py's equivalence tests)."""
+    if not texts:
+        return []
+    size = chunk_size if chunk_size and chunk_size > 0 else len(texts)
+    # Length without padding/special tokens; truncated at the same cap
+    # generation will use, so a prompt far over the cap doesn't distort
+    # ordering relative to one just under it.
+    lengths = [
+        len(tokenizer(text, truncation=True, max_length=max_length)["input_ids"])
+        for text in texts
+    ]
+    order = sorted(range(len(texts)), key=lambda i: lengths[i])
+    return [order[start : start + size] for start in range(0, len(order), size)]
+
+
+def run_with_oom_backoff(generate_fn, items: List[Any], on_backoff=None) -> List[Any]:
+    """Calls `generate_fn(sublist_of_items)` over `items`, halving the
+    batch and retrying whenever CUDA reports OOM. Returns results in input
+    order.
+
+    `items` is deliberately untyped beyond "a list the caller's own
+    generate_fn understands" -- the steering arm passes prompt strings, the
+    QLoRA arm passes example indices. This function only ever splits the
+    list and preserves order; it never inspects an element.
+
+    Static batch sizing cannot be made reliable here: per-chunk memory
+    depends on prompt length, which varies by an order of magnitude within
+    a single recipe, and the interacting knobs (batch x sequence length x
+    generated tokens) multiply. Any fixed number is either sized for the
+    worst case (wasting most of the card on typical chunks) or for the
+    typical case (OOMing on the tail). This makes the run self-stabilizing
+    instead: the configured batch_size becomes a starting point rather
+    than a promise, and a hard chunk costs throughput rather than killing
+    a multi-hour run.
+
+    A failing batch is split in half and both halves are pushed back to
+    the FRONT of the queue, so ordering is preserved exactly. If a batch of
+    one still OOMs, the error propagates -- that genuinely does not fit and
+    silently skipping the row would corrupt the results."""
+    if not items:
+        return []
+    pending: List[List[Any]] = [list(items)]
+    results: List[Any] = []
+    while pending:
+        batch = pending.pop(0)
+        try:
+            results.extend(generate_fn(batch))
+        except torch.cuda.OutOfMemoryError:
+            if len(batch) <= 1:
+                raise
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            midpoint = len(batch) // 2
+            logger.warning(
+                "CUDA OOM at batch size %d; retrying as %d + %d.",
+                len(batch), midpoint, len(batch) - midpoint,
+            )
+            if on_backoff is not None:
+                try:
+                    on_backoff(len(batch), midpoint)
+                except Exception:
+                    logger.debug("on_backoff callback raised; ignoring.", exc_info=True)
+            # Front of the queue, first half first -- preserves input order.
+            pending.insert(0, batch[midpoint:])
+            pending.insert(0, batch[:midpoint])
+    return results
+
+
 def generate_with_steering_batch(
     loaded: LoadedModel,
     layer_idx: int,

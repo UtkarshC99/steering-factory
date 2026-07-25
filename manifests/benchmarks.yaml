@@ -196,7 +196,14 @@ recipes:
     # (cut off mid-object on the OUTPUT side too). Both raised together
     # since fixing only one still leaves the JSON incomplete.
     decoding:
-      batch_size: 16
+      # Halved from 16 after a real OOM at 16 on this recipe (19.48 GiB
+      # live, only 352 MiB fragmented -- genuinely out of memory, not
+      # fragmentation). With sweep.length_bucketed_chunks grouping
+      # similar-length prompts and sweep.run_with_oom_backoff halving on
+      # OOM, this is a STARTING point rather than a hard promise: the
+      # short-schema buckets run densely at 8 and only the long tail
+      # backs off, instead of one static number having to fit both.
+      batch_size: 8
       max_new_tokens: 256
       max_length: 2048
   - id: benign_over_refusal_control
