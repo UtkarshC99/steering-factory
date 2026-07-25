@@ -164,48 +164,30 @@ recipes:
       layers: ["mid"]
       coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
       token_scopes: [all]
-  - id: structured_output_real
-    behavior: structured_output
-    dataset:
-      adapter: jsonschemabench
-      dataset: epfl-dlab/JSONSchemaBench
-      subset: default  # confirmed against the live dataset viewer: 9.56K rows, train split 5.75K
-      reviewed_dataset_card: true
-      max_records: 150
-    extraction: [mean_diff, whitened_mean_diff]
-    application:
-      # Same as calibrated_abstention_real above: no grid existed here
-      # before, so this recipe only ever ran at coefficient=1.0 (plus the
-      # implicit 0.0 baseline). Widened to the same grid for the same
-      # reason -- see harmful_instruction_compliance's comment.
-      layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
-      token_scopes: [all]
-    # This recipe's prompts embed a full JSON schema and routinely approach
-    # the 1024-token truncation cap, unlike HarmBench's short prompts --
-    # decoding.batch_size: 32 above was sized from HarmBench's own observed
-    # VRAM usage and is NOT safe here. A real run OOM'd specifically on this
-    # recipe (VRAM swinging ~21.8GB -> ~11-14GB -> ~11.5GB batch-to-batch, a
-    # real variable-size spike from long-prompt batches, not fragmentation).
-    # Halved relative to the manifest default as a conservative fix.
-    #
-    # max_length: 2048 (was the 1024 default) -- a real run truncated long
-    # schemas mid-object, so the model never even saw the closing braces or
-    # required fields regardless of output budget. max_new_tokens: 256 (was
-    # 96) -- the same run showed tokens_generated==96 on nearly every row
-    # (cut off mid-object on the OUTPUT side too). Both raised together
-    # since fixing only one still leaves the JSON incomplete.
-    decoding:
-      # Halved from 16 after a real OOM at 16 on this recipe (19.48 GiB
-      # live, only 352 MiB fragmented -- genuinely out of memory, not
-      # fragmentation). With sweep.length_bucketed_chunks grouping
-      # similar-length prompts and sweep.run_with_oom_backoff halving on
-      # OOM, this is a STARTING point rather than a hard promise: the
-      # short-schema buckets run densely at 8 and only the long tail
-      # backs off, instead of one static number having to fit both.
-      batch_size: 8
-      max_new_tokens: 256
-      max_length: 2048
+  # REMOVED: structured_output_real (JSONSchemaBench).
+  #
+  # Cut after it OOMed four separate runs and produced no usable signal.
+  # Both reasons are worth keeping written down, because they are selection
+  # criteria for any future recipe, not just facts about this one:
+  #
+  #  1. MEMORY. Its prompts embed a whole JSON schema, so lengths ranged from
+  #     a few dozen tokens to the truncation cap. Raising that cap to 2048 so
+  #     schemas stopped being cut mid-object made extraction's own forward
+  #     pass allocate 64 texts x 2048 x 9728 (the MLP intermediate) = 2.38 GiB
+  #     in one tensor -- the exact allocation every OOM reported. No other
+  #     recipe here has prompts remotely that long or that variable.
+  #  2. NO SIGNAL. Even before the memory problem, JSON parsing succeeded on
+  #     2 of 2160 steering rows and 1 of 360 QLoRA rows. Its quality key
+  #     (leaf_exact_match) is None whenever parsing fails, and a recipe whose
+  #     quality is None everywhere is silently DROPPED from the comparison
+  #     rather than reported as a zero -- so it consumed roughly half the
+  #     run's generation budget and contributed nothing to the report.
+  #
+  # Nothing is lost: the jsonschemabench adapter, the structured_output
+  # behavior, and structured_score all remain in the codebase. Re-add this
+  # block to run it, ideally as its OWN manifest so its memory profile can
+  # only take down its own run -- and give extraction its own smaller
+  # batch size there, since extraction.py's forward pass has no OOM backoff.
   - id: benign_over_refusal_control
     # XSTest is a benign control set, not a steer source -- see
     # XSTestAdapter's docstring. Every row normalizes to split="test"

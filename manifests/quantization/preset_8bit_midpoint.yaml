@@ -94,37 +94,30 @@ recipes:
       layers: ["mid"]
       coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
       token_scopes: [all]
-  - id: structured_output_real
-    behavior: structured_output
-    dataset:
-      adapter: jsonschemabench
-      dataset: epfl-dlab/JSONSchemaBench
-      subset: default
-      reviewed_dataset_card: true
-      max_records: 150
-    extraction: [mean_diff, whitened_mean_diff]
-    application:
-      layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
-      token_scopes: [all]
-    # Same long-prompt OOM risk as preset_4bit_baseline.yaml's identical
-    # recipe -- halved relative to this preset's own batch_size: 24.
-    decoding:
-      # Halved from 12 BY ANALOGY, not from an observed failure at 12:
-      # the real OOM was on preset_4bit_baseline at its own batch 16
-      # (19.48 GiB live, only 352 MiB fragmented -- genuinely out of
-      # memory, not fragmentation). This preset holds MORE weight
-      # resident, so the same halving is applied here rather than
-      # waiting to rediscover the ceiling.
-      # With sweep.length_bucketed_chunks grouping
-      # similar-length prompts and sweep.run_with_oom_backoff halving on
-      # OOM, this is a STARTING point rather than a hard promise: the
-      # short-schema buckets run densely at 6 and only the long tail
-      # backs off, instead of one static number having to fit both.
-      batch_size: 6
-      # See preset_4bit_baseline.yaml's identical comment.
-      max_new_tokens: 256
-      max_length: 2048
+  # REMOVED: structured_output_real (JSONSchemaBench).
+  #
+  # Cut after it OOMed four separate runs and produced no usable signal.
+  # Both reasons are worth keeping written down, because they are selection
+  # criteria for any future recipe, not just facts about this one:
+  #
+  #  1. MEMORY. Its prompts embed a whole JSON schema, so lengths ranged from
+  #     a few dozen tokens to the truncation cap. Raising that cap to 2048 so
+  #     schemas stopped being cut mid-object made extraction's own forward
+  #     pass allocate 64 texts x 2048 x 9728 (the MLP intermediate) = 2.38 GiB
+  #     in one tensor -- the exact allocation every OOM reported. No other
+  #     recipe here has prompts remotely that long or that variable.
+  #  2. NO SIGNAL. Even before the memory problem, JSON parsing succeeded on
+  #     2 of 2160 steering rows and 1 of 360 QLoRA rows. Its quality key
+  #     (leaf_exact_match) is None whenever parsing fails, and a recipe whose
+  #     quality is None everywhere is silently DROPPED from the comparison
+  #     rather than reported as a zero -- so it consumed roughly half the
+  #     run's generation budget and contributed nothing to the report.
+  #
+  # Nothing is lost: the jsonschemabench adapter, the structured_output
+  # behavior, and structured_score all remain in the codebase. Re-add this
+  # block to run it, ideally as its OWN manifest so its memory profile can
+  # only take down its own run -- and give extraction its own smaller
+  # batch size there, since extraction.py's forward pass has no OOM backoff.
   - id: benign_over_refusal_control
     behavior: harmful_instruction_compliance
     dataset:
