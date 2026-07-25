@@ -117,7 +117,14 @@ recipes:
     # ~21.8GB -> ~11-14GB -> ~11.5GB batch-to-batch, a genuine variable-size
     # spike, not fragmentation). Halved as a conservative fix.
     decoding:
-      batch_size: 16
+      # Halved from 16 after a real OOM at 16 on this recipe (19.48 GiB
+      # live, only 352 MiB fragmented -- genuinely out of memory, not
+      # fragmentation). With sweep.length_bucketed_chunks grouping
+      # similar-length prompts and sweep.run_with_oom_backoff halving on
+      # OOM, this is a STARTING point rather than a hard promise: the
+      # short-schema buckets run densely at 8 and only the long tail
+      # backs off, instead of one static number having to fit both.
+      batch_size: 8
       # max_length: 2048 (was 1024 default) -- long schemas were being
       # truncated mid-object. max_new_tokens: 256 (was 96) -- outputs were
       # also cut off mid-object. See benchmarks.yaml's identical comment.

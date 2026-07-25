@@ -63,7 +63,7 @@ def _manifest(tmp_path, big_path, small_path, small_recipe_batch_size=None):
 
 @pytest.fixture
 def _stub_finetune(monkeypatch):
-    calls = {"eval_batch_sizes": []}
+    calls = {"eval_batch_sizes": [], "eval_max_lengths": []}
 
     def fake_train_qlora(records, config, callback=None, callback_context=None):
         return {"adapter_dir": "unused-adapter-dir", "train_loss": 0.0, "global_step": 1,
@@ -71,8 +71,9 @@ def _stub_finetune(monkeypatch):
 
     def fake_evaluate_qlora_adapter(examples, model_name, adapter_dir, max_new_tokens=96,
                                      trust_remote_code=False, batch_size=16,
-                                     quantization="4bit", dtype=None):
+                                     quantization="4bit", dtype=None, max_length=1024):
         calls["eval_batch_sizes"].append(batch_size)
+        calls["eval_max_lengths"].append(max_length)
         rows = [{"example_id": e["id"], "behavior_id": e["behavior_id"], "split": e["split"],
                   "category": e.get("category"), "prompt": e["prompt"], "output": "stub-output",
                   "latency_s": 0.01, "batch_size": batch_size, "batch_wall_time_s": 0.01,
@@ -109,3 +110,32 @@ def test_qlora_eval_falls_back_to_manifest_wide_batch_size_when_unset(tmp_path, 
     # preserving pre-existing behavior for every manifest written before
     # this override existed.
     assert _stub_finetune["eval_batch_sizes"] == [32, 32]
+
+
+def test_qlora_eval_honors_recipe_max_length(tmp_path, _stub_finetune):
+    """The QLoRA arm must truncate prompts at the SAME per-recipe
+    decoding.max_length the steering arm uses.
+
+    _generate_batched_rows hardcoded max_length=1024 while the steering
+    arm honored a per-recipe override (2048 for structured_output_real),
+    so for that recipe the two arms silently evaluated on prompts
+    truncated at DIFFERENT lengths -- and were then reported side by side
+    as a matched comparison."""
+    big_path, small_path = tmp_path / "big.jsonl", tmp_path / "small.jsonl"
+    _write_recipe_jsonl(big_path)
+    _write_recipe_jsonl(small_path)
+    manifest = _manifest(tmp_path, big_path, small_path)
+    manifest["recipes"][1]["decoding"] = {"max_length": 2048}
+
+    run_qlora(manifest, command="test")
+
+    # big_recipe has no override -> default 1024; small_recipe -> 2048.
+    assert set(_stub_finetune["eval_max_lengths"]) == {1024, 2048}
+
+
+def test_qlora_eval_max_length_defaults_to_1024(tmp_path, _stub_finetune):
+    big_path, small_path = tmp_path / "big.jsonl", tmp_path / "small.jsonl"
+    _write_recipe_jsonl(big_path)
+    _write_recipe_jsonl(small_path)
+    run_qlora(_manifest(tmp_path, big_path, small_path), command="test")
+    assert _stub_finetune["eval_max_lengths"] == [1024, 1024]

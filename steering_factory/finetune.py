@@ -134,6 +134,7 @@ def train_qlora(
 
 def _generate_batched_rows(
     model, tokenizer, examples: List[Dict[str, Any]], max_new_tokens: int, batch_size: int,
+    max_length: int = 1024,
 ) -> List[Dict[str, Any]]:
     """The actual batched-generation loop, factored out of
     `evaluate_qlora_adapter` so it's testable against a plain (unquantized,
@@ -148,29 +149,43 @@ def _generate_batched_rows(
     `latency_s` is amortized (`batch_wall_time_s / batch_size`);
     `batch_size`/`batch_wall_time_s` are recorded alongside it per row so
     cost analysis can tell measured-per-row apart from amortized-per-row,
-    matching the steering arm's row schema."""
+    matching the steering arm's row schema.
+
+    `max_length` MUST track the steering arm's own per-recipe
+    `decoding.max_length`: it was hardcoded to 1024 here while the steering
+    arm honored a per-recipe override (2048 for structured_output_real),
+    which silently truncated the two arms' prompts at DIFFERENT lengths for
+    the same recipe -- the arms would then be compared on inputs they did
+    not both see in full.
+
+    Length bucketing + OOM backoff mirror the steering arm's eval loop
+    (see sweep.length_bucketed_chunks / sweep.run_with_oom_backoff) so both
+    arms stay stable on recipes whose prompt lengths vary by an order of
+    magnitude. Row order always follows `examples`, never batch order."""
     import torch
 
     from .model_utils import format_chat
-    from .sweep import _reduce_scores
+    from .sweep import _reduce_scores, length_bucketed_chunks, run_with_oom_backoff
 
     device = next(model.parameters()).device
-    rows: List[Dict[str, Any]] = []
-    for start in range(0, len(examples), batch_size):
-        chunk = examples[start : start + batch_size]
-        prompt_texts = [format_chat(tokenizer, example["prompt"]) for example in chunk]
+    if not examples:
+        return []
+    prompt_texts_all = [format_chat(tokenizer, example["prompt"]) for example in examples]
+    rows_by_index: List[Optional[Dict[str, Any]]] = [None] * len(examples)
+
+    def _run_batch(indices: List[int]) -> List[Dict[str, Any]]:
+        chunk = [examples[i] for i in indices]
+        prompt_texts = [prompt_texts_all[i] for i in indices]
 
         original_padding_side = tokenizer.padding_side
         tokenizer.padding_side = "left"
         try:
-            # truncation=True, max_length=1024: see the identical guard in
-            # sweep.generate_with_steering_batch -- without a length cap, a
+            # truncation=True + an explicit cap: without a length bound, a
             # single oversized prompt in the batch pads every other row out
-            # to match it, which is what caused a real CUDA OOM (~26 GiB
-            # requested in one torch.embedding call) during a steering
-            # sweep. Same fix applies here since this loop uses the same
-            # padding=True batching pattern.
-            enc = tokenizer(prompt_texts, return_tensors="pt", truncation=True, max_length=1024, padding=True).to(device)
+            # to match it, which caused a real CUDA OOM (~26 GiB requested
+            # in one torch.embedding call) during a steering sweep.
+            enc = tokenizer(prompt_texts, return_tensors="pt", truncation=True,
+                            max_length=max_length, padding=True).to(device)
         finally:
             tokenizer.padding_side = original_padding_side
         prompt_len = enc["input_ids"].shape[1]
@@ -182,18 +197,27 @@ def _generate_batched_rows(
                                   pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
         batch_wall_time_s = time.perf_counter() - before
 
+        built = []
         for row, example in enumerate(chunk):
             gen_ids_row = out.sequences[row][prompt_len:]
             text = tokenizer.decode(gen_ids_row, skip_special_tokens=True)
             row_scores = [step_logits[row : row + 1] for step_logits in out.scores]
             token_logprobs, _ = _reduce_scores(row_scores, gen_ids_row)
-            rows.append({
+            built.append({
                 "example_id": example["id"], "behavior_id": example["behavior_id"], "split": example["split"],
                 "category": example.get("category"), "prompt": example["prompt"], "output": text,
                 "latency_s": batch_wall_time_s / len(chunk), "batch_size": len(chunk),
                 "batch_wall_time_s": batch_wall_time_s, "tokens_generated": len(token_logprobs),
             })
-    return rows
+        return built
+
+    for indices in length_bucketed_chunks(tokenizer, prompt_texts_all, batch_size, max_length):
+        # run_with_oom_backoff halves on OOM; it operates on the index list
+        # so results scatter back to their original positions either way.
+        built = run_with_oom_backoff(_run_batch, indices)
+        for index, row in zip(indices, built):
+            rows_by_index[index] = row
+    return [row for row in rows_by_index if row is not None]
 
 
 def evaluate_qlora_adapter(
@@ -205,6 +229,7 @@ def evaluate_qlora_adapter(
     batch_size: int = 16,
     quantization: Optional[str] = "4bit",
     dtype: Optional[str] = None,
+    max_length: int = 1024,
 ) -> Dict[str, Any]:
     """Generate on `examples` (validation/test split) with the base model +
     trained QLoRA adapter, returning per-example rows in the same shape as
@@ -241,7 +266,7 @@ def evaluate_qlora_adapter(
     model = PeftModel.from_pretrained(base, adapter_dir)
     model.eval()
 
-    rows = _generate_batched_rows(model, tokenizer, examples, max_new_tokens, batch_size)
+    rows = _generate_batched_rows(model, tokenizer, examples, max_new_tokens, batch_size, max_length)
 
     del model, base
     if torch.cuda.is_available():
@@ -257,6 +282,7 @@ def evaluate_base_model(
     batch_size: int = 16,
     quantization: Optional[str] = "4bit",
     dtype: Optional[str] = None,
+    max_length: int = 1024,
 ) -> Dict[str, Any]:
     """Same as `evaluate_qlora_adapter` but loads the plain base model with
     no PEFT adapter -- used for the "before" half of the QLoRA arm's
@@ -284,7 +310,7 @@ def evaluate_base_model(
                                                   trust_remote_code=trust_remote_code, **quant_kwargs)
     model.eval()
 
-    rows = _generate_batched_rows(model, tokenizer, examples, max_new_tokens, batch_size)
+    rows = _generate_batched_rows(model, tokenizer, examples, max_new_tokens, batch_size, max_length)
 
     del model
     if torch.cuda.is_available():

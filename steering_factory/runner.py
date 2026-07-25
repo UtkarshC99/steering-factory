@@ -1,6 +1,8 @@
 """High-level orchestration that is usable from a CLI, notebook, or Python."""
 from __future__ import annotations
 
+print("I hope this works")
+
 import logging
 import time
 import traceback
@@ -433,35 +435,49 @@ def _evaluate_vector_grid(
     # tokenizer changes here.
     prompts = [format_chat(loaded.tokenizer, e["prompt"]) for e in evaluate_examples]
 
+    # Length-bucketed index chunks, computed ONCE and reused for every
+    # coefficient and token_scope -- the bucketing depends only on the
+    # prompts, and re-tokenizing the whole pool per coefficient would be
+    # pure waste on a 7-coefficient sweep.
+    index_chunks = sweep.length_bucketed_chunks(
+        loaded.tokenizer, prompts, batch_size, max_prompt_length,
+    )
+
     def _generate_chunked(coefficient: float, token_scope: str) -> List[Any]:
-        """Generates for every prompt at one coefficient, in
-        `batch_size`-sized chunks, returning one result per prompt in input
-        order.
+        """Generates for every prompt at one coefficient, returning one
+        result per prompt in ORIGINAL input order.
 
-        This chunking is load-bearing and was MISSING: `batch_size` was
-        accepted by this function and threaded through every caller (and
-        tuned per-recipe in the manifests) but never actually used to
-        chunk -- `prompts` was passed to `generate_with_steering_batch`
+        Chunking here is load-bearing and was once MISSING entirely:
+        `batch_size` was accepted by this function and threaded through
+        every caller (and tuned per-recipe across five manifests) but never
+        used to chunk -- `prompts` went to `generate_with_steering_batch`
         whole, so the real batch was always the entire eval pool. Proven by
-        the rows' own `batch_size` field: requesting batch_size=2 over 8
-        examples recorded batch_size=8.
+        the rows' own `batch_size` field: requesting 2 over 8 examples
+        recorded 8. Raising `max_records` 100 -> 150 then grew that de-facto
+        batch from 60 to 90 and OOMed.
 
-        Consequences that showed up as a real CUDA OOM: raising
-        `max_records` 100 -> 150 grew the eval pool (and therefore the
-        actual batch) from 60 to 90, ~2.8x the configured 32, and none of
-        the per-recipe `decoding.batch_size` overrides added earlier had
-        any effect on this arm at all. Note extraction
-        (`extraction._collect_diffs`) and the QLoRA eval loop
-        (`finetune._generate_batched_rows`) BOTH chunk correctly -- this
-        was the one generation path that didn't, exactly the kind of drift
-        this function's own docstring claims sharing it prevents."""
-        chunk = batch_size if batch_size and batch_size > 0 else len(prompts)
-        results: List[Any] = []
-        for start in range(0, len(prompts), chunk):
-            results.extend(sweep.generate_with_steering_batch(
-                loaded, layer_idx, vector, coefficient, prompts[start : start + chunk],
-                max_new_tokens, token_scope, max_prompt_length,
-            ))
+        Two things now keep this stable rather than relying on a
+        perfectly-tuned constant, because per-chunk memory varies by an
+        order of magnitude within a single recipe:
+          - `length_bucketed_chunks` groups similar-length prompts so a
+            chunk's cost tracks real content instead of its longest member.
+          - `run_with_oom_backoff` halves and retries on CUDA OOM, so
+            `batch_size` is a starting point and a hard chunk costs
+            throughput instead of killing a multi-hour run.
+        Neither changes a generated token; both only affect which rows
+        share a forward pass."""
+        results: List[Any] = [None] * len(prompts)
+        for indices in index_chunks:
+            chunk_prompts = [prompts[i] for i in indices]
+            chunk_results = sweep.run_with_oom_backoff(
+                lambda texts: sweep.generate_with_steering_batch(
+                    loaded, layer_idx, vector, coefficient, texts,
+                    max_new_tokens, token_scope, max_prompt_length,
+                ),
+                chunk_prompts,
+            )
+            for index, result in zip(indices, chunk_results):
+                results[index] = result
         return results
 
     for token_scope in token_scopes:
@@ -1091,12 +1107,17 @@ def run_qlora(
                     recipe_decoding = recipe.get("decoding", {})
                     recipe_eval_batch_size = recipe_decoding.get("batch_size", eval_batch_size)
                     recipe_max_new_tokens = recipe_decoding.get("max_new_tokens", max_new_tokens)
+                    # Must match the steering arm's own per-recipe cap, or
+                    # the two arms get differently-truncated prompts for
+                    # the same recipe and stop being comparable.
+                    recipe_max_length = recipe_decoding.get("max_length", 1024)
                     eval_started = _time.perf_counter()
                     eval_result = evaluate_qlora_adapter(
                         eval_examples, model["name_or_path"], train_result["adapter_dir"],
                         max_new_tokens=recipe_max_new_tokens, trust_remote_code=bool(model.get("trust_remote_code", False)),
                         batch_size=recipe_eval_batch_size,
                         quantization=model.get("quantization", "4bit"), dtype=model.get("dtype"),
+                        max_length=recipe_max_length,
                     )
                     for row in eval_result["rows"]:
                         example = next(e for e in eval_examples if e["id"] == row["example_id"])
@@ -1135,6 +1156,7 @@ def run_qlora(
                 recipe_decoding = recipe.get("decoding", {})
                 recipe_eval_batch_size = recipe_decoding.get("batch_size", eval_batch_size)
                 recipe_max_new_tokens = recipe_decoding.get("max_new_tokens", max_new_tokens)
+                recipe_max_length = recipe_decoding.get("max_length", 1024)
                 for (adapter_model_id, adapter_recipe_id, num_train_records), adapter_dir in adapter_dirs.items():
                     if adapter_model_id != model["id"] or adapter_recipe_id != source_id:
                         continue
@@ -1144,6 +1166,7 @@ def run_qlora(
                         max_new_tokens=recipe_max_new_tokens, trust_remote_code=bool(model.get("trust_remote_code", False)),
                         batch_size=recipe_eval_batch_size,
                         quantization=model.get("quantization", "4bit"), dtype=model.get("dtype"),
+                        max_length=recipe_max_length,
                     )
                     for row in eval_result["rows"]:
                         example = next(e for e in applicator_examples if e["id"] == row["example_id"])

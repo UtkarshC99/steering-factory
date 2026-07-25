@@ -110,7 +110,18 @@ recipes:
     # Same long-prompt OOM risk as preset_4bit_baseline.yaml's identical
     # recipe -- halved relative to this preset's own batch_size: 24.
     decoding:
-      batch_size: 12
+      # Halved from 12 BY ANALOGY, not from an observed failure at 12:
+      # the real OOM was on preset_4bit_baseline at its own batch 16
+      # (19.48 GiB live, only 352 MiB fragmented -- genuinely out of
+      # memory, not fragmentation). This preset holds MORE weight
+      # resident, so the same halving is applied here rather than
+      # waiting to rediscover the ceiling.
+      # With sweep.length_bucketed_chunks grouping
+      # similar-length prompts and sweep.run_with_oom_backoff halving on
+      # OOM, this is a STARTING point rather than a hard promise: the
+      # short-schema buckets run densely at 6 and only the long tail
+      # backs off, instead of one static number having to fit both.
+      batch_size: 6
       # See preset_4bit_baseline.yaml's identical comment.
       max_new_tokens: 256
       max_length: 2048
