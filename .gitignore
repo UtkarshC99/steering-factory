@@ -8,3 +8,4 @@ data/vectors/*.pt
 data/vectors/index.json
 data/examples/*.json
 hypotheses.md
+experiment-outputs

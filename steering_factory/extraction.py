@@ -32,7 +32,7 @@ def _encode(tokenizer, text: str, device):
 
 
 def _pooled_activations_batch(
-    loaded: LoadedModel, layer_idx: int, texts: List[str], pooling: Pooling
+    loaded: LoadedModel, layer_idx: int, texts: List[str], pooling: Pooling, max_length: int = 1024,
 ) -> torch.Tensor:
     """Runs one left-padded, batched forward pass over `texts` and returns
     the pooled activation at `layer_idx` for each row, shape (len(texts),
@@ -51,14 +51,20 @@ def _pooled_activations_batch(
     right-padding shifts position handling for the trailing pad tokens in
     a way that does not affect the real tokens' own hidden states, but
     left-padding is the standard decoder-only convention and is what's
-    verified, so it's what's used everywhere in this codebase."""
+    verified, so it's what's used everywhere in this codebase.
+
+    `max_length` (default 1024) is the tokenizer truncation cap, overridable
+    per-recipe (runner.py's decoding.max_length) for recipes whose prompts
+    routinely approach it mid-content (structured_output_real's JSON
+    schemas) -- the extracted vector should come from the same effective
+    input length the eval-generation path sees, not a shorter one."""
     device = next(loaded.model.parameters()).device
     layer_module = loaded.layers[layer_idx]
 
     original_padding_side = loaded.tokenizer.padding_side
     loaded.tokenizer.padding_side = "left"
     try:
-        enc = loaded.tokenizer(texts, return_tensors="pt", truncation=True, max_length=1024, padding=True)
+        enc = loaded.tokenizer(texts, return_tensors="pt", truncation=True, max_length=max_length, padding=True)
     finally:
         loaded.tokenizer.padding_side = original_padding_side
     enc = {k: v.to(device) for k, v in enc.items()}
@@ -75,6 +81,7 @@ def _pooled_activations_batch(
 
 def _collect_diffs(
     loaded: LoadedModel, layer_idx: int, pairs: List[Dict], pooling: Pooling, batch_size: int = 16,
+    max_length: int = 1024,
 ) -> torch.Tensor:
     """Computes the pooled (compliant - non_compliant) activation diff for
     every pair, batching `batch_size` pairs' worth of forward passes at a
@@ -92,7 +99,7 @@ def _collect_diffs(
     pooled_rows: List[torch.Tensor] = []
     for start in range(0, len(all_texts), batch_size * 2):
         chunk = all_texts[start : start + batch_size * 2]
-        pooled_rows.append(_pooled_activations_batch(loaded, layer_idx, chunk, pooling))
+        pooled_rows.append(_pooled_activations_batch(loaded, layer_idx, chunk, pooling, max_length))
     pooled = torch.cat(pooled_rows, dim=0)  # (2 * n_pairs, hidden): [pos0, neg0, pos1, neg1, ...]
 
     diffs = pooled[0::2] - pooled[1::2]  # (n_pairs, hidden)
@@ -107,8 +114,9 @@ def mean_diff_vector(
     track_convergence: bool = True,
     convergence_steps: Optional[List[int]] = None,
     batch_size: int = 16,
+    max_length: int = 1024,
 ) -> ExtractionResult:
-    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size)
+    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size, max_length)
     final_vec = diffs.mean(dim=0)
 
     convergence = []
@@ -138,8 +146,9 @@ def pca_vector(
     pooling: Pooling = "last",
     track_convergence: bool = True,
     batch_size: int = 16,
+    max_length: int = 1024,
 ) -> ExtractionResult:
-    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size)
+    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size, max_length)
     centered = diffs - diffs.mean(dim=0, keepdim=True)
     # SVD on the (n_pairs, hidden) diff matrix; top right-singular vector
     # is the principal direction of the activation differences.
@@ -183,13 +192,14 @@ def whitened_mean_diff_vector(
     pooling: Pooling = "last",
     ridge: float = 1e-3,
     batch_size: int = 16,
+    max_length: int = 1024,
 ) -> ExtractionResult:
     """Regularized Fisher/whitened contrastive direction.
 
     It downweights activation dimensions whose pair differences are noisy,
     offering a useful ablation between raw CAA and a learned optimizer.
     """
-    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size).float()
+    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size, max_length).float()
     mean = diffs.mean(dim=0)
     centered = diffs - mean
     # Diagonal covariance is deliberate: full covariance is unstable when
@@ -325,9 +335,13 @@ def extract(
         # forward passes; optimized_vector's own per-pair gradient loop
         # below is NOT batched (each pair needs its own backward pass
         # under teacher forcing, which batching would change the semantics
-        # of, not just the speed) and has no batch_size parameter -- pop
-        # it here rather than forward it and hit an unexpected-kwarg error.
+        # of, not just the speed) and has no batch_size/max_length parameter
+        # -- pop both here rather than forward them and hit an
+        # unexpected-kwarg error. max_length still governs the init
+        # vector's own closed-form forward passes below.
         init_batch_size = kwargs.pop("batch_size", 16)
-        init = mean_diff_vector(loaded, layer_idx, pairs, pooling, track_convergence=False, batch_size=init_batch_size).vector
+        init_max_length = kwargs.pop("max_length", 1024)
+        init = mean_diff_vector(loaded, layer_idx, pairs, pooling, track_convergence=False,
+                                 batch_size=init_batch_size, max_length=init_max_length).vector
         return optimized_vector(loaded, layer_idx, pairs, init_vector=init, callback=callback, **kwargs)
     raise ValueError(f"Unknown extraction method: {method}")

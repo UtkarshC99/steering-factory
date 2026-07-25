@@ -8,14 +8,17 @@ experiment:
   # measured on identical held-out data. Remove this key to fall back to a
   # single run at the full steer/train pool size (the pre-n_sweep default).
   #
-  # [10, 20, 40] instead of [8, 16, 32, 64, 128, 256, 512]: _subsample_n
+  # [10, 40] instead of [8, 16, 32, 64, 128, 256, 512]: _subsample_n
   # returns the WHOLE steer pool unchanged whenever n >= len(steer)
-  # (runner.py) -- with a ~40-example steer pool (see steer_fraction
-  # below), every sweep point above 40 was silently re-extracting and
-  # re-training on the identical subsample, 6 times over, for zero new
-  # information. [10, 20, 40] gives 3 genuinely distinct points spanning
-  # the full pool instead of 7 points where only the smallest 1-2 differ.
-  n_sweep: [10, 20, 40]
+  # (runner.py) -- with a ~60-example steer pool (see steer_fraction/
+  # max_records below), every sweep point above 60 was silently
+  # re-extracting and re-training on the identical subsample, for zero new
+  # information. Dropped the middle point (20) that [10, 20, 40] used to
+  # have: it added a third data-efficiency point but tripled extraction
+  # cost for the least-informative point on the curve (the two endpoints
+  # already show the efficiency trend). [10, 40] keeps the curve's
+  # low-data and full-pool endpoints only.
+  n_sweep: [10, 40]
 artifacts:
   root: /content/steering_factory_artifacts
   publish_root: null
@@ -34,11 +37,13 @@ splits:
   # generation cost (that scales with validation+test, not steer) -- it
   # only costs a little more extraction/training time -- but it directly
   # controls how many n_sweep points are non-redundant (see the n_sweep
-  # comment above). At max_records: 100 below, steer_fraction: 0.4 gives
-  # steer=40, validation=20, test=40 -- n_test clears the comparison
-  # report's own min_split_size=20 honesty floor with margin, and the
-  # n_sweep=[10,20,40] points span the whole steer pool instead of being
-  # bunched at the low end of a ~12-example pool.
+  # comment above). At max_records: 150 below, steer_fraction: 0.4 gives
+  # steer=60, validation=30, test=60 -- n_validation clears the comparison
+  # report's own min_split_size=20 honesty floor WITH margin even after the
+  # quality-key filter drops rows with a None score (a real run showed
+  # QLoRA n_validation fall from a nominal 20 to 17 post-filter at
+  # max_records: 100 -- 150 leaves headroom for that attrition instead of
+  # sitting right at the floor).
   steer_fraction: 0.4
   validation_fraction: 0.2
   group_key: category
@@ -101,25 +106,37 @@ recipes:
       # smaller pool -- capping after splitting would instead shrink each
       # split unevenly. Deterministic: same splits.seed -> same subsample
       # (steering_factory.runner._subsample_n), so results are reproducible
-      # and comparable across a re-run at the same value. Raised from 60 to
-      # 100 alongside steer_fraction: 0.4 above -- spends the larger pool
-      # on held-out volume (n_test=40, double the report's floor) rather
-      # than grid density.
-      max_records: 100
-    # Dropped `optimized` (BiPO-lite) for this first pass: it's the one
+      # and comparable across a re-run at the same value. Raised from 100 to
+      # 150 (uniformly across every extracting recipe in this manifest, not
+      # just this one -- there is no principled reason to size harmful's
+      # pool differently from abstention/structured's): a real run's QLoRA
+      # n_validation fell to 17 (below the report's min_split_size: 20
+      # floor) after the quality-key filter dropped None-scored rows, even
+      # though the nominal split size was 20. 150 gives validation=30 with
+      # margin for that attrition, on every recipe.
+      max_records: 150
+    # Dropped `pca` (kept mean_diff, whitened_mean_diff): pca was the
+    # least-motivated of the three methods for a first correctness pass --
+    # re-add once the pipeline is confirmed producing valid, parseable
+    # outputs end to end. Also dropped `optimized` (BiPO-lite): it's the one
     # extraction method with an unbatched per-pair gradient loop (~40 steps
     # each), the single most expensive method per vector by a wide margin,
-    # and orthogonal to the sizing fix here. Re-add it once a cheap first
-    # pass confirms the rest of the pipeline end to end.
-    extraction: [mean_diff, pca, whitened_mean_diff]
+    # and orthogonal to the sizing fix here.
+    extraction: [mean_diff, whitened_mean_diff]
     application:
       # Trimmed from 3 layers x 7 coefficients x 2 token_scopes (42-point
-      # grid) to 1 x 3 x 1 for a first pass -- layers/coefficients/scopes
-      # are all still real ablation axes worth sweeping, just not all at
-      # once against a 224-vector extraction bill on the first run. Widen
-      # this back out once one config is confirmed trustworthy.
+      # grid) to 1 layer x 1 scope for a first pass -- layers/token_scopes
+      # are still real ablation axes worth sweeping, just not all at once.
+      # Widen the layer/scope axes back out once one config is confirmed
+      # trustworthy. The coefficient axis is NOT trimmed the same way: it's
+      # cheap (1 layer x 1 scope makes every extra coefficient just another
+      # generation pass, not another vector) and it's the vector-validity
+      # check itself -- both positive and negative magnitudes need to be
+      # present to see whether the extracted direction is meaningfully
+      # bidirectional, and multiple magnitudes trace the dose-response
+      # curve rather than a single before/after point.
       layers: ["mid"]
-      coefficients: [-1, 0, 1]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
       token_scopes: [all]
   - id: calibrated_abstention_real
     behavior: appropriate_abstention
@@ -135,8 +152,18 @@ recipes:
       # OTHER recipe in this manifest keeps the default (on_load_error:
       # raise, i.e. unset) -- a broken dataset there still stops the run.
       on_load_error: skip
-      max_records: 100
-    extraction: [mean_diff, pca, whitened_mean_diff]
+      max_records: 150
+    extraction: [mean_diff, whitened_mean_diff]
+    application:
+      # No application grid existed here before -- _evaluate_vector_grid's
+      # default (grid.get("coefficients", [0.0, 1.0])) meant this recipe
+      # only ever saw ONE positive magnitude and no negative at all. Widened
+      # to match harmful_instruction_compliance's grid (same cheap 1 layer x
+      # 1 scope axis) so this recipe also gets the pos/neg dose-response
+      # check instead of a single before/after point.
+      layers: ["mid"]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      token_scopes: [all]
   - id: structured_output_real
     behavior: structured_output
     dataset:
@@ -144,8 +171,16 @@ recipes:
       dataset: epfl-dlab/JSONSchemaBench
       subset: default  # confirmed against the live dataset viewer: 9.56K rows, train split 5.75K
       reviewed_dataset_card: true
-      max_records: 100
-    extraction: [mean_diff, pca, whitened_mean_diff]
+      max_records: 150
+    extraction: [mean_diff, whitened_mean_diff]
+    application:
+      # Same as calibrated_abstention_real above: no grid existed here
+      # before, so this recipe only ever ran at coefficient=1.0 (plus the
+      # implicit 0.0 baseline). Widened to the same grid for the same
+      # reason -- see harmful_instruction_compliance's comment.
+      layers: ["mid"]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      token_scopes: [all]
     # This recipe's prompts embed a full JSON schema and routinely approach
     # the 1024-token truncation cap, unlike HarmBench's short prompts --
     # decoding.batch_size: 32 above was sized from HarmBench's own observed
@@ -153,8 +188,17 @@ recipes:
     # recipe (VRAM swinging ~21.8GB -> ~11-14GB -> ~11.5GB batch-to-batch, a
     # real variable-size spike from long-prompt batches, not fragmentation).
     # Halved relative to the manifest default as a conservative fix.
+    #
+    # max_length: 2048 (was the 1024 default) -- a real run truncated long
+    # schemas mid-object, so the model never even saw the closing braces or
+    # required fields regardless of output budget. max_new_tokens: 256 (was
+    # 96) -- the same run showed tokens_generated==96 on nearly every row
+    # (cut off mid-object on the OUTPUT side too). Both raised together
+    # since fixing only one still leaves the JSON incomplete.
     decoding:
       batch_size: 16
+      max_new_tokens: 256
+      max_length: 2048
   - id: benign_over_refusal_control
     # XSTest is a benign control set, not a steer source -- see
     # XSTestAdapter's docstring. Every row normalizes to split="test"
@@ -165,6 +209,16 @@ recipes:
     # under harmful_instruction_compliance's own application grid, against
     # THIS recipe's benign prompts -- that's the false-refusal measurement.
     # No `extraction`/`application` block needed here.
+    #
+    # `apply_adapter_from` is the QLoRA counterpart, same mechanism as
+    # apply_vectors_from but for a trained adapter instead of a vector: zero
+    # train examples here means QLoRA could never train its own safety
+    # adapter for XSTest, so without this the QLoRA arm had NO benign-
+    # over-refusal check at all. A real run's QLoRA adapter collapsed to
+    # the same canned refusal string on 372/372 harmful-recipe rows --
+    # evaluating that same adapter here is exactly the test for whether it
+    # over-refuses benign prompts too (a truly lost-cause overfit) or is
+    # merely aggressive on genuinely harmful ones.
     behavior: harmful_instruction_compliance
     dataset:
       adapter: xstest
@@ -172,10 +226,18 @@ recipes:
       reviewed_dataset_card: true
       max_records: 100
       apply_vectors_from: harmful_instruction_compliance
+      apply_adapter_from: harmful_instruction_compliance
 finetune:
   backend: qlora
   matched_split: steer
-  max_steps: 200
+  # Cut from 200 to 25: a real run's train-loss log showed loss=0.009 by
+  # step 15 and 1.6e-4 by step 20 -- the adapter had fully memorized its
+  # ~40-80 example steer pool well before step 200, and the eval outputs
+  # confirmed it (the QLoRA safety adapter collapsed to the SAME canned
+  # refusal string on every single held-out example regardless of input).
+  # 25 leaves a small margin past the observed plateau (~step 15-20)
+  # without continuing to overfit for another 175 steps.
+  max_steps: 25
   target_modules: [q_proj, k_proj, v_proj, o_proj]
   batch_size: 4
   gradient_accumulation_steps: 2

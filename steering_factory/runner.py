@@ -309,9 +309,15 @@ def run_extract(manifest: Dict[str, Any], command: str | None = None, callback: 
                 grid = recipe.get("application", {})
                 layers = grid.get("layers", [0.6])
                 resolved_layers = _resolve_layers(layers, loaded.num_layers)
+                # Per-recipe decoding.max_length override -- the extracted
+                # vector should come from the same effective input length
+                # the eval-generation path uses for this recipe (see
+                # run_steering's identical override), not a shorter one.
+                recipe_max_length = recipe.get("decoding", {}).get("max_length", 1024)
                 for method in methods:
                     for layer_idx in resolved_layers:
-                        result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback, batch_size=extraction_batch_size)
+                        result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback,
+                                                      batch_size=extraction_batch_size, max_length=recipe_max_length)
                         metadata = {"model": model_cfg.get("name_or_path"), "model_id": model_cfg.get("id"),
                                     "hidden_size": loaded.hidden_size, "layer_idx": layer_idx, "method": method,
                                     "recipe_id": recipe_id, "num_pairs": len(pairs), "convergence": result.convergence}
@@ -386,6 +392,7 @@ def _evaluate_vector_grid(
     callback: Optional[RunCallback],
     progress: Dict[str, int],
     judge: Optional[Any] = None,
+    max_prompt_length: int = 1024,
 ) -> List[Dict[str, Any]]:
     """Generates and scores every (token_scope, coefficient, example) row
     for one already-extracted vector, batching examples together at each
@@ -407,10 +414,24 @@ def _evaluate_vector_grid(
     tell measured-per-row apart from amortized-per-row rather than
     silently trusting the amortized number as a per-row measurement."""
     from . import metrics, sweep
+    from .model_utils import format_chat
 
     rows: List[Dict[str, Any]] = []
     all_coefficients = sorted(set([float(c) for c in coefficients] + [0.0]))
-    prompts = [e["prompt"] for e in evaluate_examples]
+    # format_chat, not the raw example prompt: extraction (extraction.py's
+    # _collect_diffs) and QLoRA (finetune.py's tokenize/_generate_batched_rows)
+    # BOTH already template their prompts through the tokenizer's chat
+    # template before encoding -- this eval path was the one place that
+    # didn't, a real train/eval mismatch. Without it, even an
+    # instruction-tuned model (Qwen3-4B, gemma-3-4b-it) sees a bare
+    # instruction with no <|im_start|>user/assistant scaffolding and falls
+    # back to completing the prompt text instead of answering it -- exactly
+    # what a real run's outputs showed (e.g. continuing "The JSON object
+    # must not contain any additional properties..." instead of emitting
+    # JSON). The raw `example["prompt"]` stays on the row's own `prompt`
+    # field below for human-readability; only what's handed to the
+    # tokenizer changes here.
+    prompts = [format_chat(loaded.tokenizer, e["prompt"]) for e in evaluate_examples]
 
     for token_scope in token_scopes:
         # Baseline (coefficient 0.0) is computed once per example per
@@ -419,14 +440,14 @@ def _evaluate_vector_grid(
         # pre-batching loop's behavior, just computed for the whole batch
         # of examples in one call instead of one example at a time.
         baseline_results = sweep.generate_with_steering_batch(
-            loaded, layer_idx, vector, 0.0, prompts, max_new_tokens, token_scope,
+            loaded, layer_idx, vector, 0.0, prompts, max_new_tokens, token_scope, max_prompt_length,
         )
         results_by_coefficient: Dict[float, List] = {0.0: baseline_results}
         for coefficient in all_coefficients:
             if coefficient == 0.0:
                 continue
             results_by_coefficient[coefficient] = sweep.generate_with_steering_batch(
-                loaded, layer_idx, vector, coefficient, prompts, max_new_tokens, token_scope,
+                loaded, layer_idx, vector, coefficient, prompts, max_new_tokens, token_scope, max_prompt_length,
             )
 
         for example_idx, example in enumerate(evaluate_examples):
@@ -512,6 +533,25 @@ def _recipe_applies_cross_recipe(recipe: Dict[str, Any]) -> Optional[str]:
     return recipe.get("dataset", {}).get("apply_vectors_from") or recipe.get("apply_vectors_from")
 
 
+def _recipe_applies_cross_recipe_adapter(recipe: Dict[str, Any]) -> Optional[str]:
+    """QLoRA counterpart to `_recipe_applies_cross_recipe`: returns the
+    source recipe id a recipe borrows a TRAINED ADAPTER from
+    (`apply_adapter_from`, same top-level-or-dataset-block convenience as
+    `apply_vectors_from`), or None.
+
+    XSTest (benign_over_refusal_control) has zero steer examples by design
+    (every row normalizes to split="test"), so it can never train its own
+    QLoRA adapter -- `run_qlora`'s main loop already skips any recipe with
+    no train_records. Without this, XSTest had a steering arm (via
+    apply_vectors_from) but no QLoRA arm at all, so there was no way to
+    check whether the QLoRA safety adapter ALSO over-refuses benign
+    prompts -- a real run showed it collapsed to the same canned refusal
+    string on 372/372 harmful-recipe rows, making "does it also refuse
+    benign ones" exactly the question needed to tell overfit-to-refusal
+    apart from a genuinely calibrated adapter."""
+    return recipe.get("dataset", {}).get("apply_adapter_from") or recipe.get("apply_adapter_from")
+
+
 def _apply_vectors_cross_recipe(
     manifest: Dict[str, Any], examples: List[Dict[str, Any]], vector_rows: List[Dict[str, Any]],
     resolve_vector, get_loaded, max_new_tokens: int, batch_size: int,
@@ -553,6 +593,14 @@ def _apply_vectors_cross_recipe(
         grid = source_recipe.get("application", {})
         coefficients = grid.get("coefficients", [0.0, 1.0])
         token_scopes = grid.get("token_scopes", ["all"])
+        # Per-recipe decoding overrides sourced from the APPLICATOR recipe
+        # (this recipe) since its own examples are what get tokenized here
+        # -- matches run_steering/run_evaluate's identical per-recipe
+        # override pattern.
+        recipe_decoding = recipe.get("decoding", {})
+        recipe_batch_size = recipe_decoding.get("batch_size", batch_size)
+        recipe_max_new_tokens = recipe_decoding.get("max_new_tokens", max_new_tokens)
+        recipe_max_prompt_length = recipe_decoding.get("max_length", 1024)
         for vrow in vector_rows:
             if vrow.get("recipe_id") != source_id:
                 continue
@@ -561,7 +609,8 @@ def _apply_vectors_cross_recipe(
             rows.extend(_evaluate_vector_grid(
                 loaded, vector, vrow["layer_idx"], vrow["method"], applicator_id,
                 vrow["model_id"], vrow["model"], eval_examples, coefficients, token_scopes,
-                max_new_tokens, batch_size, callback, progress, judge,
+                recipe_max_new_tokens, recipe_batch_size, callback, progress, judge,
+                max_prompt_length=recipe_max_prompt_length,
             ))
     return rows
 
@@ -633,13 +682,18 @@ def run_evaluate(
             token_scopes = grid.get("token_scopes", ["all"])
             layer_idx = vrow["layer_idx"]
             method = vrow["method"]
-            # Per-recipe decoding.batch_size override -- see the identical
-            # comment in run_steering's equivalent loop.
-            recipe_batch_size = recipe.get("decoding", {}).get("batch_size", batch_size)
+            # Per-recipe decoding.batch_size/max_new_tokens/max_length
+            # overrides -- see the identical comment in run_steering's
+            # equivalent loop.
+            recipe_decoding = recipe.get("decoding", {})
+            recipe_batch_size = recipe_decoding.get("batch_size", batch_size)
+            recipe_max_new_tokens = recipe_decoding.get("max_new_tokens", max_new_tokens)
+            recipe_max_prompt_length = recipe_decoding.get("max_length", 1024)
 
             rows.extend(_evaluate_vector_grid(
                 loaded, vector, layer_idx, method, recipe_id, vrow["model_id"], vrow["model"],
-                evaluate_examples, coefficients, token_scopes, max_new_tokens, recipe_batch_size, callback, progress, judge,
+                evaluate_examples, coefficients, token_scopes, recipe_max_new_tokens, recipe_batch_size, callback, progress, judge,
+                max_prompt_length=recipe_max_prompt_length,
             ))
             # Same per-vector cache clear as run_steering's equivalent loop
             # -- see the comment there for the fragmentation OOM this
@@ -777,7 +831,25 @@ def run_steering(
                 # would show a floor that doesn't come back down). Defaults
                 # to the run-wide batch_size when unset, so every existing
                 # manifest is unaffected.
-                recipe_batch_size = recipe.get("decoding", {}).get("batch_size", batch_size)
+                #
+                # max_new_tokens gets the same per-recipe override for the
+                # opposite reason: structured_output_real's JSON-schema
+                # completions were being cut off at exactly the manifest-wide
+                # 96-token cap on essentially every row (a real run showed
+                # tokens_generated==96 on nearly every structured_output_real
+                # row), well before a full JSON object could be emitted.
+                # Defaults to the run-wide max_new_tokens when unset.
+                #
+                # decoding.max_length is the input-side counterpart: raises
+                # the tokenizer's truncation cap above the default 1024 for
+                # recipes whose prompts routinely approach it mid-schema
+                # (structured_output_real) -- otherwise the model never even
+                # SEES the closing braces/required fields of a long schema,
+                # independent of how many output tokens it's given.
+                recipe_decoding = recipe.get("decoding", {})
+                recipe_batch_size = recipe_decoding.get("batch_size", batch_size)
+                recipe_max_new_tokens = recipe_decoding.get("max_new_tokens", max_new_tokens)
+                recipe_max_prompt_length = recipe_decoding.get("max_length", 1024)
 
                 # n_points is the labeled-example-count axis (experiment.n_sweep);
                 # absent, this is exactly [len(steer)] -- one iteration using
@@ -792,7 +864,8 @@ def run_steering(
                     pairs = [{"prompt": e["prompt"], "compliant": e["positive"], "non_compliant": e["negative"]} for e in steer_subset]
                     for method in methods:
                         for layer_idx in resolved_layers:
-                            result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback, batch_size=extraction_batch_size)
+                            result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback,
+                                                          batch_size=extraction_batch_size, max_length=recipe_max_prompt_length)
                             metadata = {"model": model_cfg.get("name_or_path"), "model_id": model_cfg.get("id"),
                                         "hidden_size": loaded.hidden_size, "layer_idx": layer_idx, "method": method,
                                         "recipe_id": recipe_id, "num_pairs": len(pairs), "convergence": result.convergence}
@@ -807,7 +880,8 @@ def run_steering(
                             progress = {"done": generations_done, "total": generations_total_for_model}
                             new_rows = _evaluate_vector_grid(
                                 loaded, result.vector, layer_idx, method, recipe_id, model_cfg.get("id"), model_cfg.get("name_or_path"),
-                                evaluate, coefficients, token_scopes, max_new_tokens, recipe_batch_size, callback, progress, judge,
+                                evaluate, coefficients, token_scopes, recipe_max_new_tokens, recipe_batch_size, callback, progress, judge,
+                                max_prompt_length=recipe_max_prompt_length,
                             )
                             rows.extend(new_rows)
                             generations_done = progress["done"]
@@ -929,6 +1003,14 @@ def run_qlora(
         decoding_cfg = manifest.get("decoding", {})
         max_new_tokens = decoding_cfg.get("max_new_tokens", 96)
         eval_batch_size = decoding_cfg.get("batch_size", 16)
+        # (model_id, recipe_id, num_train_records) -> trained adapter_dir,
+        # populated as the main loop below trains each adapter -- read by
+        # the apply_adapter_from cross-recipe pass after this loop so a
+        # recipe with no train pool of its own (XSTest) can still be
+        # evaluated against an already-trained adapter, at every N-sweep
+        # point the source recipe trained, mirroring the steering arm's
+        # apply_vectors_from.
+        adapter_dirs: Dict[tuple, str] = {}
         for model in manifest["models"]:
             for recipe in manifest["recipes"]:
                 recipe_examples = [e for e in examples if e["recipe_id"] == recipe["id"]]
@@ -956,6 +1038,7 @@ def run_qlora(
                                      "quantization": model.get("quantization", "4bit"), "dtype": model.get("dtype")}
                     train_result = train_qlora(train_subset, qlora_config, callback=callback,
                                                 callback_context={"model_id": model["id"], "recipe_id": recipe["id"]})
+                    adapter_dirs[(model["id"], recipe["id"], len(train_subset))] = train_result["adapter_dir"]
                     results.append({"model_id": model["id"], "recipe_id": recipe["id"], "num_train_records": len(train_subset),
                                      "quantization": model.get("quantization", "4bit"), "dtype": model.get("dtype"), **train_result})
                     _safe(callback, {"arm": "qlora", "event": "adapter_done", "model_id": model["id"], "recipe_id": recipe["id"],
@@ -975,11 +1058,18 @@ def run_qlora(
                     # produced a real OOM on the steering arm before its own
                     # override was added -- _generate_batched_rows uses the
                     # same padding=True batching pattern.
-                    recipe_eval_batch_size = recipe.get("decoding", {}).get("batch_size", eval_batch_size)
+                    # max_new_tokens gets the identical per-recipe override
+                    # as run_steering's generation loop -- otherwise QLoRA's
+                    # structured_output_real eval would stay capped at the
+                    # manifest-wide 96 tokens even after the steering arm's
+                    # cap is raised, breaking the two arms' comparability.
+                    recipe_decoding = recipe.get("decoding", {})
+                    recipe_eval_batch_size = recipe_decoding.get("batch_size", eval_batch_size)
+                    recipe_max_new_tokens = recipe_decoding.get("max_new_tokens", max_new_tokens)
                     eval_started = _time.perf_counter()
                     eval_result = evaluate_qlora_adapter(
                         eval_examples, model["name_or_path"], train_result["adapter_dir"],
-                        max_new_tokens=max_new_tokens, trust_remote_code=bool(model.get("trust_remote_code", False)),
+                        max_new_tokens=recipe_max_new_tokens, trust_remote_code=bool(model.get("trust_remote_code", False)),
                         batch_size=recipe_eval_batch_size,
                         quantization=model.get("quantization", "4bit"), dtype=model.get("dtype"),
                     )
@@ -998,6 +1088,56 @@ def run_qlora(
                                           "recipe_id": recipe["id"], "example_id": row["example_id"]})
                     results[-1]["eval_wall_time_s"] = _time.perf_counter() - eval_started
                     results[-1]["eval_records"] = len(eval_examples)
+
+        # apply_adapter_from cross-recipe pass: evaluate each already-trained
+        # source adapter against the APPLICATOR recipe's own examples, at
+        # every N-sweep point the source recipe trained -- mirrors the
+        # steering arm's apply_vectors_from / _apply_vectors_cross_recipe.
+        # Tagged with num_train_records like every other qlora eval row, so
+        # comparison.py's existing max-N pinning applies unmodified.
+        for model in manifest["models"]:
+            for recipe in manifest["recipes"]:
+                source_id = _recipe_applies_cross_recipe_adapter(recipe)
+                if not source_id:
+                    continue
+                applicator_id = recipe["id"]
+                applicator_examples = [e for e in examples if e["recipe_id"] == applicator_id and e["split"] in ("validation", "test")]
+                if not applicator_examples:
+                    continue
+                source_recipe = next((r for r in manifest["recipes"] if r["id"] == source_id), None)
+                if source_recipe is None:
+                    continue
+                recipe_decoding = recipe.get("decoding", {})
+                recipe_eval_batch_size = recipe_decoding.get("batch_size", eval_batch_size)
+                recipe_max_new_tokens = recipe_decoding.get("max_new_tokens", max_new_tokens)
+                for (adapter_model_id, adapter_recipe_id, num_train_records), adapter_dir in adapter_dirs.items():
+                    if adapter_model_id != model["id"] or adapter_recipe_id != source_id:
+                        continue
+                    eval_started = _time.perf_counter()
+                    eval_result = evaluate_qlora_adapter(
+                        applicator_examples, model["name_or_path"], adapter_dir,
+                        max_new_tokens=recipe_max_new_tokens, trust_remote_code=bool(model.get("trust_remote_code", False)),
+                        batch_size=recipe_eval_batch_size,
+                        quantization=model.get("quantization", "4bit"), dtype=model.get("dtype"),
+                    )
+                    for row in eval_result["rows"]:
+                        example = next(e for e in applicator_examples if e["id"] == row["example_id"])
+                        example_metadata = example.get("metadata", {}) or {}
+                        score = _behavior_score(row["output"], example, judge)
+                        eval_rows.append({"model_id": model["id"], "model_name": model["name_or_path"],
+                                           "recipe_id": applicator_id, "arm": "qlora",
+                                           "num_train_records": num_train_records,
+                                           "quantization": model.get("quantization", "4bit"), "dtype": model.get("dtype"),
+                                           "benchmark": example_metadata.get("benchmark"),
+                                           "is_safe_control": example_metadata.get("is_safe_control"),
+                                           **row, **score})
+                        _safe(callback, {"arm": "qlora", "event": "eval_generation", "model_id": model["id"],
+                                          "recipe_id": applicator_id, "example_id": row["example_id"]})
+                    _safe(callback, {"arm": "qlora", "event": "cross_recipe_adapter_eval_done", "model_id": model["id"],
+                                      "recipe_id": applicator_id, "source_recipe_id": source_id,
+                                      "num_train_records": num_train_records,
+                                      "eval_wall_time_s": _time.perf_counter() - eval_started})
+
         store.write_json("results/qlora.json", results)
         if eval_rows:
             store.write_table("results/generations", eval_rows)

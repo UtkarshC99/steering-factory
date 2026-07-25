@@ -307,3 +307,86 @@ def test_empty_records_still_writes_valid_empty_package(tmp_path):
         assert col in rows[0]
     assert "0 paired examples" in (package_dir / "README.md").read_text(encoding="utf-8")
     assert (package_dir / "review.html").exists()
+
+
+# --- negative-coefficient column ------------------------------------------
+
+def _steering_rows_with_negative(model_id="m1", recipe_id="r1", behavior_id="domain_classification", n=N_PER_SPLIT):
+    """Same shape as _steering_rows, plus a negative-coefficient (-1.0) row
+    per test example at the WINNER's method/layer/token_scope -- the row
+    set build_human_eval_records's steering_negative_output column reads."""
+    rows = _steering_rows(model_id, recipe_id, behavior_id, n)
+    for i in range(n):
+        rows.append({"model_id": model_id, "recipe_id": recipe_id, "behavior_id": behavior_id,
+                     "split": "test", "method": "mean_diff", "layer_idx": 5, "coefficient": -1.0,
+                     "token_scope": "all", "example_id": f"test-{i}", "exact_match": 0.0,
+                     "category": "cat-a", "prompt": f"test-prompt-{i}", "output": f"negative-test-output-{i}",
+                     "benchmark": "TestBench", "is_safe_control": False})
+    return rows
+
+
+def test_negative_coefficient_output_present_when_swept(tmp_path):
+    steer_dir, qlora_dir = tmp_path / "steer", tmp_path / "qlora"
+    _write_jsonl(steer_dir / "results" / "generations.jsonl", _steering_rows_with_negative())
+    _write_json(steer_dir / "run.json", {"run_id": "steer-1", "status": "completed", "manifest_hash": "abc"})
+    _build_qlora_run(qlora_dir)
+
+    records = build_human_eval_records(steer_dir, qlora_dir)
+    assert records
+    for record in records:
+        assert record["negative_coefficient"] == -1.0
+        assert record["steering_negative_output"].startswith("negative-test-output-")
+        assert record["steering_negative_exact_match"] == 0.0
+
+
+def test_negative_coefficient_mirrors_winner_magnitude(tmp_path):
+    # Winner is +1.0; both -1.0 and -2.0 are swept -- the mirror (-1.0)
+    # must be preferred over the more-negative -2.0.
+    steer_dir, qlora_dir = tmp_path / "steer", tmp_path / "qlora"
+    rows = _steering_rows_with_negative()
+    n = N_PER_SPLIT
+    for i in range(n):
+        rows.append({"model_id": "m1", "recipe_id": "r1", "behavior_id": "domain_classification",
+                     "split": "test", "method": "mean_diff", "layer_idx": 5, "coefficient": -2.0,
+                     "token_scope": "all", "example_id": f"test-{i}", "exact_match": 0.0,
+                     "category": "cat-a", "prompt": f"test-prompt-{i}", "output": f"far-negative-output-{i}",
+                     "benchmark": "TestBench", "is_safe_control": False})
+    _write_jsonl(steer_dir / "results" / "generations.jsonl", rows)
+    _write_json(steer_dir / "run.json", {"run_id": "steer-1", "status": "completed", "manifest_hash": "abc"})
+    _build_qlora_run(qlora_dir)
+
+    records = build_human_eval_records(steer_dir, qlora_dir)
+    assert records
+    for record in records:
+        assert record["negative_coefficient"] == -1.0
+        assert record["steering_negative_output"].startswith("negative-test-output-")
+
+
+def test_negative_coefficient_absent_when_not_swept(run_dirs):
+    # The base fixture (no monkey-patched negative rows) never swept a
+    # negative coefficient -- must degrade to None/empty, not crash.
+    steer_dir, qlora_dir = run_dirs
+    records = build_human_eval_records(steer_dir, qlora_dir)
+    assert records
+    for record in records:
+        assert record["negative_coefficient"] is None
+        assert record["steering_negative_output"] is None
+
+
+def test_negative_coefficient_column_in_csv_and_html(tmp_path):
+    steer_dir, qlora_dir = tmp_path / "steer", tmp_path / "qlora"
+    _write_jsonl(steer_dir / "results" / "generations.jsonl", _steering_rows_with_negative())
+    _write_json(steer_dir / "run.json", {"run_id": "steer-1", "status": "completed", "manifest_hash": "abc"})
+    _build_qlora_run(qlora_dir)
+    records = build_human_eval_records(steer_dir, qlora_dir)
+
+    package_dir = write_human_eval_package(records, tmp_path / "output")
+    with (package_dir / "pairs.csv").open(encoding="utf-8", newline="") as handle:
+        header = next(csv.reader(handle))
+    assert "negative_coefficient" in header
+    assert "steering_negative_output" in header
+    assert "rating_steering_negative" in header
+
+    html_text = (package_dir / "review.html").read_text(encoding="utf-8")
+    assert "negative-test-output-0" in html_text
+    assert 'data-field="rating_steering_negative"' in html_text

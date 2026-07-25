@@ -69,6 +69,7 @@ def generate_with_steering_batch(
     prompt_texts: List[str],
     max_new_tokens: int = 120,
     token_scope: str = "all",
+    max_prompt_length: int = 1024,
 ) -> List[GenerationResult]:
     """Batched greedy decode across `prompt_texts` at a FIXED (layer,
     vector, coefficient, token_scope) -- the axis every caller in this
@@ -100,17 +101,20 @@ def generate_with_steering_batch(
     original_padding_side = loaded.tokenizer.padding_side
     loaded.tokenizer.padding_side = "left"
     try:
-        # truncation=True, max_length=1024 (matching extraction.py's own
-        # prompt-length cap) is load-bearing, not cosmetic: with
-        # padding=True and no length bound, a SINGLE unusually long prompt
-        # in the batch (e.g. a JSONSchemaBench prompt embedding a schema up
-        # to ~1.28M characters, or a HarmBench `contextual`-subset prompt)
-        # pads every other row in the batch out to match it. At batch_size
-        # 32 that produced a real OOM (~26 GiB requested in one
-        # torch.embedding call) from a single oversized prompt, not from
-        # batch_size itself -- this was a missing guard, not a memory-
-        # capacity problem to solve by lowering batch_size.
-        enc = loaded.tokenizer(prompt_texts, return_tensors="pt", truncation=True, max_length=1024, padding=True).to(device)
+        # truncation=True, max_length=max_prompt_length (default 1024,
+        # matching extraction.py's own prompt-length cap) is load-bearing,
+        # not cosmetic: with padding=True and no length bound, a SINGLE
+        # unusually long prompt in the batch (e.g. a JSONSchemaBench prompt
+        # embedding a schema up to ~1.28M characters, or a HarmBench
+        # `contextual`-subset prompt) pads every other row in the batch out
+        # to match it. At batch_size 32 that produced a real OOM (~26 GiB
+        # requested in one torch.embedding call) from a single oversized
+        # prompt, not from batch_size itself -- this was a missing guard,
+        # not a memory-capacity problem to solve by lowering batch_size.
+        # `max_prompt_length` is overridable per-recipe (runner.py's
+        # per-recipe decoding overrides) for recipes whose prompts routinely
+        # approach the default cap mid-schema (structured_output_real).
+        enc = loaded.tokenizer(prompt_texts, return_tensors="pt", truncation=True, max_length=max_prompt_length, padding=True).to(device)
     finally:
         loaded.tokenizer.padding_side = original_padding_side
 

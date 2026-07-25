@@ -52,7 +52,9 @@
 experiment:
   name: quantization-bf16-control
   seed: 17
-  n_sweep: [10, 20, 40]
+  # Trimmed to [10, 40] and coefficients/max_records widened -- see
+  # preset_4bit_baseline.yaml's recipe comments for the full rationale.
+  n_sweep: [10, 40]
 artifacts:
   root: /content/steering_factory_artifacts
   publish_root: null
@@ -86,13 +88,13 @@ recipes:
       dataset: walledai/HarmBench
       subset: standard
       reviewed_dataset_card: true
-      max_records: 100
-    extraction: [mean_diff, pca, whitened_mean_diff]
+      max_records: 150
+    extraction: [mean_diff, whitened_mean_diff]
     application:
       # Widened vs the other two presets (see header comment): establishes
       # which layer is robust with no quantization noise to confound it.
       layers: ["early", "mid", "late"]
-      coefficients: [-1, 0, 1]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
       token_scopes: [all]
   - id: calibrated_abstention_real
     behavior: appropriate_abstention
@@ -101,8 +103,12 @@ recipes:
       dataset: facebook/AbstentionBench
       reviewed_dataset_card: true
       on_load_error: skip
-      max_records: 100
-    extraction: [mean_diff, pca, whitened_mean_diff]
+      max_records: 150
+    extraction: [mean_diff, whitened_mean_diff]
+    application:
+      layers: ["mid"]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      token_scopes: [all]
   - id: structured_output_real
     behavior: structured_output
     dataset:
@@ -110,13 +116,20 @@ recipes:
       dataset: epfl-dlab/JSONSchemaBench
       subset: default
       reviewed_dataset_card: true
-      max_records: 100
-    extraction: [mean_diff, pca, whitened_mean_diff]
+      max_records: 150
+    extraction: [mean_diff, whitened_mean_diff]
+    application:
+      layers: ["mid"]
+      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      token_scopes: [all]
     # Same long-prompt OOM risk as preset_4bit_baseline.yaml's identical
     # recipe -- halved relative to this preset's own batch_size: 16 (already
     # the most conservative of the three precision presets).
     decoding:
       batch_size: 8
+      # See preset_4bit_baseline.yaml's identical comment.
+      max_new_tokens: 256
+      max_length: 2048
   - id: benign_over_refusal_control
     behavior: harmful_instruction_compliance
     dataset:
@@ -125,10 +138,13 @@ recipes:
       reviewed_dataset_card: true
       max_records: 100
       apply_vectors_from: harmful_instruction_compliance
+      apply_adapter_from: harmful_instruction_compliance
 finetune:
   backend: qlora
   matched_split: steer
-  max_steps: 200
+  # Cut from 200 to 25 -- see preset_4bit_baseline.yaml's identical comment
+  # (real train-loss log plateaued by step 15-20).
+  max_steps: 25
   target_modules: [q_proj, k_proj, v_proj, o_proj]
   batch_size: 4
   gradient_accumulation_steps: 2

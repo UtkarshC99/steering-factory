@@ -26,20 +26,24 @@
 #     quantization noise specifically, is deliberately reserved for
 #     preset_8bit_midpoint.yaml/preset_4bit_baseline.yaml's full 3-method
 #     grid, not spent here.)
-#   - coefficients: narrowed to [-1, 1] (drops the implicit 0.0 baseline is
-#     still evaluated automatically by _evaluate_vector_grid regardless) --
-#     halves the coefficient axis to afford 3x the layer axis within a
-#     similar total step budget.
+#   - coefficients: [-1, 1] only (drops 0.0, still evaluated automatically
+#     by _evaluate_vector_grid regardless, and drops the wider magnitudes
+#     preset_4bit_baseline.yaml now sweeps) -- keeps the coefficient axis
+#     minimal (one pos, one neg magnitude, still a real bidirectionality
+#     check) to afford 3x the layer axis within a similar total step budget.
+#     This is a deliberate exception to widening the coefficient grid
+#     everywhere else: this preset's whole point is trading coefficient
+#     breadth for layer depth.
 #   - n_sweep: narrowed to a single point [40] (was [10,20,40]) -- this
 #     hypothesis is about layer robustness at a fixed, reasonably-sized
 #     labeled pool, not about data efficiency; the N-sweep axis is orthogonal
 #     to H3 and cut entirely rather than spread thin.
 #
 # Net step-count vs preset_4bit_baseline.yaml's HarmBench recipe: baseline is
-# 1 layer x 3 methods x 3 coeffs x 1 scope x 3 n_sweep = 27 extraction units;
-# this preset is 3 layers x 1 method x 2 coeffs x 1 scope x 1 n_sweep = 6
-# extraction units -- fewer vectors overall, spent on 3x the layer depth
-# instead of on data-efficiency or method comparison, which is exactly the
+# now 1 layer x 2 methods x 7 coeffs x 1 scope x 2 n_sweep = 28 extraction
+# units; this preset is 3 layers x 1 method x 2 coeffs x 1 scope x 1 n_sweep
+# = 6 extraction units -- fewer vectors overall, spent on 3x the layer depth
+# instead of on data-efficiency or coefficient breadth, which is exactly the
 # tradeoff this hypothesis calls for.
 #
 # Other two recipes (calibrated_abstention_real, structured_output_real) are
@@ -90,7 +94,10 @@ recipes:
       dataset: walledai/HarmBench
       subset: standard
       reviewed_dataset_card: true
-      max_records: 100
+      # Raised from 100 to 150, matching every other preset -- see
+      # preset_4bit_baseline.yaml's comment (real run's QLoRA n_validation
+      # fell below the min_split_size floor at max_records: 100).
+      max_records: 150
     extraction: [mean_diff]
     application:
       layers: ["early", "mid", "late"]
@@ -104,10 +111,13 @@ recipes:
       reviewed_dataset_card: true
       max_records: 100
       apply_vectors_from: harmful_instruction_compliance
+      apply_adapter_from: harmful_instruction_compliance
 finetune:
   backend: qlora
   matched_split: steer
-  max_steps: 200
+  # Cut from 200 to 25 -- see preset_4bit_baseline.yaml's identical comment
+  # (real train-loss log plateaued by step 15-20).
+  max_steps: 25
   target_modules: [q_proj, k_proj, v_proj, o_proj]
   batch_size: 4
   gradient_accumulation_steps: 2

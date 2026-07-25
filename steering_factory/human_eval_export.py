@@ -30,10 +30,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from .comparison import _quality_key, _read_json, _read_jsonl, _steering_config_key, best_steering_config
 
 ANNOTATION_COLUMNS = [
-    "rating_steering_winner", "rating_steering_baseline", "rating_qlora", "preferred_arm", "notes",
+    "rating_steering_winner", "rating_steering_baseline", "rating_steering_negative", "rating_qlora",
+    "preferred_arm", "notes",
 ]
 
-# Column order for CSV/JSONL -- context first, then the three outputs, then
+# Column order for CSV/JSONL -- context first, then the four outputs, then
 # each arm's own auto-scores, then the empty annotation columns last (so a
 # human importing into a spreadsheet sees prompt/outputs first and doesn't
 # have to scroll past scoring internals to find where to write).
@@ -41,8 +42,12 @@ _CONTEXT_COLUMNS = [
     "model_id", "recipe_id", "behavior_id", "example_id", "split", "category",
     "benchmark", "is_safe_control", "prompt",
 ]
-_CONFIG_COLUMNS = ["winner_method", "winner_layer_idx", "winner_coefficient", "winner_token_scope"]
-_OUTPUT_COLUMNS = ["steering_winner_output", "steering_baseline_output", "qlora_output"]
+_CONFIG_COLUMNS = [
+    "winner_method", "winner_layer_idx", "winner_coefficient", "winner_token_scope", "negative_coefficient",
+]
+_OUTPUT_COLUMNS = [
+    "steering_winner_output", "steering_baseline_output", "steering_negative_output", "qlora_output",
+]
 
 
 def _score_keys_present(rows: List[Dict[str, Any]]) -> List[str]:
@@ -65,6 +70,33 @@ def _score_keys_present(rows: List[Dict[str, Any]]) -> List[str]:
             if key not in known and key not in keys:
                 keys.append(key)
     return sorted(keys)
+
+
+def _pick_negative_coefficient(all_steer_rows: List[Dict[str, Any]], winner: Dict[str, Any]) -> Optional[float]:
+    """Picks which negative coefficient (same method/layer/token_scope as
+    the winner) populates the human-eval package's fourth column -- the
+    vector-validity/bidirectionality check: a steering direction that only
+    "works" pushed one way is a weaker finding than one that pushes the
+    target behavior in both directions from baseline. Prefers the negative
+    coefficient with the SAME magnitude as the winner's (so a +1 winner
+    pairs with -1, not an arbitrary -2), falling back to the most negative
+    coefficient actually present in this (method, layer, token_scope)'s
+    grid if the exact mirror isn't there. Returns None if no negative
+    coefficient was swept for this config at all (e.g. an older run's
+    manifest, or a config with coefficients=[0.0, 1.0] only)."""
+    same_config = [
+        r for r in all_steer_rows
+        if r.get("method") == winner["method"] and r.get("layer_idx") == winner["layer_idx"]
+        and r.get("token_scope") == winner["token_scope"] and r.get("coefficient") is not None
+        and r["coefficient"] < 0
+    ]
+    if not same_config:
+        return None
+    available = {r["coefficient"] for r in same_config}
+    mirror = -abs(winner["coefficient"]) if winner.get("coefficient") else None
+    if mirror in available:
+        return mirror
+    return min(available)
 
 
 def build_human_eval_records(
@@ -112,6 +144,11 @@ def build_human_eval_records(
             continue
         winner_cfg = (winner["method"], winner["layer_idx"], winner["coefficient"], winner["token_scope"])
         baseline_cfg = (winner["method"], winner["layer_idx"], 0.0, winner["token_scope"])
+        negative_coefficient = _pick_negative_coefficient(all_steer_rows, winner)
+        negative_cfg = (
+            (winner["method"], winner["layer_idx"], negative_coefficient, winner["token_scope"])
+            if negative_coefficient is not None else None
+        )
 
         # QLoRA pinned to the max num_train_records point, matching
         # build_comparison's own "best shot" pinning for the headline table.
@@ -124,6 +161,10 @@ def build_human_eval_records(
 
         winner_by_key = {(r.get("example_id"), r.get("split")): r for r in all_steer_rows if _steering_config_key(r) == winner_cfg}
         baseline_by_key = {(r.get("example_id"), r.get("split")): r for r in all_steer_rows if _steering_config_key(r) == baseline_cfg}
+        negative_by_key = (
+            {(r.get("example_id"), r.get("split")): r for r in all_steer_rows if _steering_config_key(r) == negative_cfg}
+            if negative_cfg is not None else {}
+        )
         qlora_by_key = {(r.get("example_id"), r.get("split")): r for r in qlora_rows_at_max_n}
 
         example_keys = sorted(
@@ -133,6 +174,7 @@ def build_human_eval_records(
         for example_id, split in example_keys:
             winner_row = winner_by_key.get((example_id, split))
             baseline_row = baseline_by_key.get((example_id, split))
+            negative_row = negative_by_key.get((example_id, split))
             qlora_row = qlora_by_key.get((example_id, split))
             if winner_row is None or qlora_row is None:
                 continue
@@ -144,13 +186,16 @@ def build_human_eval_records(
                 "is_safe_control": winner_row.get("is_safe_control"), "prompt": winner_row.get("prompt"),
                 "winner_method": winner["method"], "winner_layer_idx": winner["layer_idx"],
                 "winner_coefficient": winner["coefficient"], "winner_token_scope": winner["token_scope"],
+                "negative_coefficient": negative_coefficient,
                 "steering_winner_output": winner_row.get("output"),
                 "steering_baseline_output": baseline_row.get("output") if baseline_row else None,
+                "steering_negative_output": negative_row.get("output") if negative_row else None,
                 "qlora_output": qlora_row.get("output"),
             }
             for key in steer_score_keys:
                 record[f"steering_winner_{key}"] = winner_row.get(key)
                 record[f"steering_baseline_{key}"] = baseline_row.get(key) if baseline_row else None
+                record[f"steering_negative_{key}"] = negative_row.get(key) if negative_row else None
             for key in qlora_score_keys:
                 record[f"qlora_{key}"] = qlora_row.get(key)
             for col in ANNOTATION_COLUMNS:
@@ -212,10 +257,22 @@ def _render_review_html(records: List[Dict[str, Any]]) -> str:
                 short = key[len("steering_winner_"):]
                 if record.get(key) is not None:
                     score_bits.append(f'<span class="score">winner.{esc(short)}={esc(record[key])}</span>')
+            elif key.startswith("steering_negative_") and key != "steering_negative_output":
+                short = key[len("steering_negative_"):]
+                if record.get(key) is not None:
+                    score_bits.append(f'<span class="score">negative.{esc(short)}={esc(record[key])}</span>')
             elif key.startswith("qlora_") and key != "qlora_output":
                 short = key[len("qlora_"):]
                 if record.get(key) is not None:
                     score_bits.append(f'<span class="score">qlora.{esc(short)}={esc(record[key])}</span>')
+        negative_col = ""
+        if record.get("negative_coefficient") is not None:
+            negative_col = f"""
+    <div class="output-col">
+      <h4>Steering (negative: c={esc(record.get('negative_coefficient'))})</h4>
+      <div class="output-text">{esc(record.get('steering_negative_output'))}</div>
+      <label>Rating <input type="text" class="rating" data-field="rating_steering_negative" placeholder="e.g. 1-5 or pass/fail"></label>
+    </div>"""
         cards.append(f"""
 <div class="card" data-index="{i}">
   <div class="meta">
@@ -236,7 +293,7 @@ def _render_review_html(records: List[Dict[str, Any]]) -> str:
       <h4>Steering baseline (coefficient=0)</h4>
       <div class="output-text">{esc(record.get('steering_baseline_output'))}</div>
       <label>Rating <input type="text" class="rating" data-field="rating_steering_baseline" placeholder="e.g. 1-5 or pass/fail"></label>
-    </div>
+    </div>{negative_col}
     <div class="output-col">
       <h4>QLoRA</h4>
       <div class="output-text">{esc(record.get('qlora_output'))}</div>
@@ -250,6 +307,7 @@ def _render_review_html(records: List[Dict[str, Any]]) -> str:
         <option value=""></option>
         <option value="steering_winner">steering (winner)</option>
         <option value="steering_baseline">steering (baseline)</option>
+        <option value="steering_negative">steering (negative)</option>
         <option value="qlora">qlora</option>
         <option value="tie">tie</option>
         <option value="neither">neither</option>
@@ -284,7 +342,7 @@ button:hover {{ background: color-mix(in srgb, CanvasText 8%, Canvas); }}
 .card {{ border: 1px solid color-mix(in srgb, CanvasText 15%, transparent); border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }}
 .meta {{ font-size: 0.85rem; opacity: 0.75; margin-bottom: 0.5rem; }}
 .prompt {{ margin-bottom: 0.75rem; white-space: pre-wrap; }}
-.outputs {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem; }}
+.outputs {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; }}
 @media (max-width: 800px) {{ .outputs {{ grid-template-columns: 1fr; }} }}
 .output-col h4 {{ margin: 0 0 0.35rem 0; font-size: 0.85rem; }}
 .output-text {{ white-space: pre-wrap; background: color-mix(in srgb, CanvasText 5%, Canvas); border-radius: 6px; padding: 0.5rem; min-height: 3rem; font-size: 0.9rem; overflow-wrap: break-word; }}
@@ -375,11 +433,20 @@ def _render_readme(records: List[Dict[str, Any]]) -> str:
         "- `steering_winner_output` -- generated text from the best steering config.",
         "- `steering_baseline_output` -- generated text with the SAME method/layer/token_scope but coefficient=0",
         "  (i.e. no steering applied) -- what steering added over doing nothing.",
+        "- `negative_coefficient` / `steering_negative_output` -- generated text at a NEGATIVE coefficient (same",
+        "  method/layer/token_scope), when one was swept for this config. This is the vector-validity/",
+        "  bidirectionality check: a direction that only \"works\" pushed one way is a weaker finding than one that",
+        "  moves the target behavior in both directions from baseline. Empty when no negative coefficient was",
+        "  evaluated for this config.",
         "- `qlora_output` -- generated text from the matched-recipe QLoRA adapter, at its largest trained example count.",
-        "- `steering_winner_<score>` / `steering_baseline_<score>` / `qlora_<score>` -- each arm's own automated",
-        "  scores (e.g. `safe_refusal`, `leaf_exact_match`), for reference next to a human's own judgment.",
-        "- `rating_steering_winner`, `rating_steering_baseline`, `rating_qlora`, `preferred_arm`, `notes` -- empty",
-        "  annotation columns for a human reviewer to fill in.",
+        "  For a recipe with `apply_adapter_from` (e.g. XSTest's benign-over-refusal control), this is a DIFFERENT",
+        "  recipe's trained adapter evaluated on THIS recipe's examples -- the QLoRA counterpart of the steering",
+        "  arm's `apply_vectors_from`, letting you check whether a safety adapter also over-refuses benign prompts.",
+        "- `steering_winner_<score>` / `steering_baseline_<score>` / `steering_negative_<score>` / `qlora_<score>` --",
+        "  each arm's own automated scores (e.g. `safe_refusal`, `leaf_exact_match`), for reference next to a",
+        "  human's own judgment.",
+        "- `rating_steering_winner`, `rating_steering_baseline`, `rating_steering_negative`, `rating_qlora`,",
+        "  `preferred_arm`, `notes` -- empty annotation columns for a human reviewer to fill in.",
     ]
     if fieldnames:
         lines += ["", "## Full column order", "", "```", ", ".join(fieldnames), "```"]
