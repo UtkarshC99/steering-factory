@@ -1,6 +1,8 @@
 """High-level orchestration that is usable from a CLI, notebook, or Python."""
 from __future__ import annotations
 
+print("I hope this works")
+
 import logging
 import time
 import traceback
