@@ -433,22 +433,47 @@ def _evaluate_vector_grid(
     # tokenizer changes here.
     prompts = [format_chat(loaded.tokenizer, e["prompt"]) for e in evaluate_examples]
 
+    def _generate_chunked(coefficient: float, token_scope: str) -> List[Any]:
+        """Generates for every prompt at one coefficient, in
+        `batch_size`-sized chunks, returning one result per prompt in input
+        order.
+
+        This chunking is load-bearing and was MISSING: `batch_size` was
+        accepted by this function and threaded through every caller (and
+        tuned per-recipe in the manifests) but never actually used to
+        chunk -- `prompts` was passed to `generate_with_steering_batch`
+        whole, so the real batch was always the entire eval pool. Proven by
+        the rows' own `batch_size` field: requesting batch_size=2 over 8
+        examples recorded batch_size=8.
+
+        Consequences that showed up as a real CUDA OOM: raising
+        `max_records` 100 -> 150 grew the eval pool (and therefore the
+        actual batch) from 60 to 90, ~2.8x the configured 32, and none of
+        the per-recipe `decoding.batch_size` overrides added earlier had
+        any effect on this arm at all. Note extraction
+        (`extraction._collect_diffs`) and the QLoRA eval loop
+        (`finetune._generate_batched_rows`) BOTH chunk correctly -- this
+        was the one generation path that didn't, exactly the kind of drift
+        this function's own docstring claims sharing it prevents."""
+        chunk = batch_size if batch_size and batch_size > 0 else len(prompts)
+        results: List[Any] = []
+        for start in range(0, len(prompts), chunk):
+            results.extend(sweep.generate_with_steering_batch(
+                loaded, layer_idx, vector, coefficient, prompts[start : start + chunk],
+                max_new_tokens, token_scope, max_prompt_length,
+            ))
+        return results
+
     for token_scope in token_scopes:
         # Baseline (coefficient 0.0) is computed once per example per
         # token_scope and reused for every other coefficient's
-        # perplexity-ratio/JS-divergence-vs-baseline -- unchanged from the
-        # pre-batching loop's behavior, just computed for the whole batch
-        # of examples in one call instead of one example at a time.
-        baseline_results = sweep.generate_with_steering_batch(
-            loaded, layer_idx, vector, 0.0, prompts, max_new_tokens, token_scope, max_prompt_length,
-        )
+        # perplexity-ratio/JS-divergence-vs-baseline.
+        baseline_results = _generate_chunked(0.0, token_scope)
         results_by_coefficient: Dict[float, List] = {0.0: baseline_results}
         for coefficient in all_coefficients:
             if coefficient == 0.0:
                 continue
-            results_by_coefficient[coefficient] = sweep.generate_with_steering_batch(
-                loaded, layer_idx, vector, coefficient, prompts, max_new_tokens, token_scope, max_prompt_length,
-            )
+            results_by_coefficient[coefficient] = _generate_chunked(coefficient, token_scope)
 
         for example_idx, example in enumerate(evaluate_examples):
             baseline = baseline_results[example_idx]
