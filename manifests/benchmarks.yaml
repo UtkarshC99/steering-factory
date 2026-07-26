@@ -284,6 +284,7 @@ recipes:
 finetune:
   backend: qlora
   matched_split: steer
+  objective: dpo
   # Cut from 200 to 25: a real run's train-loss log showed loss=0.009 by
   # step 15 and 1.6e-4 by step 20 -- the adapter had fully memorized its
   # ~40-80 example steer pool well before step 200, and the eval outputs

@@ -164,6 +164,7 @@ recipes:
 finetune:
   backend: qlora
   matched_split: steer
+  objective: dpo
   # Cut from 200 to 25 -- see preset_4bit_baseline.yaml's identical comment
   # (real train-loss log plateaued by step 15-20).
   max_steps: 25
