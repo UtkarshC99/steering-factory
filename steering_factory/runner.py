@@ -1404,10 +1404,10 @@ def compare(run_paths: Iterable[str | Path], output_root: str | Path) -> Path:
             comparison = build_comparison(steering_path, qlora_path)
             report_path = write_comparison_report(comparison, output_root)
             try:
-                from .human_eval_export import build_human_eval_records, write_human_eval_package
+                from .human_eval_export import build_human_eval_records, write_human_eval_package, _manifest_summary
                 records = build_human_eval_records(steering_path, qlora_path)
                 if records:
-                    write_human_eval_package(records, output_root)
+                    write_human_eval_package(records, output_root, _manifest_summary(steering_path))
             except Exception as exc:  # best-effort -- never block the core comparison report
                 logger.warning("Human-eval package generation failed (comparison report was still written): %s", exc)
             return report_path

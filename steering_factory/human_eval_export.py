@@ -1,23 +1,24 @@
-"""Human-evaluation onboarding package: pairs each held-out example's
-steering-winner, steering-baseline, and QLoRA outputs side by side, plus
-empty annotation columns, and writes them as CSV/JSONL/a self-contained
-static HTML review sheet.
+"""Human-evaluation onboarding package: for each held-out example, shows
+EVERY swept steering config (not just the validation-selected winner)
+alongside the QLoRA output, plus a shared manifest header, and writes them
+as CSV/JSONL/a self-contained static HTML review page.
 
 Pure post-processing -- reads a finalized steering run dir + QLoRA run dir
 (the same two directories `comparison.build_comparison` reads), loads no
-model, touches no GPU. Reuses `comparison`'s own read helpers and
-`best_steering_config` so the "winner" pinned here is the exact same
-validation-selected config the headline comparison report already reports,
-not a second, possibly-divergent selection.
+model, touches no GPU. Reuses `comparison`'s own read helpers so the
+`quality_key`/behavior handling matches the headline report.
 
-Row-pairing basis (see the exploration behind this module): both arms'
-generation rows share `example_id`, `split`, `model_id`, `recipe_id` --
-enough to join exactly. A steering run has one row per example PER
-(method, layer_idx, coefficient, token_scope) grid cell, so a single
-steering output must be pinned to one config before it can sit in a single
-column: the validation-selected winner (`best_steering_config`) and the
-unsteered baseline (`coefficient == 0.0`, same method/layer/token_scope as
-the winner) are the two steering columns; QLoRA contributes the third.
+REBUILT 2026-07-26 from an earlier version that pinned exactly 4 outputs
+per example (winner / baseline=0.0 / one mirrored negative / qlora),
+following direct feedback: "I am only seeing coeff +1 and -1 and not the
+other coefficients... ideally would want to see more examples alongside
+not just the winners. And the associated numbers/values alongside each
+card". All N swept coefficients are generated during a real run -- the
+old exporter's 4-slot pinning was hiding data that already existed, not a
+generation gap.
+
+Row-pairing basis (unchanged): both arms' generation rows share
+`example_id`, `split`, `model_id`, `recipe_id`.
 """
 from __future__ import annotations
 
@@ -27,91 +28,90 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .comparison import _quality_key, _read_json, _read_jsonl, _steering_config_key, best_steering_config
+from .comparison import _quality_key, _read_json, _read_jsonl, _read_yaml, _steering_config_key
 
-ANNOTATION_COLUMNS = [
-    "rating_steering_winner", "rating_steering_baseline", "rating_steering_negative", "rating_qlora",
-    "preferred_arm", "notes",
-]
+ANNOTATION_COLUMNS = ["selected_best_positive", "selected_best_negative", "selected_best_lora", "notes"]
 
-# Column order for CSV/JSONL -- context first, then the four outputs, then
-# each arm's own auto-scores, then the empty annotation columns last (so a
-# human importing into a spreadsheet sees prompt/outputs first and doesn't
-# have to scroll past scoring internals to find where to write).
+# Column order for CSV/JSONL: context, then the selection summary (what a
+# human picked, if anything -- this is what makes the CSV a useful export
+# even before any review happens: it degrades to "everything blank" and
+# still lists every config's own scores), then annotation columns last.
 _CONTEXT_COLUMNS = [
     "model_id", "recipe_id", "behavior_id", "example_id", "split", "category",
     "benchmark", "is_safe_control", "prompt",
 ]
-_CONFIG_COLUMNS = [
-    "winner_method", "winner_layer_idx", "winner_coefficient", "winner_token_scope", "negative_coefficient",
-]
-_OUTPUT_COLUMNS = [
-    "steering_winner_output", "steering_baseline_output", "steering_negative_output", "qlora_output",
-]
+
+# Fields on a generation row that describe context/identity rather than a
+# per-row score -- excluded from the "score" bundle attached to each card.
+_NON_SCORE_ROW_KEYS = {
+    "model_id", "model_name", "arm", "recipe_id", "behavior_id", "example_id", "split", "category",
+    "method", "layer_idx", "coefficient", "token_scope", "prompt", "output", "batch_size",
+    "num_train_records", "quantization", "dtype",
+}
 
 
 def _score_keys_present(rows: List[Dict[str, Any]]) -> List[str]:
-    """Every extra key beyond the row schema's own fixed fields -- the
-    behavior-score keys `_behavior_score` merged in (e.g. `safe_refusal`,
-    `leaf_exact_match`), which vary by behavior family. Collected from
-    whatever rows are actually present rather than hardcoded, so this
-    module doesn't need updating every time a new behavior/scorer is
-    added."""
-    known = {
-        "model_id", "model_name", "arm", "recipe_id", "behavior_id", "example_id", "split", "category",
-        "method", "layer_idx", "coefficient", "token_scope", "prompt", "output", "latency_s", "batch_size",
-        "batch_wall_time_s", "tokens_generated", "perplexity", "perplexity_ratio_vs_baseline",
-        "js_divergence_vs_baseline", "repetition_score", "distinct_2", "benchmark", "is_safe_control",
-        "num_train_records", "quantization", "dtype",
-    }
+    """Every extra key beyond the row schema's own fixed fields -- collected
+    from whatever rows are actually present rather than hardcoded, so this
+    module doesn't need updating every time a new behavior/scorer is added."""
     keys: List[str] = []
     for row in rows:
         for key in row:
-            if key not in known and key not in keys:
+            if key not in _NON_SCORE_ROW_KEYS and key not in keys:
                 keys.append(key)
     return sorted(keys)
 
 
-def _pick_negative_coefficient(all_steer_rows: List[Dict[str, Any]], winner: Dict[str, Any]) -> Optional[float]:
-    """Picks which negative coefficient (same method/layer/token_scope as
-    the winner) populates the human-eval package's fourth column -- the
-    vector-validity/bidirectionality check: a steering direction that only
-    "works" pushed one way is a weaker finding than one that pushes the
-    target behavior in both directions from baseline. Prefers the negative
-    coefficient with the SAME magnitude as the winner's (so a +1 winner
-    pairs with -1, not an arbitrary -2), falling back to the most negative
-    coefficient actually present in this (method, layer, token_scope)'s
-    grid if the exact mirror isn't there. Returns None if no negative
-    coefficient was swept for this config at all (e.g. an older run's
-    manifest, or a config with coefficients=[0.0, 1.0] only)."""
-    same_config = [
-        r for r in all_steer_rows
-        if r.get("method") == winner["method"] and r.get("layer_idx") == winner["layer_idx"]
-        and r.get("token_scope") == winner["token_scope"] and r.get("coefficient") is not None
-        and r["coefficient"] < 0
-    ]
-    if not same_config:
-        return None
-    available = {r["coefficient"] for r in same_config}
-    mirror = -abs(winner["coefficient"]) if winner.get("coefficient") else None
-    if mirror in available:
-        return mirror
-    return min(available)
+def _card_scores(row: Dict[str, Any], score_keys: List[str]) -> Dict[str, Any]:
+    return {key: row.get(key) for key in score_keys if row.get(key) is not None}
+
+
+def _manifest_summary(steer_dir: str | Path) -> Dict[str, Any]:
+    """Common manifest details for the package header: experiment name,
+    seed, models (id/name_or_path/dtype/quantization), split fractions,
+    n_sweep, and decoding.max_new_tokens -- the settings that apply to
+    every card in the package rather than repeating per-example. Degrades
+    to an empty dict (header simply omits the section) if
+    resolved_manifest.yaml is missing, e.g. an older run predating it."""
+    manifest = _read_yaml(Path(steer_dir) / "resolved_manifest.yaml")
+    if not manifest:
+        return {}
+    experiment = manifest.get("experiment", {}) or {}
+    splits = manifest.get("splits", {}) or {}
+    decoding = manifest.get("decoding", {}) or {}
+    return {
+        "experiment_name": experiment.get("name"),
+        "seed": experiment.get("seed"),
+        "n_sweep": experiment.get("n_sweep"),
+        "models": [
+            {"id": m.get("id"), "name_or_path": m.get("name_or_path"),
+             "dtype": m.get("dtype"), "quantization": m.get("quantization")}
+            for m in manifest.get("models", []) or []
+        ],
+        "steer_fraction": splits.get("steer_fraction"),
+        "validation_fraction": splits.get("validation_fraction"),
+        "group_key": splits.get("group_key"),
+        "max_new_tokens": decoding.get("max_new_tokens"),
+    }
 
 
 def build_human_eval_records(
     steering_run: str | Path, qlora_run: str | Path, splits: Tuple[str, ...] = ("validation", "test"),
 ) -> List[Dict[str, Any]]:
     """One record per (model_id, recipe_id, example_id, split) present in
-    BOTH arms, for each split in `splits`. Uses `best_steering_config` (the
-    same function the headline comparison report uses) to pick which
-    steering config's rows populate the "winner" column, so a human
-    reviewing this package is looking at the exact config the automated
-    report calls the winner -- not a second, possibly different pick.
+    BOTH arms. Each record carries `steering_configs` -- one entry per
+    (method, layer_idx, coefficient, token_scope) actually swept for that
+    example, sorted by (method, layer, coefficient) for stable ordering --
+    plus a single `qlora` entry (pinned to the max num_train_records point,
+    matching `build_comparison`'s own pinning). `winner_config` (the
+    validation-selected config `comparison.best_steering_config` would
+    pick, if determinable) is included as a hint for which card to open
+    first / pre-highlight, but every config is present regardless.
 
-    A (model_id, recipe_id) pair with no validation data (so
-    `best_steering_config` can't select a winner) contributes no records --
-    mirrors `build_comparison`'s own skip behavior for the same reason.
+    A (model_id, recipe_id) pair with zero steering configs for a given
+    example contributes no record for it (nothing to show); a pair with no
+    overlap between the two arms at all contributes nothing, matching the
+    old exporter's skip behavior.
     """
     steer_dir = Path(steering_run)
     qlora_dir = Path(qlora_run)
@@ -138,84 +138,124 @@ def build_human_eval_records(
         behavior_id = behavior_by_recipe.get(recipe_id)
         all_steer_rows = [r for r in steer_gen_rows if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id]
         all_qlora_rows = [r for r in qlora_gen_rows if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id]
-
-        winner = best_steering_config(all_steer_rows, behavior_id)
-        if winner is None:
+        if not all_steer_rows or not all_qlora_rows:
             continue
-        winner_cfg = (winner["method"], winner["layer_idx"], winner["coefficient"], winner["token_scope"])
-        baseline_cfg = (winner["method"], winner["layer_idx"], 0.0, winner["token_scope"])
-        negative_coefficient = _pick_negative_coefficient(all_steer_rows, winner)
-        negative_cfg = (
-            (winner["method"], winner["layer_idx"], negative_coefficient, winner["token_scope"])
-            if negative_coefficient is not None else None
-        )
 
-        # QLoRA pinned to the max num_train_records point, matching
-        # build_comparison's own "best shot" pinning for the headline table.
         qlora_ns = {r.get("num_train_records") for r in all_qlora_rows if r.get("num_train_records") is not None}
         max_qlora_n = max(qlora_ns) if qlora_ns else None
         qlora_rows_at_max_n = (
             [r for r in all_qlora_rows if r.get("num_train_records") == max_qlora_n]
             if max_qlora_n is not None else all_qlora_rows
         )
-
-        winner_by_key = {(r.get("example_id"), r.get("split")): r for r in all_steer_rows if _steering_config_key(r) == winner_cfg}
-        baseline_by_key = {(r.get("example_id"), r.get("split")): r for r in all_steer_rows if _steering_config_key(r) == baseline_cfg}
-        negative_by_key = (
-            {(r.get("example_id"), r.get("split")): r for r in all_steer_rows if _steering_config_key(r) == negative_cfg}
-            if negative_cfg is not None else {}
-        )
         qlora_by_key = {(r.get("example_id"), r.get("split")): r for r in qlora_rows_at_max_n}
 
-        example_keys = sorted(
-            {k for k in winner_by_key if k[1] in splits} &
-            {k for k in qlora_by_key if k[1] in splits}
-        )
-        for example_id, split in example_keys:
-            winner_row = winner_by_key.get((example_id, split))
-            baseline_row = baseline_by_key.get((example_id, split))
-            negative_row = negative_by_key.get((example_id, split))
+        winner_cfg = None
+        quality_key = _quality_key(behavior_id, all_steer_rows)
+        if quality_key is not None:
+            from .comparison import best_steering_config
+            winner = best_steering_config(all_steer_rows, behavior_id)
+            if winner is not None:
+                winner_cfg = (winner["method"], winner["layer_idx"], winner["coefficient"], winner["token_scope"])
+
+        by_example: Dict[Tuple[Any, str], List[Dict[str, Any]]] = {}
+        for row in all_steer_rows:
+            if row.get("split") not in splits:
+                continue
+            key = (row.get("example_id"), row.get("split"))
+            by_example.setdefault(key, []).append(row)
+
+        for (example_id, split), rows_for_example in sorted(by_example.items(), key=lambda kv: (str(kv[0][1]), str(kv[0][0]))):
             qlora_row = qlora_by_key.get((example_id, split))
-            if winner_row is None or qlora_row is None:
+            if qlora_row is None:
                 continue
 
-            record: Dict[str, Any] = {
+            configs = sorted(
+                rows_for_example,
+                key=lambda r: (str(r.get("method")), r.get("layer_idx") or 0, r.get("coefficient") or 0),
+            )
+            first = configs[0]
+            steering_configs = [
+                {
+                    "method": row.get("method"), "layer_idx": row.get("layer_idx"),
+                    "coefficient": row.get("coefficient"), "token_scope": row.get("token_scope"),
+                    "output": row.get("output"),
+                    "is_baseline": row.get("coefficient") == 0.0,
+                    "is_winner_config": winner_cfg is not None and _steering_config_key(row) == winner_cfg,
+                    "scores": _card_scores(row, steer_score_keys),
+                }
+                for row in configs
+            ]
+
+            records.append({
                 "model_id": model_id, "recipe_id": recipe_id, "behavior_id": behavior_id,
                 "example_id": example_id, "split": split,
-                "category": winner_row.get("category"), "benchmark": winner_row.get("benchmark"),
-                "is_safe_control": winner_row.get("is_safe_control"), "prompt": winner_row.get("prompt"),
-                "winner_method": winner["method"], "winner_layer_idx": winner["layer_idx"],
-                "winner_coefficient": winner["coefficient"], "winner_token_scope": winner["token_scope"],
-                "negative_coefficient": negative_coefficient,
-                "steering_winner_output": winner_row.get("output"),
-                "steering_baseline_output": baseline_row.get("output") if baseline_row else None,
-                "steering_negative_output": negative_row.get("output") if negative_row else None,
-                "qlora_output": qlora_row.get("output"),
-            }
-            for key in steer_score_keys:
-                record[f"steering_winner_{key}"] = winner_row.get(key)
-                record[f"steering_baseline_{key}"] = baseline_row.get(key) if baseline_row else None
-                record[f"steering_negative_{key}"] = negative_row.get(key) if negative_row else None
-            for key in qlora_score_keys:
-                record[f"qlora_{key}"] = qlora_row.get(key)
-            for col in ANNOTATION_COLUMNS:
-                record[col] = ""
-            records.append(record)
+                "category": first.get("category"), "benchmark": first.get("benchmark"),
+                "is_safe_control": first.get("is_safe_control"), "prompt": first.get("prompt"),
+                "steering_configs": steering_configs,
+                "qlora": {"output": qlora_row.get("output"), "scores": _card_scores(qlora_row, qlora_score_keys)},
+                "selected_best_positive": "", "selected_best_negative": "", "selected_best_lora": "",
+                "notes": "",
+            })
 
     return records
 
 
+def _selection_summary_row(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Flattens one record into the compact CSV/JSONL shape: every
+    steering config gets its own column set (config_N_*), the qlora output/
+    scores, and the (initially empty) human selections. This is the
+    "expand to all coefficients" CSV shape -- unlike the old 4-pinned-slot
+    version, an external tool importing pairs.csv sees the same full grid
+    the HTML page does, not just the winner/baseline/one-negative subset."""
+    flat: Dict[str, Any] = {
+        "model_id": record["model_id"], "recipe_id": record["recipe_id"], "behavior_id": record["behavior_id"],
+        "example_id": record["example_id"], "split": record["split"], "category": record.get("category"),
+        "benchmark": record.get("benchmark"), "is_safe_control": record.get("is_safe_control"),
+        "prompt": record.get("prompt"),
+    }
+    for i, cfg in enumerate(record["steering_configs"]):
+        prefix = f"config_{i}"
+        flat[f"{prefix}_method"] = cfg["method"]
+        flat[f"{prefix}_layer_idx"] = cfg["layer_idx"]
+        flat[f"{prefix}_coefficient"] = cfg["coefficient"]
+        flat[f"{prefix}_token_scope"] = cfg["token_scope"]
+        flat[f"{prefix}_output"] = cfg["output"]
+        for score_key, value in cfg["scores"].items():
+            flat[f"{prefix}_{score_key}"] = value
+    flat["qlora_output"] = record["qlora"]["output"]
+    for score_key, value in record["qlora"]["scores"].items():
+        flat[f"qlora_{score_key}"] = value
+    for col in ANNOTATION_COLUMNS:
+        flat[col] = record.get(col, "")
+    return flat
+
+
 def _fieldnames(records: List[Dict[str, Any]]) -> List[str]:
-    """Stable column order: context, config, outputs, then every
-    score-derived column encountered (sorted for determinism), then
-    annotation columns last."""
+    """Stable column order: fixed context columns, then every config_N_*/
+    qlora_* column encountered (sorted for determinism within each config
+    index), then annotation columns last. Built from the flattened rows,
+    since the config columns are dynamic (N varies per example's own
+    sweep)."""
+    flat_rows = [_selection_summary_row(r) for r in records]
     extra: List[str] = []
-    for record in records:
-        for key in record:
-            if key not in _CONTEXT_COLUMNS and key not in _CONFIG_COLUMNS and key not in _OUTPUT_COLUMNS \
-               and key not in ANNOTATION_COLUMNS and key not in extra:
+    for row in flat_rows:
+        for key in row:
+            if key not in _CONTEXT_COLUMNS and key not in ANNOTATION_COLUMNS and key not in extra:
                 extra.append(key)
-    return _CONTEXT_COLUMNS + _CONFIG_COLUMNS + _OUTPUT_COLUMNS + sorted(extra) + ANNOTATION_COLUMNS
+
+    def _sort_key(key: str):
+        if key.startswith("config_"):
+            parts = key.split("_", 2)
+            try:
+                idx = int(parts[1])
+            except (IndexError, ValueError):
+                idx = 0
+            return (0, idx, parts[2] if len(parts) > 2 else "")
+        if key.startswith("qlora_"):
+            return (1, 0, key)
+        return (2, 0, key)
+
+    return _CONTEXT_COLUMNS + sorted(extra, key=_sort_key) + ANNOTATION_COLUMNS
 
 
 def _write_csv(records: List[Dict[str, Any]], path: Path) -> None:
@@ -225,7 +265,8 @@ def _write_csv(records: List[Dict[str, Any]], path: Path) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for record in records:
-            writer.writerow({k: ("" if v is None else v) for k, v in record.items()})
+            flat = _selection_summary_row(record)
+            writer.writerow({k: ("" if v is None else v) for k, v in flat.items()})
 
 
 def _write_jsonl(records: List[Dict[str, Any]], path: Path) -> None:
@@ -235,150 +276,270 @@ def _write_jsonl(records: List[Dict[str, Any]], path: Path) -> None:
             handle.write(json.dumps(record, default=str) + "\n")
 
 
-def _render_review_html(records: List[Dict[str, Any]]) -> str:
-    """Self-contained static page -- inline CSS/JS only, no external
-    requests (no CDN script/stylesheet/font/image references), so it opens
-    correctly from a plain file:// path or any static host. One card per
-    example with the three outputs side by side, the auto-scores, and
-    rating/notes inputs; a "Download annotations as CSV" button serializes
-    the in-page form state via a client-side Blob -- nothing is sent
-    anywhere. Theme-aware (prefers-color-scheme) matching the artifact
-    conventions used elsewhere in this project."""
-    fieldnames = _fieldnames(records)
+def _render_review_html(records: List[Dict[str, Any]], manifest_summary: Dict[str, Any]) -> str:
+    """Self-contained static page (no external requests) -- one example per
+    screen, every swept coefficient as its own card, manifest details
+    pinned at the top, click-to-select (not a dropdown) for best positive/
+    negative/LoRA (baseline selectable in either steering slot), and a
+    compact list view built from those selections."""
 
     def esc(value: Any) -> str:
         return html.escape("" if value is None else str(value))
 
-    cards = []
-    for i, record in enumerate(records):
-        score_bits = []
-        for key in fieldnames:
-            if key.startswith("steering_winner_") and key != "steering_winner_output":
-                short = key[len("steering_winner_"):]
-                if record.get(key) is not None:
-                    score_bits.append(f'<span class="score">winner.{esc(short)}={esc(record[key])}</span>')
-            elif key.startswith("steering_negative_") and key != "steering_negative_output":
-                short = key[len("steering_negative_"):]
-                if record.get(key) is not None:
-                    score_bits.append(f'<span class="score">negative.{esc(short)}={esc(record[key])}</span>')
-            elif key.startswith("qlora_") and key != "qlora_output":
-                short = key[len("qlora_"):]
-                if record.get(key) is not None:
-                    score_bits.append(f'<span class="score">qlora.{esc(short)}={esc(record[key])}</span>')
-        negative_col = ""
-        if record.get("negative_coefficient") is not None:
-            negative_col = f"""
-    <div class="output-col">
-      <h4>Steering (negative: c={esc(record.get('negative_coefficient'))})</h4>
-      <div class="output-text">{esc(record.get('steering_negative_output'))}</div>
-      <label>Rating <input type="text" class="rating" data-field="rating_steering_negative" placeholder="e.g. 1-5 or pass/fail"></label>
-    </div>"""
-        cards.append(f"""
-<div class="card" data-index="{i}">
-  <div class="meta">
-    <strong>{esc(record.get('model_id'))} / {esc(record.get('recipe_id'))}</strong>
-    &middot; example <code>{esc(record.get('example_id'))}</code>
-    &middot; split <code>{esc(record.get('split'))}</code>
-    &middot; category <code>{esc(record.get('category'))}</code>
-  </div>
-  <div class="prompt"><strong>Prompt:</strong> {esc(record.get('prompt'))}</div>
-  <div class="outputs">
-    <div class="output-col">
-      <h4>Steering (winner: {esc(record.get('winner_method'))} L{esc(record.get('winner_layer_idx'))}
-        c={esc(record.get('winner_coefficient'))})</h4>
-      <div class="output-text">{esc(record.get('steering_winner_output'))}</div>
-      <label>Rating <input type="text" class="rating" data-field="rating_steering_winner" placeholder="e.g. 1-5 or pass/fail"></label>
-    </div>
-    <div class="output-col">
-      <h4>Steering baseline (coefficient=0)</h4>
-      <div class="output-text">{esc(record.get('steering_baseline_output'))}</div>
-      <label>Rating <input type="text" class="rating" data-field="rating_steering_baseline" placeholder="e.g. 1-5 or pass/fail"></label>
-    </div>{negative_col}
-    <div class="output-col">
-      <h4>QLoRA</h4>
-      <div class="output-text">{esc(record.get('qlora_output'))}</div>
-      <label>Rating <input type="text" class="rating" data-field="rating_qlora" placeholder="e.g. 1-5 or pass/fail"></label>
-    </div>
-  </div>
-  <div class="scores">{' '.join(score_bits)}</div>
-  <div class="annotation-row">
-    <label>Preferred arm
-      <select class="preferred-arm" data-field="preferred_arm">
-        <option value=""></option>
-        <option value="steering_winner">steering (winner)</option>
-        <option value="steering_baseline">steering (baseline)</option>
-        <option value="steering_negative">steering (negative)</option>
-        <option value="qlora">qlora</option>
-        <option value="tie">tie</option>
-        <option value="neither">neither</option>
-      </select>
-    </label>
-    <label class="notes-label">Notes
-      <textarea class="notes" data-field="notes" rows="2"></textarea>
-    </label>
-  </div>
-</div>""")
-
-    # `<` -> `<` (a standard JSON-in-<script> escape): record content
-    # comes from real LLM generations and can contain arbitrary text,
-    # including a literal "</script>" sequence -- embedded unescaped, that
-    # closes the script tag early and injects the remainder of the JSON
-    # blob (and anything an adversarial generation crafted after it) as raw
-    # HTML into the page. Escaping every `<` (not just in "</script>")
-    # is the safe, standard fix -- JSON's own escaping already handles
-    # quotes/backslashes/control characters, this only adds the one
-    # character `json.dumps` doesn't escape that's dangerous specifically
-    # inside a <script> block.
+    # `<` -> `<`: record content is real LLM output and can contain a
+    # literal "</script>" sequence, which would close the script tag early
+    # and inject the remainder as raw HTML -- see the original module's
+    # identical note. json.dumps already handles quotes/backslashes.
     records_json = json.dumps(records, default=str).replace("<", "\\u003c")
+    manifest_json = json.dumps(manifest_summary, default=str).replace("<", "\\u003c")
+
+    manifest_bits = []
+    if manifest_summary.get("experiment_name"):
+        manifest_bits.append(f"<strong>{esc(manifest_summary['experiment_name'])}</strong>")
+    if manifest_summary.get("seed") is not None:
+        manifest_bits.append(f"seed={esc(manifest_summary['seed'])}")
+    if manifest_summary.get("n_sweep"):
+        manifest_bits.append(f"n_sweep={esc(manifest_summary['n_sweep'])}")
+    if manifest_summary.get("steer_fraction") is not None:
+        manifest_bits.append(
+            f"splits: steer={esc(manifest_summary['steer_fraction'])} "
+            f"val={esc(manifest_summary.get('validation_fraction'))}"
+        )
+    if manifest_summary.get("max_new_tokens") is not None:
+        manifest_bits.append(f"max_new_tokens={esc(manifest_summary['max_new_tokens'])}")
+    for m in manifest_summary.get("models", []) or []:
+        manifest_bits.append(
+            f"{esc(m.get('id'))}: {esc(m.get('name_or_path'))} "
+            f"({esc(m.get('dtype'))}/{esc(m.get('quantization'))})"
+        )
+    manifest_header = (
+        f'<div class="manifest-header">{" &middot; ".join(manifest_bits)}</div>' if manifest_bits else ""
+    )
 
     return f"""<title>Human evaluation review</title>
 <style>
 :root {{ color-scheme: light dark; }}
-body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 1100px; margin: 0 auto; padding: 1.5rem; }}
-h1 {{ font-size: 1.3rem; }}
-.toolbar {{ position: sticky; top: 0; background: Canvas; padding: 0.75rem 0; border-bottom: 1px solid color-mix(in srgb, CanvasText 20%, transparent); margin-bottom: 1rem; z-index: 1; }}
+* {{ box-sizing: border-box; }}
+body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 1200px; margin: 0 auto; padding: 1.5rem; }}
+h1 {{ font-size: 1.3rem; margin-bottom: 0.25rem; }}
+.manifest-header {{ font-size: 0.8rem; opacity: 0.75; background: color-mix(in srgb, CanvasText 5%, Canvas); border-radius: 6px; padding: 0.5rem 0.75rem; margin-bottom: 1rem; line-height: 1.6; }}
+.toolbar {{ position: sticky; top: 0; background: Canvas; padding: 0.75rem 0; border-bottom: 1px solid color-mix(in srgb, CanvasText 20%, transparent); margin-bottom: 1rem; z-index: 2; display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }}
 button {{ font: inherit; padding: 0.5rem 1rem; border-radius: 6px; border: 1px solid color-mix(in srgb, CanvasText 30%, transparent); background: Canvas; color: CanvasText; cursor: pointer; }}
 button:hover {{ background: color-mix(in srgb, CanvasText 8%, Canvas); }}
-.card {{ border: 1px solid color-mix(in srgb, CanvasText 15%, transparent); border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }}
-.meta {{ font-size: 0.85rem; opacity: 0.75; margin-bottom: 0.5rem; }}
-.prompt {{ margin-bottom: 0.75rem; white-space: pre-wrap; }}
-.outputs {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; }}
-@media (max-width: 800px) {{ .outputs {{ grid-template-columns: 1fr; }} }}
-.output-col h4 {{ margin: 0 0 0.35rem 0; font-size: 0.85rem; }}
-.output-text {{ white-space: pre-wrap; background: color-mix(in srgb, CanvasText 5%, Canvas); border-radius: 6px; padding: 0.5rem; min-height: 3rem; font-size: 0.9rem; overflow-wrap: break-word; }}
-.output-col label {{ display: block; margin-top: 0.4rem; font-size: 0.8rem; }}
-.rating {{ width: 100%; box-sizing: border-box; }}
-.scores {{ margin-top: 0.5rem; font-size: 0.75rem; opacity: 0.7; }}
-.score {{ margin-right: 0.75rem; }}
-.annotation-row {{ display: flex; gap: 1rem; margin-top: 0.75rem; flex-wrap: wrap; }}
-.notes-label {{ flex: 1; min-width: 200px; }}
-.notes {{ width: 100%; box-sizing: border-box; font: inherit; }}
-select, input[type=text] {{ font: inherit; }}
+button.active-view {{ background: color-mix(in srgb, CanvasText 12%, Canvas); font-weight: 600; }}
+.nav-group {{ display: flex; align-items: center; gap: 0.5rem; }}
+.nav-pos {{ font-size: 0.85rem; opacity: 0.75; min-width: 5.5rem; text-align: center; }}
+.spacer {{ flex: 1; }}
+
+/* Detail view: one example per screen */
+.example-meta {{ font-size: 0.85rem; opacity: 0.75; margin-bottom: 0.5rem; }}
+.prompt-box {{ margin-bottom: 1rem; padding: 0.75rem; border-radius: 8px; background: color-mix(in srgb, CanvasText 6%, Canvas); white-space: pre-wrap; }}
+.prompt-box strong {{ display: block; margin-bottom: 0.25rem; font-size: 0.8rem; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.03em; }}
+.section-label {{ font-size: 0.8rem; opacity: 0.7; text-transform: uppercase; letter-spacing: 0.03em; margin: 1.25rem 0 0.5rem 0; }}
+.card-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 0.75rem; }}
+.card {{ border: 1px solid color-mix(in srgb, CanvasText 15%, transparent); border-radius: 10px; padding: 0.75rem; display: flex; flex-direction: column; gap: 0.5rem; }}
+.card.is-winner {{ border-color: color-mix(in srgb, Highlight 60%, CanvasText 15%); box-shadow: 0 0 0 1px color-mix(in srgb, Highlight 40%, transparent); }}
+.card-title {{ font-size: 0.85rem; font-weight: 600; }}
+.card-scores {{ font-size: 0.7rem; opacity: 0.75; display: flex; flex-wrap: wrap; gap: 0.4rem 0.6rem; }}
+.card-output {{ white-space: pre-wrap; overflow-wrap: break-word; font-size: 0.85rem; background: color-mix(in srgb, CanvasText 4%, Canvas); border-radius: 6px; padding: 0.5rem; max-height: 14rem; overflow-y: auto; flex: 1; }}
+.card-output.expanded {{ max-height: none; }}
+.expand-btn {{ align-self: flex-start; font-size: 0.72rem; padding: 0.15rem 0.5rem; }}
+.select-row {{ display: flex; gap: 0.35rem; flex-wrap: wrap; }}
+.select-btn {{ font-size: 0.72rem; padding: 0.25rem 0.5rem; border-radius: 5px; }}
+.select-btn.picked {{ background: Highlight; color: HighlightText; border-color: Highlight; }}
+.qlora-card {{ border-color: color-mix(in srgb, CanvasText 25%, transparent); }}
+
+/* List view */
+#list-view table {{ width: 100%; border-collapse: collapse; font-size: 0.82rem; }}
+#list-view th, #list-view td {{ text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid color-mix(in srgb, CanvasText 12%, transparent); vertical-align: top; }}
+#list-view th {{ position: sticky; top: 3.2rem; background: Canvas; }}
+#list-view td.output-preview {{ max-width: 22rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+#list-view tr:hover {{ background: color-mix(in srgb, CanvasText 4%, Canvas); cursor: pointer; }}
+.hidden {{ display: none !important; }}
+textarea.notes {{ width: 100%; box-sizing: border-box; font: inherit; margin-top: 0.5rem; }}
 </style>
 <h1>Human evaluation review</h1>
-<p>{len(records)} paired examples. Ratings/notes are saved only in this page's memory until you click
-"Download annotations as CSV" -- nothing is sent anywhere.</p>
+{manifest_header}
 <div class="toolbar">
+  <button id="view-detail-btn" class="active-view">Detail view</button>
+  <button id="view-list-btn">List view</button>
+  <div class="nav-group" id="detail-nav">
+    <button id="prev-btn">&larr; Prev</button>
+    <span class="nav-pos" id="nav-pos"></span>
+    <button id="next-btn">Next &rarr;</button>
+  </div>
+  <div class="spacer"></div>
   <button id="download-btn">Download annotations as CSV</button>
 </div>
-<div id="cards">
-{''.join(cards)}
-</div>
+<div id="detail-view"></div>
+<div id="list-view" class="hidden"></div>
 <script>
 const RECORDS = {records_json};
-const FIELDNAMES = {json.dumps(fieldnames)};
+const MANIFEST = {manifest_json};
+let current = 0;
 
-function collectAnnotations() {{
-  const cards = document.querySelectorAll('.card');
-  const out = RECORDS.map((r) => Object.assign({{}}, r));
-  cards.forEach((card) => {{
-    const idx = parseInt(card.getAttribute('data-index'), 10);
-    card.querySelectorAll('[data-field]').forEach((el) => {{
-      out[idx][el.getAttribute('data-field')] = el.value;
+function esc(v) {{
+  const d = document.createElement('div');
+  d.textContent = (v === null || v === undefined) ? '' : String(v);
+  return d.innerHTML;
+}}
+
+function configTitle(cfg) {{
+  let t = (cfg.method || '') + ' L' + cfg.layer_idx + ' c=' + cfg.coefficient + ' scope=' + cfg.token_scope;
+  if (cfg.is_baseline) t += ' (baseline)';
+  return t;
+}}
+
+function scoreBits(scores) {{
+  return Object.entries(scores || {{}}).map(([k, v]) => {{
+    const num = typeof v === 'number' ? (Number.isInteger(v) ? v : v.toFixed(3)) : v;
+    return '<span>' + esc(k) + '=' + esc(num) + '</span>';
+  }}).join('');
+}}
+
+function cardKeyForConfig(cfg, index) {{
+  // Position-based, not value-based: a cross-recipe control (e.g. XSTest's
+  // benign_over_refusal_control) can legitimately have two DIFFERENT
+  // generations at the identical (method, layer, coefficient, token_scope)
+  // -- one per source vector applied (e.g. its N=10 and N=40 extractions),
+  // with no field on the row distinguishing which -- so a value-based key
+  // would silently merge two distinct cards into one selectable target.
+  return 'cfg' + index;
+}}
+
+function renderCard(record, cfg, cardKey, isLora) {{
+  const selField = isLora ? 'selected_best_lora'
+    : (cfg.coefficient < 0 ? 'selected_best_negative' : 'selected_best_positive');
+  const picked = record[selField] === cardKey;
+  const winnerClass = (!isLora && cfg.is_winner_config) ? ' is-winner' : '';
+  const title = isLora ? 'QLoRA' : configTitle(cfg);
+  const output = isLora ? record.qlora.output : cfg.output;
+  const scores = isLora ? record.qlora.scores : cfg.scores;
+  const selectButtons = isLora
+    ? `<button class="select-btn${{picked ? ' picked' : ''}}" data-select="selected_best_lora" data-key="${{esc(cardKey)}}">Best LoRA</button>`
+    : (cfg.coefficient <= 0
+        ? `<button class="select-btn${{record.selected_best_negative === cardKey ? ' picked' : ''}}" data-select="selected_best_negative" data-key="${{esc(cardKey)}}">Best negative</button>
+           <button class="select-btn${{record.selected_best_positive === cardKey ? ' picked' : ''}}" data-select="selected_best_positive" data-key="${{esc(cardKey)}}">Best positive</button>`
+        : `<button class="select-btn${{record.selected_best_positive === cardKey ? ' picked' : ''}}" data-select="selected_best_positive" data-key="${{esc(cardKey)}}">Best positive</button>`);
+  return `
+    <div class="card${{isLora ? ' qlora-card' : ''}}${{winnerClass}}" data-card-key="${{esc(cardKey)}}">
+      <div class="card-title">${{esc(title)}}</div>
+      <div class="card-scores">${{scoreBits(scores)}}</div>
+      <div class="card-output">${{esc(output)}}</div>
+      <button class="expand-btn">Expand</button>
+      <div class="select-row">${{selectButtons}}</div>
+    </div>`;
+}}
+
+function renderDetail() {{
+  const record = RECORDS[current];
+  const container = document.getElementById('detail-view');
+  if (!record) {{ container.innerHTML = '<p>No examples.</p>'; return; }}
+  const configs = record.steering_configs || [];
+  const cards = configs.map((cfg, i) => renderCard(record, cfg, cardKeyForConfig(cfg, i), false)).join('');
+  const qloraCard = renderCard(record, null, '__qlora__', true);
+  container.innerHTML = `
+    <div class="example-meta">
+      <strong>${{esc(record.model_id)}} / ${{esc(record.recipe_id)}}</strong>
+      &middot; example <code>${{esc(record.example_id)}}</code>
+      &middot; split <code>${{esc(record.split)}}</code>
+      &middot; category <code>${{esc(record.category)}}</code>
+    </div>
+    <div class="prompt-box"><strong>Prompt</strong>${{esc(record.prompt)}}</div>
+    <div class="section-label">Steering configs (${{configs.length}})</div>
+    <div class="card-grid">${{cards}}</div>
+    <div class="section-label">Fine-tuning</div>
+    <div class="card-grid">${{qloraCard}}</div>
+    <label>Notes<textarea class="notes" rows="2" data-notes-index="${{current}}">${{esc(record.notes)}}</textarea></label>
+  `;
+  document.getElementById('nav-pos').textContent = (current + 1) + ' / ' + RECORDS.length;
+  container.querySelectorAll('.expand-btn').forEach((btn) => {{
+    btn.addEventListener('click', () => {{
+      const out = btn.previousElementSibling;
+      out.classList.toggle('expanded');
+      btn.textContent = out.classList.contains('expanded') ? 'Collapse' : 'Expand';
     }});
   }});
-  return out;
+  container.querySelectorAll('[data-select]').forEach((btn) => {{
+    btn.addEventListener('click', () => {{
+      const field = btn.getAttribute('data-select');
+      const key = btn.getAttribute('data-key');
+      record[field] = (record[field] === key) ? '' : key;  // click again to deselect
+      renderDetail();
+    }});
+  }});
+  const notesEl = container.querySelector('[data-notes-index]');
+  if (notesEl) notesEl.addEventListener('input', (e) => {{ record.notes = e.target.value; }});
 }}
+
+function pickedSummary(record, field) {{
+  const key = record[field];
+  if (!key) return '';
+  if (key === '__qlora__') return 'QLoRA';
+  const configs = record.steering_configs || [];
+  const idx = configs.findIndex((c, i) => cardKeyForConfig(c, i) === key);
+  return idx >= 0 ? configTitle(configs[idx]) : key;
+}}
+
+function renderList() {{
+  const container = document.getElementById('list-view');
+  const rows = RECORDS.map((r, i) => `
+    <tr data-goto="${{i}}">
+      <td>${{i + 1}}</td>
+      <td>${{esc(r.model_id)}}</td>
+      <td>${{esc(r.recipe_id)}}</td>
+      <td>${{esc(r.example_id)}}</td>
+      <td>${{esc(r.split)}}</td>
+      <td>${{(r.steering_configs || []).length}}</td>
+      <td>${{esc(pickedSummary(r, 'selected_best_positive'))}}</td>
+      <td>${{esc(pickedSummary(r, 'selected_best_negative'))}}</td>
+      <td>${{esc(pickedSummary(r, 'selected_best_lora'))}}</td>
+      <td class="output-preview">${{esc((r.prompt || '').slice(0, 80))}}</td>
+    </tr>`).join('');
+  container.innerHTML = `
+    <table>
+      <thead><tr>
+        <th>#</th><th>model</th><th>recipe</th><th>example</th><th>split</th><th>configs</th>
+        <th>best +</th><th>best -</th><th>best LoRA</th><th>prompt</th>
+      </tr></thead>
+      <tbody>${{rows}}</tbody>
+    </table>`;
+  container.querySelectorAll('[data-goto]').forEach((tr) => {{
+    tr.addEventListener('click', () => {{
+      current = parseInt(tr.getAttribute('data-goto'), 10);
+      showDetailView();
+    }});
+  }});
+}}
+
+function showDetailView() {{
+  document.getElementById('detail-view').classList.remove('hidden');
+  document.getElementById('detail-nav').classList.remove('hidden');
+  document.getElementById('list-view').classList.add('hidden');
+  document.getElementById('view-detail-btn').classList.add('active-view');
+  document.getElementById('view-list-btn').classList.remove('active-view');
+  renderDetail();
+}}
+
+function showListView() {{
+  renderList();
+  document.getElementById('detail-view').classList.add('hidden');
+  document.getElementById('detail-nav').classList.add('hidden');
+  document.getElementById('list-view').classList.remove('hidden');
+  document.getElementById('view-list-btn').classList.add('active-view');
+  document.getElementById('view-detail-btn').classList.remove('active-view');
+}}
+
+document.getElementById('view-detail-btn').addEventListener('click', showDetailView);
+document.getElementById('view-list-btn').addEventListener('click', showListView);
+document.getElementById('prev-btn').addEventListener('click', () => {{
+  current = (current - 1 + RECORDS.length) % Math.max(RECORDS.length, 1);
+  renderDetail();
+}});
+document.getElementById('next-btn').addEventListener('click', () => {{
+  current = (current + 1) % Math.max(RECORDS.length, 1);
+  renderDetail();
+}});
 
 function toCsvValue(v) {{
   if (v === null || v === undefined) v = '';
@@ -388,16 +549,18 @@ function toCsvValue(v) {{
 }}
 
 function downloadCsv() {{
-  const rows = collectAnnotations();
-  const lines = [FIELDNAMES.map(toCsvValue).join(',')];
-  for (const row of rows) {{
-    lines.push(FIELDNAMES.map((f) => toCsvValue(row[f])).join(','));
+  const cols = ['model_id', 'recipe_id', 'example_id', 'split', 'selected_best_positive', 'selected_best_negative', 'selected_best_lora', 'notes'];
+  const lines = [cols.join(',')];
+  for (const r of RECORDS) {{
+    lines.push(cols.map((c) => toCsvValue(
+      c.startsWith('selected_') ? pickedSummary(r, c) : r[c]
+    )).join(','));
   }}
   const blob = new Blob([lines.join('\\n')], {{ type: 'text/csv' }});
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = 'human_eval_annotations.csv';
+  a.download = 'human_eval_selections.csv';
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -405,63 +568,64 @@ function downloadCsv() {{
 }}
 
 document.getElementById('download-btn').addEventListener('click', downloadCsv);
+
+showDetailView();
 </script>
 """
 
 
-def _render_readme(records: List[Dict[str, Any]]) -> str:
-    fieldnames = _fieldnames(records) if records else []
+def _render_readme(records: List[Dict[str, Any]], manifest_summary: Dict[str, Any]) -> str:
+    n_configs = sum(len(r.get("steering_configs", [])) for r in records)
     lines = [
         "# Human evaluation package",
         "",
-        f"{len(records)} paired examples across matched (model, recipe) pairs from a steering run and a QLoRA run.",
+        f"{len(records)} examples across matched (model, recipe) pairs from a steering run and a QLoRA run "
+        f"({n_configs} total steering-config generations across all examples).",
         "",
         "## Files",
         "",
-        "- `pairs.jsonl` / `pairs.csv` -- one row per (model, recipe, example, split). Import directly into a",
-        "  spreadsheet, Label Studio, or Argilla.",
-        "- `review.html` -- self-contained static page (no server, no external requests) for eyeballing outputs",
-        "  side by side and entering ratings/notes; a button downloads your annotations as CSV.",
+        "- `pairs.jsonl` -- one record per example, each carrying the FULL set of swept steering configs (not",
+        "  just a winner) plus the QLoRA output. This is the complete data; `pairs.csv` is a flattened view of it.",
+        "- `pairs.csv` -- one row per example, one column-set per steering config (`config_0_*`, `config_1_*`, ...)",
+        "  plus `qlora_*` and the (initially empty) selection columns. Import into a spreadsheet directly.",
+        "- `review.html` -- self-contained static page (no server, no external requests). Detail view shows one",
+        "  example per screen with every swept coefficient as its own card, plus manifest details at the top;",
+        "  click a card's \"Best positive\" / \"Best negative\" / \"Best LoRA\" button to select it (baseline is",
+        "  selectable the same way). List view is a compact table driven by those selections. A button downloads",
+        "  your selections as CSV.",
         "",
-        "## Columns",
+        "## Record shape (pairs.jsonl)",
         "",
-        "- `model_id`, `recipe_id`, `behavior_id`, `example_id`, `split`, `category`, `benchmark`, `is_safe_control`,",
-        "  `prompt` -- context identifying the example.",
-        "- `winner_method`, `winner_layer_idx`, `winner_coefficient`, `winner_token_scope` -- the validation-selected",
-        "  steering config populating the `steering_winner_*` columns (same winner the automated comparison report",
-        "  picks -- see `comparison.best_steering_config`).",
-        "- `steering_winner_output` -- generated text from the best steering config.",
-        "- `steering_baseline_output` -- generated text with the SAME method/layer/token_scope but coefficient=0",
-        "  (i.e. no steering applied) -- what steering added over doing nothing.",
-        "- `negative_coefficient` / `steering_negative_output` -- generated text at a NEGATIVE coefficient (same",
-        "  method/layer/token_scope), when one was swept for this config. This is the vector-validity/",
-        "  bidirectionality check: a direction that only \"works\" pushed one way is a weaker finding than one that",
-        "  moves the target behavior in both directions from baseline. Empty when no negative coefficient was",
-        "  evaluated for this config.",
-        "- `qlora_output` -- generated text from the matched-recipe QLoRA adapter, at its largest trained example count.",
-        "  For a recipe with `apply_adapter_from` (e.g. XSTest's benign-over-refusal control), this is a DIFFERENT",
-        "  recipe's trained adapter evaluated on THIS recipe's examples -- the QLoRA counterpart of the steering",
-        "  arm's `apply_vectors_from`, letting you check whether a safety adapter also over-refuses benign prompts.",
-        "- `steering_winner_<score>` / `steering_baseline_<score>` / `steering_negative_<score>` / `qlora_<score>` --",
-        "  each arm's own automated scores (e.g. `safe_refusal`, `leaf_exact_match`), for reference next to a",
-        "  human's own judgment.",
-        "- `rating_steering_winner`, `rating_steering_baseline`, `rating_steering_negative`, `rating_qlora`,",
-        "  `preferred_arm`, `notes` -- empty annotation columns for a human reviewer to fill in.",
+        "- `model_id`, `recipe_id`, `behavior_id`, `example_id`, `split`, `category`, `benchmark`,",
+        "  `is_safe_control`, `prompt` -- context identifying the example.",
+        "- `steering_configs` -- list of `{method, layer_idx, coefficient, token_scope, output, is_baseline,",
+        "  is_winner_config, scores}`, one per swept config. `is_winner_config` flags the config",
+        "  `comparison.best_steering_config` would select (a hint, not a restriction -- every config is present",
+        "  regardless). `scores` is that config's own automated scores (e.g. `safe_refusal`, `perplexity_ratio_",
+        "  vs_baseline`, `js_divergence_vs_baseline`), read directly off the stored generation row.",
+        "- `qlora` -- `{output, scores}` from the matched-recipe QLoRA adapter at its largest trained example count.",
+        "- `selected_best_positive`, `selected_best_negative`, `selected_best_lora` -- empty until a human selects",
+        "  a card in `review.html`; then set to that config's key (`method|layer_idx|coefficient|token_scope`, or",
+        "  `__qlora__`). Any card, including the baseline (`coefficient == 0`), is selectable in either steering slot.",
+        "- `notes` -- free-text per-example notes.",
     ]
-    if fieldnames:
-        lines += ["", "## Full column order", "", "```", ", ".join(fieldnames), "```"]
+    if manifest_summary:
+        lines += ["", "## Manifest summary", "", "```json", json.dumps(manifest_summary, indent=2, default=str), "```"]
     return "\n".join(lines) + "\n"
 
 
-def write_human_eval_package(records: List[Dict[str, Any]], output_root: str | Path) -> Path:
+def write_human_eval_package(
+    records: List[Dict[str, Any]], output_root: str | Path, manifest_summary: Optional[Dict[str, Any]] = None,
+) -> Path:
     """Writes `human_eval/{pairs.jsonl,pairs.csv,review.html,README.md}`
     under `output_root` (the same directory `write_comparison_report`
     writes `report.md`/`report.json` to). Returns the `human_eval/`
     directory path."""
     output = Path(output_root) / "human_eval"
     output.mkdir(parents=True, exist_ok=True)
+    manifest_summary = manifest_summary or {}
     _write_jsonl(records, output / "pairs.jsonl")
     _write_csv(records, output / "pairs.csv")
-    (output / "review.html").write_text(_render_review_html(records), encoding="utf-8")
-    (output / "README.md").write_text(_render_readme(records), encoding="utf-8")
+    (output / "review.html").write_text(_render_review_html(records, manifest_summary), encoding="utf-8")
+    (output / "README.md").write_text(_render_readme(records, manifest_summary), encoding="utf-8")
     return output
