@@ -311,7 +311,7 @@ def best_steering_config(
     if test_quality is not None and baseline_quality is not None:
         beat_baseline = test_quality > baseline_quality
     method, layer_idx, coefficient, token_scope = best_cfg
-    return {
+    result = {
         "quality_key": quality_key,
         "method": method, "layer_idx": layer_idx, "coefficient": coefficient, "token_scope": token_scope,
         "validation_quality": best_val_quality, "test_quality": test_quality,
@@ -320,6 +320,9 @@ def best_steering_config(
         "distinct_output_ratio": _distinct_output_ratio(test_rows),
         "rejected_for_fluency": rejected_for_fluency,
     }
+    if quality_key == "mc_correct":
+        result["mc_parsed_rate"] = _mean(test_rows, "mc_parsed")
+    return result
 
 
 def full_config_grid(rows: List[Dict[str, Any]], behavior_id: Optional[str]) -> List[Dict[str, Any]]:
@@ -378,13 +381,16 @@ def qlora_quality(rows: List[Dict[str, Any]], behavior_id: Optional[str]) -> Opt
     val_rows = [r for r in rows if r.get("split") == "validation"]
     test_rows = [r for r in rows if r.get("split") == "test"]
     assert_disjoint_selection_and_test_rows(val_rows, test_rows)
-    return {
+    result = {
         "quality_key": quality_key,
         "validation_quality": _mean(val_rows, quality_key),
         "test_quality": _mean(test_rows, quality_key),
         "n_validation": len(val_rows), "n_test": len(test_rows),
         "distinct_output_ratio": _distinct_output_ratio(test_rows),
     }
+    if quality_key == "mc_correct":
+        result["mc_parsed_rate"] = _mean(test_rows, "mc_parsed")
+    return result
 
 
 def _steering_cost(
@@ -491,6 +497,18 @@ def _qlora_cost(qlora_results: List[Dict[str, Any]], model_id: str, recipe_id: s
         ms_per_token = 1000.0 * sum(latencies) / sum(tokens)
     train_time = match.get("wall_time_s")
     eval_time = match.get("eval_wall_time_s")
+    # final_rewards_margin (added 2026-07-26): the last logged
+    # rewards/margins value from a DPO training run's log_history, if
+    # present (objective: sft runs have no such key). A real run showed
+    # this reaching 14-19 on N=10 adapters that had also collapsed to
+    # ~1e-6 loss -- DPO pushing `rejected` to near-zero probability, the
+    # same memorization signature `train_loss` alone shows but with a
+    # metric that is specific to the preference-pair objective. Surfaced
+    # here so it can be read alongside cost/quality rather than requiring
+    # a separate read of qlora.json's raw log_history.
+    log_history = match.get("log_history") or []
+    margin_entries = [h for h in log_history if h.get("rewards/margins") is not None]
+    final_rewards_margin = margin_entries[-1]["rewards/margins"] if margin_entries else None
     return {
         "arm": "qlora",
         "one_time_cost_s": train_time,
@@ -499,6 +517,7 @@ def _qlora_cost(qlora_results: List[Dict[str, Any]], model_id: str, recipe_id: s
         "artifact_bytes": match.get("adapter_size_bytes"),
         "labeled_examples": match.get("num_train_records"),
         "train_loss": match.get("train_loss"),
+        "final_rewards_margin": final_rewards_margin,
         "per_request_ms_per_token": ms_per_token,
     }
 

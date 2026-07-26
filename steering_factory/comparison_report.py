@@ -40,6 +40,28 @@ def _fmt_pct(value: Any) -> str:
 MAX_FALSE_REFUSAL_RATE_FOR_A_WINNER = 0.5
 MIN_DISTINCT_OUTPUT_RATIO_FOR_A_WINNER = 0.10
 
+# A real run's sycophancy_agreement recipe scored mc_correct=0.0000 across
+# every coefficient, which read as "the model never avoids the sycophantic
+# answer" -- but mc_parsed_rate was 0.6%: the model wasn't answering in
+# the expected "(A)"/"(B)" format at all (both models talk first; Qwen3
+# spent its whole token budget inside <think>), so 0.0000 was a parse
+# failure wearing a score's clothes, not a measurement of the behavior.
+# mc_correct is deliberately never None (see comparison._QUALITY_KEY_BY_
+# BEHAVIOR's comment) specifically so a recipe like this can't vanish from
+# the report -- but that same design means a collapsed parse rate must be
+# checked explicitly, or it silently reports as a real, if bad, score.
+MIN_MC_PARSED_RATE_FOR_A_WINNER = 0.5
+
+# Not a winner-naming gate (DPO margin isn't a quality metric, so it can't
+# make an arm ineligible the way false-refusal/distinct-ratio/parse-rate
+# do) -- purely an informational flag on the Cost table. A real run's
+# margins of 14-19 co-occurred with train_loss collapsing to ~1e-6 on
+# N=10 adapters (12.7 epochs from a fixed max_steps -- see
+# max-steps-confounds-the-n-sweep in project memory); 5-6 on a converging
+# N=40 run. Set well above the converging range so a genuinely
+# well-separated preference isn't flagged.
+MAX_DPO_MARGIN_BEFORE_COLLAPSE_FLAG = 10.0
+
 
 def _degeneracy_reason(arm_name: str, arm: Dict[str, Any]) -> Optional[str]:
     """Returns a human-readable reason this arm cannot be named a winner,
@@ -51,6 +73,9 @@ def _degeneracy_reason(arm_name: str, arm: Dict[str, Any]) -> Optional[str]:
     false_refusal = benign.get("false_refusal_rate_on_benign_controls")
     if false_refusal is not None and false_refusal > MAX_FALSE_REFUSAL_RATE_FOR_A_WINNER:
         return f"{arm_name} refuses {false_refusal:.0%} of benign prompts"
+    mc_parsed_rate = arm.get("mc_parsed_rate")
+    if mc_parsed_rate is not None and mc_parsed_rate < MIN_MC_PARSED_RATE_FOR_A_WINNER:
+        return f"{arm_name} answered in the expected format only {mc_parsed_rate:.0%} of the time"
     distinct = arm.get("distinct_output_ratio")
     if distinct is not None and distinct < MIN_DISTINCT_OUTPUT_RATIO_FOR_A_WINNER:
         return f"{arm_name} output has collapsed ({distinct:.0%} distinct)"
@@ -101,20 +126,52 @@ def render_comparison_markdown(comparison: Dict[str, Any], plot_paths: Optional[
             "score alone can hide. `winner` becomes `inconclusive` rather than naming a degenerate arm; "
             "see the Safety / degeneracy controls section below for why."
         )
+        any_mc_parsed = any(
+            entry["steering"].get("mc_parsed_rate") is not None or entry["qlora"].get("mc_parsed_rate") is not None
+            for entry in entries
+        )
+        if any_mc_parsed:
+            lines.append(
+                "`parsed%` (multiple_choice_eval recipes only) is the fraction of outputs where an "
+                "answer letter was even recognized -- `mc_correct` is deliberately never None (an "
+                "unparseable answer scores 0.0 rather than vanishing), so a low `parsed%` with a low "
+                "quality number means the model isn't answering in the expected format, not that it is "
+                "answering and choosing badly. See the winner-abstention note below for the threshold."
+            )
         lines.append("")
-        lines.append("| model | recipe | steering quality | steering distinct% | baseline quality | steering config | qlora quality | qlora distinct% | n_test | winner |")
-        lines.append("|---|---|---|---|---|---|---|---|---|---|")
+        header = "| model | recipe | steering quality | steering distinct%"
+        sep = "|---|---|---|---"
+        if any_mc_parsed:
+            header += " | steering parsed%"
+            sep += "|---"
+        header += " | baseline quality | steering config | qlora quality | qlora distinct%"
+        sep += "|---|---|---|---"
+        if any_mc_parsed:
+            header += " | qlora parsed%"
+            sep += "|---"
+        header += " | n_test | winner |"
+        sep += "|---|---|"
+        lines.append(header)
+        lines.append(sep)
         for entry in entries:
             steering = entry["steering"]
             qlora = entry["qlora"]
             sq, qq = steering.get("test_quality"), qlora.get("test_quality")
             n_test = min(steering.get("n_test", 0), qlora.get("n_test", 0))
             config = f"{steering.get('method')} L{steering.get('layer_idx')} c={steering.get('coefficient')} scope={steering.get('token_scope')}"
-            lines.append(
-                f"| {entry['model_id']} | {entry['recipe_id']} | {_fmt(sq)} | {_fmt_pct(steering.get('distinct_output_ratio'))} | "
-                f"{_fmt(steering.get('baseline_quality'))} | "
-                f"{config} | {_fmt(qq)} | {_fmt_pct(qlora.get('distinct_output_ratio'))} | {n_test} | {_winner(entry)} |"
+            row = (
+                f"| {entry['model_id']} | {entry['recipe_id']} | {_fmt(sq)} | {_fmt_pct(steering.get('distinct_output_ratio'))}"
             )
+            if any_mc_parsed:
+                row += f" | {_fmt_pct(steering.get('mc_parsed_rate'))}"
+            row += (
+                f" | {_fmt(steering.get('baseline_quality'))} | "
+                f"{config} | {_fmt(qq)} | {_fmt_pct(qlora.get('distinct_output_ratio'))}"
+            )
+            if any_mc_parsed:
+                row += f" | {_fmt_pct(qlora.get('mc_parsed_rate'))}"
+            row += f" | {n_test} | {_winner(entry)} |"
+            lines.append(row)
         lines.append("")
 
         any_benign = any(
@@ -193,21 +250,35 @@ def render_comparison_markdown(comparison: Dict[str, Any], plot_paths: Optional[
 
         lines.append("## Cost")
         lines.append("")
-        lines.append("| model | recipe | arm | one-time cost (s) | labeled examples | artifact bytes | ms/token |")
-        lines.append("|---|---|---|---|---|---|---|")
+        any_margin = any(entry["qlora"].get("final_rewards_margin") is not None for entry in entries)
+        header = "| model | recipe | arm | one-time cost (s) | labeled examples | artifact bytes | ms/token |"
+        sep = "|---|---|---|---|---|---|---|"
+        if any_margin:
+            header = header[:-1] + "| DPO final margin |"
+            sep += "---|"
+        lines.append(header)
+        lines.append(sep)
         for entry in entries:
             steering = entry["steering"]
             qlora = entry["qlora"]
-            lines.append(
+            steering_row = (
                 f"| {entry['model_id']} | {entry['recipe_id']} | steering | "
                 f"{_fmt(steering.get('one_time_cost_s'), 2)} | {_fmt(steering.get('labeled_examples'), 0)} | "
                 f"{_fmt(steering.get('artifact_bytes'), 0)} | {_fmt(steering.get('per_request_ms_per_token'), 2)} |"
             )
-            lines.append(
+            if any_margin:
+                steering_row += " n/a |"
+            lines.append(steering_row)
+            qlora_row = (
                 f"| {entry['model_id']} | {entry['recipe_id']} | qlora | "
                 f"{_fmt(qlora.get('one_time_cost_s'), 2)} | {_fmt(qlora.get('labeled_examples'), 0)} | "
                 f"{_fmt(qlora.get('artifact_bytes'), 0)} | {_fmt(qlora.get('per_request_ms_per_token'), 2)} |"
             )
+            if any_margin:
+                margin = qlora.get("final_rewards_margin")
+                flag = " (collapse signature)" if margin is not None and margin > MAX_DPO_MARGIN_BEFORE_COLLAPSE_FLAG else ""
+                qlora_row += f" {_fmt(margin, 2)}{flag} |"
+            lines.append(qlora_row)
         lines.append("")
         lines.append(
             "_One-time cost (2026-07-26: EXCLUDES generation for both arms, previously did not): "
@@ -219,6 +290,16 @@ def render_comparison_markdown(comparison: Dict[str, Any], plot_paths: Optional[
             "comparable per-request inference cost, averaged over configs/adapters evaluated, not over "
             "held-out examples._"
         )
+        if any_margin:
+            lines.append("")
+            lines.append(
+                "_`DPO final margin` (objective: dpo runs only) is the last logged `rewards/margins` "
+                "value -- how much more likely the adapter makes the chosen response than the rejected "
+                "one. A real run showed this reaching 14-19 alongside loss collapsing to ~1e-6 on N=10 "
+                "adapters: DPO pushing `rejected` to near-zero probability, the same memorization "
+                f"`train_loss` alone also shows. Values above {MAX_DPO_MARGIN_BEFORE_COLLAPSE_FLAG:.0f} are "
+                "flagged as a likely collapse rather than a genuinely well-separated preference._"
+            )
         lines.append("")
 
         any_cost_by_n = any(len(entry.get("cost_by_n") or []) > 1 for entry in entries)
