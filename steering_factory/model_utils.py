@@ -20,15 +20,44 @@ _TOKENIZER_COMPAT_PATCHED = False
 # BitsAndBytesConfig at all (confirmed against the installed transformers'
 # signature). Its MatMul8bitLt kernel always internally casts to fp16 for
 # the outlier decomposition regardless of the model's own dtype, and it
-# warns about that via warnings.warn() on EVERY int8 matmul call -- every
-# layer, every forward pass, every generation step -- which is what
-# flooded the 8bit_midpoint preset's log. This is expected LLM.int8()
-# behavior, not a misconfiguration to fix, so the warning is suppressed by
-# message text (not category) so an unrelated bitsandbytes warning would
-# still surface.
+# reports that on EVERY int8 matmul call -- every layer, every forward
+# pass, every generation step -- which is what flooded the 8bit_midpoint
+# preset's log. This is expected LLM.int8() behavior, not a
+# misconfiguration to fix.
+#
+# The LOCAL bitsandbytes install (0.49.2) emits this via warnings.warn(),
+# but the log format actually seen on Colab (`WARNING:bitsandbytes.
+# autograd._functions:...`) is stdlib logging's own format, meaning
+# Colab's installed version (a different one -- pip resolves a possibly
+# newer/older release there than pinned locally) routes it through
+# `logging.getLogger("bitsandbytes.autograd._functions").warning(...)`
+# instead. A warnings.filterwarnings() call, tried FIRST as the only fix,
+# did not stop it recurring on Colab -- confirmed two things afterward:
+# (1) that path is a logging call, not a warnings.warn call, on whatever
+# bitsandbytes version Colab resolves (reproduced the exact Colab format
+# locally via logging.captureWarnings and found it does NOT match --
+# `py.warnings` vs `bitsandbytes.autograd._functions`); (2) separately,
+# warnings.filterwarnings() is itself unreliable as a fix at all --
+# pytest's own warnings plugin was observed resetting/clearing
+# warnings.filters around every test, so ANY code path that resets
+# warnings state after this module is imported (pytest here, possibly a
+# Colab notebook extension there) can silently undo it. The
+# logging.Filter below, registered on the logger object itself rather
+# than the global mutable warnings.filters list, is not subject to that
+# reset and is the fix this now actually depends on; the
+# filterwarnings() call is kept only as a harmless best-effort for the
+# warnings.warn()-based local install.
 warnings.filterwarnings(
     "ignore", message=r"MatMul8bitLt: inputs will be cast from .* to float16 during quantization",
 )
+
+
+class _SuppressMatMul8bitLtCastWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "MatMul8bitLt: inputs will be cast from" not in record.getMessage()
+
+
+logging.getLogger("bitsandbytes.autograd._functions").addFilter(_SuppressMatMul8bitLtCastWarning())
 
 
 def _patch_tokenizer_special_tokens_compat():
