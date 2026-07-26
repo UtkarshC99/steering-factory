@@ -82,9 +82,10 @@ capability_probe:
   enabled: true
   max_new_tokens: 24
 decoding:
-  # CHANGED 2026-07-26: 96 -> 256 -- see preset_4bit_baseline.yaml's
-  # identical comment (100% of harmful rows hit the 96 cap unfinished).
-  max_new_tokens: 256
+  # CHANGED 2026-07-26: 96 -> 256 -> 384 -- see preset_4bit_baseline.yaml's
+  # identical comment (100% hit the 96 cap unfinished; 256 was still
+  # 97-100% at-cap with gemma ending mid-word 77% of the time).
+  max_new_tokens: 384
   # Matches preset_4bit_baseline.yaml (same 4bit precision) -- re-derived
   # from a real A100 measurement, see that file's header.
   batch_size: 96

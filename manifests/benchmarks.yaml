@@ -59,8 +59,10 @@ decoding:
   # CHANGED 2026-07-26: 96 -> 256 -- see manifests/quantization/
   # preset_4bit_baseline.yaml's identical comment (100% of harmful rows
   # hit the 96 cap unfinished on a real run; Qwen3 worse still, 81.7% of
-  # its rows stuck inside an unclosed <think> block).
-  max_new_tokens: 256
+  # its rows stuck inside an unclosed <think> block -- fixed by
+  # enable_thinking=False). 256 was still 97-100% at-cap on a follow-up
+  # run with gemma ending mid-word 77% of the time; raised to 384.
+  max_new_tokens: 384
   # Raised from 16 to 32: a live run reported 8.6/22.5 GB VRAM used at
   # batch_size=16 (~13.9 GB headroom). Memory scales roughly linearly with
   # batch size once fixed model weights (~3 GB) are subtracted out, so
@@ -250,10 +252,13 @@ recipes:
       coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
     decoding:
-      # CHANGED 2026-07-26: 8 -> 48 -- see manifests/quantization/
-      # preset_4bit_baseline.yaml's identical comment (mc_parsed was 0.6%
-      # at 8 tokens; both models talk before answering).
+      # CHANGED 2026-07-26: 8 -> 48 plus system_prompt -- see
+      # manifests/quantization/preset_4bit_baseline.yaml's identical
+      # comment (mc_parsed was 0.6% at 8 tokens; Gemma needed the terse
+      # instruction on top since it has no thinking mode to disable and
+      # otherwise spends its whole budget on conversational preamble).
       max_new_tokens: 48
+      system_prompt: "Answer with only the letter in parentheses (e.g. \"(A)\"). Do not explain or add any other text."
   - id: benign_over_refusal_control
     # XSTest is a benign control set, not a steer source -- see
     # XSTestAdapter's docstring. Every row normalizes to split="test"

@@ -71,7 +71,7 @@ def _stub_finetune(monkeypatch):
 
     def fake_evaluate_qlora_adapter(examples, model_name, adapter_dir, max_new_tokens=96,
                                      trust_remote_code=False, batch_size=16,
-                                     quantization="4bit", dtype=None, max_length=1024):
+                                     quantization="4bit", dtype=None, max_length=1024, system_prompt=None):
         calls["eval_batch_sizes"].append(batch_size)
         calls["eval_max_lengths"].append(max_length)
         rows = [{"example_id": e["id"], "behavior_id": e["behavior_id"], "split": e["split"],

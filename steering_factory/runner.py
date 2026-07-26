@@ -342,6 +342,11 @@ def run_extract(manifest: Dict[str, Any], command: str | None = None, callback: 
                 # the eval-generation path uses for this recipe (see
                 # run_steering's identical override), not a shorter one.
                 recipe_max_length = recipe.get("decoding", {}).get("max_length", 1024)
+                # See run_steering's identical comment: must match the
+                # eval-generation path's system prompt exactly, or the
+                # extracted vector and its evaluation disagree on what the
+                # model actually saw.
+                recipe_system_prompt = recipe.get("decoding", {}).get("system_prompt")
                 for method in methods:
                     for layer_idx in resolved_layers:
                         # Per-vector wall time -- previously only the WHOLE
@@ -353,7 +358,8 @@ def run_extract(manifest: Dict[str, Any], command: str | None = None, callback: 
                         # memory: steering cost accounting.
                         extraction_started = time.perf_counter()
                         result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback,
-                                                      batch_size=extraction_batch_size, max_length=recipe_max_length)
+                                                      batch_size=extraction_batch_size, max_length=recipe_max_length,
+                                                      system_prompt=recipe_system_prompt)
                         extraction_wall_time_s = time.perf_counter() - extraction_started
                         metadata = {"model": model_cfg.get("name_or_path"), "model_id": model_cfg.get("id"),
                                     "hidden_size": loaded.hidden_size, "layer_idx": layer_idx, "method": method,
@@ -431,6 +437,7 @@ def _evaluate_vector_grid(
     progress: Dict[str, int],
     judge: Optional[Any] = None,
     max_prompt_length: int = 1024,
+    system_prompt: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Generates and scores every (token_scope, coefficient, example) row
     for one already-extracted vector, batching examples together at each
@@ -469,7 +476,13 @@ def _evaluate_vector_grid(
     # JSON). The raw `example["prompt"]` stays on the row's own `prompt`
     # field below for human-readability; only what's handed to the
     # tokenizer changes here.
-    prompts = [format_chat(loaded.tokenizer, e["prompt"]) for e in evaluate_examples]
+    # `system_prompt` (recipe-level `decoding.system_prompt`) MUST be passed
+    # identically here, in extraction._collect_diffs, and in finetune's
+    # tokenize/_generate_batched_rows -- a system prompt applied at eval but
+    # not extraction is the same class of train/eval mismatch this call site
+    # already had once (see the comment above). runner threads the same
+    # resolved value to all of them.
+    prompts = [format_chat(loaded.tokenizer, e["prompt"], system=system_prompt) for e in evaluate_examples]
 
     # Length-bucketed index chunks, computed ONCE and reused for every
     # coefficient and token_scope -- the bucketing depends only on the
@@ -678,6 +691,9 @@ def _apply_vectors_cross_recipe(
         recipe_batch_size = recipe_decoding.get("batch_size", batch_size)
         recipe_max_new_tokens = recipe_decoding.get("max_new_tokens", max_new_tokens)
         recipe_max_prompt_length = recipe_decoding.get("max_length", 1024)
+        # From the APPLICATOR recipe, matching every other per-recipe
+        # decoding override here: its examples are what get tokenized.
+        recipe_system_prompt = recipe_decoding.get("system_prompt")
         for vrow in vector_rows:
             if vrow.get("recipe_id") != source_id:
                 continue
@@ -688,6 +704,7 @@ def _apply_vectors_cross_recipe(
                 vrow["model_id"], vrow["model"], eval_examples, coefficients, token_scopes,
                 recipe_max_new_tokens, recipe_batch_size, callback, progress, judge,
                 max_prompt_length=recipe_max_prompt_length,
+                system_prompt=recipe_system_prompt,
             ))
     return rows
 
@@ -771,6 +788,7 @@ def run_evaluate(
                 loaded, vector, layer_idx, method, recipe_id, vrow["model_id"], vrow["model"],
                 evaluate_examples, coefficients, token_scopes, recipe_max_new_tokens, recipe_batch_size, callback, progress, judge,
                 max_prompt_length=recipe_max_prompt_length,
+                system_prompt=recipe_decoding.get("system_prompt"),
             ))
             # Same per-vector cache clear as run_steering's equivalent loop
             # -- see the comment there for the fragmentation OOM this
@@ -927,6 +945,12 @@ def run_steering(
                 recipe_batch_size = recipe_decoding.get("batch_size", batch_size)
                 recipe_max_new_tokens = recipe_decoding.get("max_new_tokens", max_new_tokens)
                 recipe_max_prompt_length = recipe_decoding.get("max_length", 1024)
+                # Threaded into BOTH extraction.extract and
+                # _evaluate_vector_grid below -- a system prompt present at
+                # one and absent at the other is a train/eval mismatch (the
+                # vector would be extracted from differently-formatted
+                # activations than it is applied to).
+                recipe_system_prompt = recipe_decoding.get("system_prompt")
 
                 # n_points is the labeled-example-count axis (experiment.n_sweep);
                 # absent, this is exactly [len(steer)] -- one iteration using
@@ -949,7 +973,8 @@ def run_steering(
                             # real comparison run uses.
                             extraction_started = time.perf_counter()
                             result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback,
-                                                          batch_size=extraction_batch_size, max_length=recipe_max_prompt_length)
+                                                          batch_size=extraction_batch_size, max_length=recipe_max_prompt_length,
+                                                          system_prompt=recipe_system_prompt)
                             extraction_wall_time_s = time.perf_counter() - extraction_started
                             metadata = {"model": model_cfg.get("name_or_path"), "model_id": model_cfg.get("id"),
                                         "hidden_size": loaded.hidden_size, "layer_idx": layer_idx, "method": method,
@@ -968,6 +993,7 @@ def run_steering(
                                 loaded, result.vector, layer_idx, method, recipe_id, model_cfg.get("id"), model_cfg.get("name_or_path"),
                                 evaluate, coefficients, token_scopes, recipe_max_new_tokens, recipe_batch_size, callback, progress, judge,
                                 max_prompt_length=recipe_max_prompt_length,
+                                system_prompt=recipe_system_prompt,
                             )
                             rows.extend(new_rows)
                             generations_done = progress["done"]
@@ -1125,8 +1151,15 @@ def run_qlora(
                     # precision match the steering arm's per manifest model
                     # entry instead of always training at a hardcoded 4bit,
                     # so a quantization sweep varies both arms together.
+                    # system_prompt sourced from THIS recipe's own
+                    # decoding block, matching the steering arm's
+                    # extraction/eval (both keyed per-recipe) rather than
+                    # the finetune block's own scope (shared across every
+                    # recipe) -- otherwise a recipe with a system prompt on
+                    # its steering side would train QLoRA without one.
                     qlora_config = {**config, "model_name": model["name_or_path"], "output_dir": str(output_dir),
-                                     "quantization": model.get("quantization", "4bit"), "dtype": model.get("dtype")}
+                                     "quantization": model.get("quantization", "4bit"), "dtype": model.get("dtype"),
+                                     "system_prompt": recipe.get("decoding", {}).get("system_prompt")}
                     train_result = train_qlora(train_subset, qlora_config, callback=callback,
                                                 callback_context={"model_id": model["id"], "recipe_id": recipe["id"]})
                     adapter_dirs[(model["id"], recipe["id"], len(train_subset))] = \
@@ -1168,7 +1201,7 @@ def run_qlora(
                         max_new_tokens=recipe_max_new_tokens, trust_remote_code=bool(model.get("trust_remote_code", False)),
                         batch_size=recipe_eval_batch_size,
                         quantization=model.get("quantization", "4bit"), dtype=model.get("dtype"),
-                        max_length=recipe_max_length,
+                        max_length=recipe_max_length, system_prompt=recipe_decoding.get("system_prompt"),
                     )
                     for row in eval_result["rows"]:
                         example = next(e for e in eval_examples if e["id"] == row["example_id"])
@@ -1221,7 +1254,7 @@ def run_qlora(
                         max_new_tokens=recipe_max_new_tokens, trust_remote_code=bool(model.get("trust_remote_code", False)),
                         batch_size=recipe_eval_batch_size,
                         quantization=model.get("quantization", "4bit"), dtype=model.get("dtype"),
-                        max_length=recipe_max_length,
+                        max_length=recipe_max_length, system_prompt=recipe_decoding.get("system_prompt"),
                     )
                     for row in eval_result["rows"]:
                         example = next(e for e in applicator_examples if e["id"] == row["example_id"])

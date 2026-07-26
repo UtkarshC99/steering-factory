@@ -81,7 +81,7 @@ def _pooled_activations_batch(
 
 def _collect_diffs(
     loaded: LoadedModel, layer_idx: int, pairs: List[Dict], pooling: Pooling, batch_size: int = 16,
-    max_length: int = 1024,
+    max_length: int = 1024, system_prompt: Optional[str] = None,
 ) -> torch.Tensor:
     """Computes the pooled (compliant - non_compliant) activation diff for
     every pair, batching `batch_size` pairs' worth of forward passes at a
@@ -90,7 +90,7 @@ def _collect_diffs(
     preserved exactly, which matters for the convergence-tracking partial
     sums in mean_diff_vector/pca_vector (they read diffs[:n] and depend on
     pair order, not batch order)."""
-    prompt_texts = [format_chat(loaded.tokenizer, p["prompt"]) for p in pairs]
+    prompt_texts = [format_chat(loaded.tokenizer, p["prompt"], system=system_prompt) for p in pairs]
     all_texts: List[str] = []
     for prompt_text, pair in zip(prompt_texts, pairs):
         all_texts.append(prompt_text + pair["compliant"])
@@ -115,8 +115,9 @@ def mean_diff_vector(
     convergence_steps: Optional[List[int]] = None,
     batch_size: int = 16,
     max_length: int = 1024,
+    system_prompt: Optional[str] = None,
 ) -> ExtractionResult:
-    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size, max_length)
+    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size, max_length, system_prompt)
     final_vec = diffs.mean(dim=0)
 
     convergence = []
@@ -147,8 +148,9 @@ def pca_vector(
     track_convergence: bool = True,
     batch_size: int = 16,
     max_length: int = 1024,
+    system_prompt: Optional[str] = None,
 ) -> ExtractionResult:
-    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size, max_length)
+    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size, max_length, system_prompt)
     centered = diffs - diffs.mean(dim=0, keepdim=True)
     # SVD on the (n_pairs, hidden) diff matrix; top right-singular vector
     # is the principal direction of the activation differences.
@@ -193,13 +195,14 @@ def whitened_mean_diff_vector(
     ridge: float = 1e-3,
     batch_size: int = 16,
     max_length: int = 1024,
+    system_prompt: Optional[str] = None,
 ) -> ExtractionResult:
     """Regularized Fisher/whitened contrastive direction.
 
     It downweights activation dimensions whose pair differences are noisy,
     offering a useful ablation between raw CAA and a learned optimizer.
     """
-    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size, max_length).float()
+    diffs = _collect_diffs(loaded, layer_idx, pairs, pooling, batch_size, max_length, system_prompt).float()
     mean = diffs.mean(dim=0)
     centered = diffs - mean
     # Diagonal covariance is deliberate: full covariance is unstable when
@@ -252,6 +255,7 @@ def optimized_vector(
     coefficient: float = 1.0,
     max_pairs_per_step: Optional[int] = None,
     callback: Optional[RunCallback] = None,
+    system_prompt: Optional[str] = None,
 ) -> ExtractionResult:
     """BiPO-lite: optimizes the vector by gradient descent to maximize
     logp(compliant) - logp(non_compliant) under teacher forcing, with the
@@ -284,7 +288,7 @@ def optimized_vector(
         optimizer.zero_grad()
         step_loss = torch.tensor(0.0, device=device)
         for pair in use_pairs:
-            prompt_text = format_chat(loaded.tokenizer, pair["prompt"])
+            prompt_text = format_chat(loaded.tokenizer, pair["prompt"], system=system_prompt)
             hook = SteeringHook(layer_module, vec, coefficient)
             with hook:
                 pos_logp = _completion_logprob(loaded, prompt_text, pair["compliant"], device)
@@ -341,7 +345,14 @@ def extract(
         # vector's own closed-form forward passes below.
         init_batch_size = kwargs.pop("batch_size", 16)
         init_max_length = kwargs.pop("max_length", 1024)
+        # system_prompt stays in kwargs (not popped) so it reaches
+        # optimized_vector's own per-pair format_chat call below, but the
+        # init vector's closed-form pass needs it too -- otherwise the
+        # gradient-optimized vector starts from an init point extracted
+        # under DIFFERENT chat formatting than what it's then refined
+        # against.
         init = mean_diff_vector(loaded, layer_idx, pairs, pooling, track_convergence=False,
-                                 batch_size=init_batch_size, max_length=init_max_length).vector
+                                 batch_size=init_batch_size, max_length=init_max_length,
+                                 system_prompt=kwargs.get("system_prompt")).vector
         return optimized_vector(loaded, layer_idx, pairs, init_vector=init, callback=callback, **kwargs)
     raise ValueError(f"Unknown extraction method: {method}")

@@ -126,7 +126,7 @@ def train_qlora(
         lora_dropout=float(config.get("dropout", 0.05)), bias="none", task_type="CAUSAL_LM", target_modules=config["target_modules"]))
 
     def tokenize(row: Dict[str, Any]) -> Dict[str, Any]:
-        prompt, target = format_chat(tokenizer, row["prompt"]), row["positive"]
+        prompt, target = format_chat(tokenizer, row["prompt"], system=config.get("system_prompt")), row["positive"]
         full = tokenizer(prompt + target, truncation=True, max_length=int(config.get("max_length", 512)))
         prompt_ids = tokenizer(prompt, truncation=True, max_length=int(config.get("max_length", 512))).input_ids
         labels = list(full["input_ids"])
@@ -202,7 +202,8 @@ def _train_qlora_dpo(
         lora_dropout=float(config.get("dropout", 0.05)), bias="none", task_type="CAUSAL_LM", target_modules=config["target_modules"])
 
     dataset = Dataset.from_list([
-        {"prompt": format_chat(tokenizer, r["prompt"]), "chosen": r["positive"], "rejected": r["negative"]}
+        {"prompt": format_chat(tokenizer, r["prompt"], system=config.get("system_prompt")),
+         "chosen": r["positive"], "rejected": r["negative"]}
         for r in records
     ])
 
@@ -236,7 +237,7 @@ def _train_qlora_dpo(
 
 def _generate_batched_rows(
     model, tokenizer, examples: List[Dict[str, Any]], max_new_tokens: int, batch_size: int,
-    max_length: int = 1024,
+    max_length: int = 1024, system_prompt: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """The actual batched-generation loop, factored out of
     `evaluate_qlora_adapter` so it's testable against a plain (unquantized,
@@ -272,7 +273,7 @@ def _generate_batched_rows(
     device = next(model.parameters()).device
     if not examples:
         return []
-    prompt_texts_all = [format_chat(tokenizer, example["prompt"]) for example in examples]
+    prompt_texts_all = [format_chat(tokenizer, example["prompt"], system=system_prompt) for example in examples]
     rows_by_index: List[Optional[Dict[str, Any]]] = [None] * len(examples)
 
     def _run_batch(indices: List[int]) -> List[Dict[str, Any]]:
@@ -332,6 +333,7 @@ def evaluate_qlora_adapter(
     quantization: Optional[str] = "4bit",
     dtype: Optional[str] = None,
     max_length: int = 1024,
+    system_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate on `examples` (validation/test split) with the base model +
     trained QLoRA adapter, returning per-example rows in the same shape as
@@ -368,7 +370,7 @@ def evaluate_qlora_adapter(
     model = PeftModel.from_pretrained(base, adapter_dir)
     model.eval()
 
-    rows = _generate_batched_rows(model, tokenizer, examples, max_new_tokens, batch_size, max_length)
+    rows = _generate_batched_rows(model, tokenizer, examples, max_new_tokens, batch_size, max_length, system_prompt)
 
     del model, base
     if torch.cuda.is_available():
@@ -385,6 +387,7 @@ def evaluate_base_model(
     quantization: Optional[str] = "4bit",
     dtype: Optional[str] = None,
     max_length: int = 1024,
+    system_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Same as `evaluate_qlora_adapter` but loads the plain base model with
     no PEFT adapter -- used for the "before" half of the QLoRA arm's
@@ -412,7 +415,7 @@ def evaluate_base_model(
                                                   trust_remote_code=trust_remote_code, **quant_kwargs)
     model.eval()
 
-    rows = _generate_batched_rows(model, tokenizer, examples, max_new_tokens, batch_size, max_length)
+    rows = _generate_batched_rows(model, tokenizer, examples, max_new_tokens, batch_size, max_length, system_prompt)
 
     del model
     if torch.cuda.is_available():
