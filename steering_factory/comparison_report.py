@@ -200,23 +200,48 @@ def render_comparison_markdown(comparison: Dict[str, Any], plot_paths: Optional[
             qlora = entry["qlora"]
             lines.append(
                 f"| {entry['model_id']} | {entry['recipe_id']} | steering | "
-                f"{_fmt(steering.get('selected_config_extraction_cost_s'), 2)} | {_fmt(steering.get('labeled_examples'), 0)} | "
+                f"{_fmt(steering.get('one_time_cost_s'), 2)} | {_fmt(steering.get('labeled_examples'), 0)} | "
                 f"{_fmt(steering.get('artifact_bytes'), 0)} | {_fmt(steering.get('per_request_ms_per_token'), 2)} |"
             )
             lines.append(
                 f"| {entry['model_id']} | {entry['recipe_id']} | qlora | "
-                f"{_fmt(qlora.get('wall_time_s'), 2)} | {_fmt(qlora.get('labeled_examples'), 0)} | "
+                f"{_fmt(qlora.get('one_time_cost_s'), 2)} | {_fmt(qlora.get('labeled_examples'), 0)} | "
                 f"{_fmt(qlora.get('artifact_bytes'), 0)} | {_fmt(qlora.get('per_request_ms_per_token'), 2)} |"
             )
         lines.append("")
         lines.append(
-            "_One-time cost: steering's is its selected vector's estimated extraction share "
-            "(the full sweep's wall time, amortized across every config evaluated -- see "
-            "`full_sweep_wall_time_s` in report.json for the whole exploration cost, which is "
-            "NOT comparable to QLoRA's single training run); QLoRA's is its one training + eval run. "
-            "Both arms' `ms/token` is the fair, directly comparable per-request inference cost._"
+            "_One-time cost (2026-07-26: EXCLUDES generation for both arms, previously did not): "
+            "steering's is its selected vector's OWN measured extraction time (not the whole sweep's "
+            "wall time amortized evenly -- see `full_sweep_wall_time_s` in report.json for that whole-run "
+            "exploration figure, which is NOT comparable to QLoRA's single training run); QLoRA's is TRAIN "
+            "time only, no longer train+eval (eval generation time is inference cost, reported fairly via "
+            "`ms/token` below, not one-time setup cost). Both arms' `ms/token` is the fair, directly "
+            "comparable per-request inference cost, averaged over configs/adapters evaluated, not over "
+            "held-out examples._"
         )
         lines.append("")
+
+        any_cost_by_n = any(len(entry.get("cost_by_n") or []) > 1 for entry in entries)
+        if any_cost_by_n:
+            lines.append("## Cost by labeled-example count (N)")
+            lines.append("")
+            lines.append(
+                "The table above pins to the MAX N each arm reached. `experiment.n_sweep` is a manifest "
+                "tunable, so cost at each N it swept is broken out here separately -- \"cost to reach "
+                "quality X with N labels\" is what this answers; see the Matched quality data-efficiency "
+                "plots above for quality at the same N points."
+            )
+            lines.append("")
+            lines.append("| model | recipe | N | steering cost (s) | steering configs | qlora cost (s) |")
+            lines.append("|---|---|---|---|---|---|")
+            for entry in entries:
+                for point in entry.get("cost_by_n") or []:
+                    lines.append(
+                        f"| {entry['model_id']} | {entry['recipe_id']} | {point['n']} | "
+                        f"{_fmt(point.get('steering_one_time_cost_s'), 2)} | {_fmt(point.get('steering_num_configs'), 0)} | "
+                        f"{_fmt(point.get('qlora_one_time_cost_s'), 2)} |"
+                    )
+            lines.append("")
 
     if excluded:
         lines.append("## Excluded (insufficient data)")

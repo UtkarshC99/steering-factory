@@ -391,17 +391,31 @@ def _steering_cost(
     run_dir: Path, model_id: str, recipe_id: str, vector_rows: List[Dict[str, Any]],
     gen_rows: List[Dict[str, Any]], selected_config: Optional[Tuple] = None,
 ) -> Dict[str, Any]:
-    """`full_sweep_wall_time_s` is the entire run's telemetry wall time --
-    every method/layer/coefficient/token_scope this manifest evaluated, not
-    just the winning config. That is exploration cost, not deployment cost,
-    and reporting it as "steering's cost" against QLoRA's one-trained-
-    adapter time is a category error (a real run showed 7247s of sweep vs
-    177s of one QLoRA training run, which reads as "steering is 40x
-    slower" when it measured 12 configs vs 1). `selected_config_extraction_cost_s`
-    amortizes the full sweep's wall time evenly across every extracted
-    vector -- a rough but honest per-vector share when telemetry only
-    tracks one whole-run timer -- so it can be compared to QLoRA's one
-    training run on the same footing.
+    """`one_time_cost_s` (added 2026-07-26, replaces
+    `selected_config_extraction_cost_s`) is the SELECTED vector's OWN
+    measured `extraction_wall_time_s` (runner.py now times each
+    extraction.extract() call individually) -- not the whole run's wall
+    time amortized evenly across every config. The old amortization
+    assumed every extraction was equally expensive, which is false: method,
+    layer, and N (the labeled-example count) all change real extraction
+    cost, and pretending otherwise is exactly the kind of scope-mixing
+    Tier 2 as a whole is fixing. Falls back to the OLD whole-run
+    amortization only if a vector predates this instrumentation (no
+    extraction_wall_time_s recorded) and full_sweep_wall_time_s is
+    available, so older run directories still get a (less precise) number
+    instead of None.
+
+    `full_sweep_wall_time_s` remains the entire run's telemetry wall time
+    -- every method/layer/coefficient/token_scope/recipe/N-point this
+    manifest evaluated -- kept for context but NEVER used as "steering's
+    cost" (a real run showed 7247s of sweep vs 177s of one QLoRA training
+    run, which reads as "steering is 40x slower" when it measured 12
+    configs vs 1).
+
+    Averaged over configs actually evaluated, not over held-out EXAMPLES
+    (per the user's explicit instruction) -- extraction cost does not
+    scale with how many examples were later evaluated on, so dividing by
+    example count would be the wrong denominator.
     """
     telemetry = _read_json(run_dir / "telemetry.json")
     own_vectors = [v for v in vector_rows if v.get("model_id") == model_id and v.get("recipe_id") == recipe_id]
@@ -430,13 +444,17 @@ def _steering_cost(
 
     full_sweep_wall_time_s = telemetry.get("wall_time_s")
     num_configs = len(own_vectors)
-    selected_config_extraction_cost_s = (
-        full_sweep_wall_time_s / num_configs if full_sweep_wall_time_s is not None and num_configs else None
-    )
+
+    if selected_vector is not None and selected_vector.get("extraction_wall_time_s") is not None:
+        one_time_cost_s = selected_vector["extraction_wall_time_s"]
+    elif full_sweep_wall_time_s is not None and num_configs:
+        one_time_cost_s = full_sweep_wall_time_s / num_configs  # legacy fallback, see docstring
+    else:
+        one_time_cost_s = None
 
     return {
         "arm": "steering",
-        "selected_config_extraction_cost_s": selected_config_extraction_cost_s,
+        "one_time_cost_s": one_time_cost_s,
         "full_sweep_wall_time_s": full_sweep_wall_time_s,
         "gpu_peak_allocated_bytes": telemetry.get("gpu_peak_allocated_bytes"),
         "gpu_peak_reserved_bytes": telemetry.get("gpu_peak_reserved_bytes"),
@@ -452,7 +470,18 @@ def _qlora_cost(qlora_results: List[Dict[str, Any]], model_id: str, recipe_id: s
     to a single (model, recipe, num_train_records) point by the caller
     (build_comparison pins every entry to the max-N adapter when an
     N-sweep produced more than one) -- this function itself has no
-    N-awareness, it just reports whatever single config it's handed."""
+    N-awareness, it just reports whatever single config it's handed.
+
+    `one_time_cost_s` is TRAIN TIME ONLY (added 2026-07-26; was
+    train_wall_time_s + eval_wall_time_s, called "wall_time_s"). Reporting
+    eval-generation time as part of QLoRA's one-time cost, while the
+    steering arm's equivalent cost was extraction-only (never included its
+    own generation sweep), was not a fair comparison -- flagged directly
+    by the user after a real run. Generation cost for BOTH arms is now
+    reported only through `per_request_ms_per_token`, which already
+    existed and is the fair, directly-comparable inference-cost number;
+    `eval_wall_time_s` is kept on the row for anyone who wants the raw
+    figure, just not folded into the headline one-time cost."""
     match = next((r for r in qlora_results if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id), {})
     own_rows = [r for r in gen_rows if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id]
     latencies = [r["latency_s"] for r in own_rows if r.get("latency_s") is not None]
@@ -462,10 +491,9 @@ def _qlora_cost(qlora_results: List[Dict[str, Any]], model_id: str, recipe_id: s
         ms_per_token = 1000.0 * sum(latencies) / sum(tokens)
     train_time = match.get("wall_time_s")
     eval_time = match.get("eval_wall_time_s")
-    total_wall_time = (train_time or 0) + (eval_time or 0) if (train_time is not None or eval_time is not None) else None
     return {
         "arm": "qlora",
-        "wall_time_s": total_wall_time,
+        "one_time_cost_s": train_time,
         "train_wall_time_s": train_time,
         "eval_wall_time_s": eval_time,
         "artifact_bytes": match.get("adapter_size_bytes"),
@@ -473,6 +501,42 @@ def _qlora_cost(qlora_results: List[Dict[str, Any]], model_id: str, recipe_id: s
         "train_loss": match.get("train_loss"),
         "per_request_ms_per_token": ms_per_token,
     }
+
+
+def _cost_by_n(
+    vector_rows: List[Dict[str, Any]], qlora_results: List[Dict[str, Any]], model_id: str, recipe_id: str,
+) -> List[Dict[str, Any]]:
+    """One-time cost delineated by N (the labeled-example count,
+    `experiment.n_sweep`) rather than collapsed to the max-N point the
+    headline table pins to -- added 2026-07-26 per explicit request,
+    since N is a manifest tunable and "cost to reach quality X with N
+    labels" is a real question the max-N-only view could not answer.
+
+    Steering's cost at a given N is the MEAN of that N's vectors' own
+    `extraction_wall_time_s` across every (method, layer) config extracted
+    at that N -- averaged over CONFIGS, not over held-out examples (the
+    same instruction Tier 2's other cost numbers follow). QLoRA's cost at
+    a given N is that N's adapter's train_wall_time_s (there is exactly
+    one adapter per N, no averaging needed)."""
+    own_vectors = [v for v in vector_rows if v.get("model_id") == model_id and v.get("recipe_id") == recipe_id]
+    own_qlora = [r for r in qlora_results if r.get("model_id") == model_id and r.get("recipe_id") == recipe_id]
+
+    ns = sorted({v.get("num_pairs") for v in own_vectors if v.get("num_pairs") is not None} |
+                {r.get("num_train_records") for r in own_qlora if r.get("num_train_records") is not None})
+
+    rows = []
+    for n in ns:
+        vectors_at_n = [v for v in own_vectors if v.get("num_pairs") == n]
+        times = [v["extraction_wall_time_s"] for v in vectors_at_n if v.get("extraction_wall_time_s") is not None]
+        steering_cost = sum(times) / len(times) if times else None
+        qlora_match = next((r for r in own_qlora if r.get("num_train_records") == n), None)
+        rows.append({
+            "n": n,
+            "steering_one_time_cost_s": steering_cost,
+            "steering_num_configs": len(vectors_at_n),
+            "qlora_one_time_cost_s": qlora_match.get("wall_time_s") if qlora_match else None,
+        })
+    return rows
 
 
 def build_comparison(
@@ -582,6 +646,7 @@ def build_comparison(
             "qlora": {**qlora_q, **_qlora_cost(qlora_results_at_max_n, model_id, recipe_id, qlora_rows)},
             "config_grid": full_config_grid(steer_rows, behavior_id),
             "data_efficiency": data_efficiency_curve(steer_dir, qlora_dir, model_id, recipe_id),
+            "cost_by_n": _cost_by_n(own_vectors, qlora_results, model_id, recipe_id),
         })
 
     return {

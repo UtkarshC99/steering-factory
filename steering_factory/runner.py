@@ -332,11 +332,21 @@ def run_extract(manifest: Dict[str, Any], command: str | None = None, callback: 
                 recipe_max_length = recipe.get("decoding", {}).get("max_length", 1024)
                 for method in methods:
                     for layer_idx in resolved_layers:
+                        # Per-vector wall time -- previously only the WHOLE
+                        # run's wall time existed (telemetry.json), so
+                        # comparison._steering_cost had to amortize it evenly
+                        # across every vector regardless of how expensive
+                        # each one actually was (different methods/layers/N
+                        # all cost differently in reality). See Tier 2 /
+                        # memory: steering cost accounting.
+                        extraction_started = time.perf_counter()
                         result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback,
                                                       batch_size=extraction_batch_size, max_length=recipe_max_length)
+                        extraction_wall_time_s = time.perf_counter() - extraction_started
                         metadata = {"model": model_cfg.get("name_or_path"), "model_id": model_cfg.get("id"),
                                     "hidden_size": loaded.hidden_size, "layer_idx": layer_idx, "method": method,
-                                    "recipe_id": recipe_id, "num_pairs": len(pairs), "convergence": result.convergence}
+                                    "recipe_id": recipe_id, "num_pairs": len(pairs), "convergence": result.convergence,
+                                    "extraction_wall_time_s": extraction_wall_time_s}
                         vector_path = store.save_vector(f"{model_cfg.get('id', 'model')}__{recipe_id}__{method}__L{layer_idx}", result.vector, metadata)
                         vector_rows.append({**metadata, "vector_path": str(vector_path), "vector_norm": float(result.vector.norm())})
                         done += 1
@@ -919,11 +929,20 @@ def run_steering(
                     pairs = [{"prompt": e["prompt"], "compliant": e["positive"], "non_compliant": e["negative"]} for e in steer_subset]
                     for method in methods:
                         for layer_idx in resolved_layers:
+                            # Per-vector wall time -- see the identical
+                            # comment at run_extract's equivalent call site.
+                            # This is the call site that actually matters for
+                            # comparison.build_comparison, since run_steering
+                            # (not the split extract/evaluate path) is what a
+                            # real comparison run uses.
+                            extraction_started = time.perf_counter()
                             result = extraction.extract(method, loaded, layer_idx, pairs, callback=callback,
                                                           batch_size=extraction_batch_size, max_length=recipe_max_prompt_length)
+                            extraction_wall_time_s = time.perf_counter() - extraction_started
                             metadata = {"model": model_cfg.get("name_or_path"), "model_id": model_cfg.get("id"),
                                         "hidden_size": loaded.hidden_size, "layer_idx": layer_idx, "method": method,
-                                        "recipe_id": recipe_id, "num_pairs": len(pairs), "convergence": result.convergence}
+                                        "recipe_id": recipe_id, "num_pairs": len(pairs), "convergence": result.convergence,
+                                        "extraction_wall_time_s": extraction_wall_time_s}
                             vector_name = f"{model_cfg.get('id', 'model')}__{recipe_id}__{method}__L{layer_idx}__N{len(pairs)}"
                             vector_path = store.save_vector(vector_name, result.vector, metadata)
                             vector_rows.append({**metadata, "vector_path": str(vector_path), "vector_norm": float(result.vector.norm())})
@@ -1046,8 +1065,10 @@ def run_qlora(
     the CLI; a caller opts in explicitly.
     """
     import time as _time
+    import torch
     from .finetune import evaluate_qlora_adapter, train_qlora
     store = ArtifactStore(manifest["artifacts"]["root"], manifest, command)
+    run_started = _time.perf_counter()
     try:
         examples = _load_normalized_records(manifest, store)
         config = dict(manifest.get("finetune", {}))
@@ -1206,6 +1227,17 @@ def run_qlora(
             store.write_json("results/summary.json", aggregate(eval_rows))
             if any("safe_refusal" in row for row in eval_rows):
                 store.write_json("results/safety_summary.json", safety_metric_bundle(eval_rows))
+        # run_qlora previously wrote NO telemetry.json at all -- unlike
+        # run_steering, which has always recorded wall_time_s/GPU peaks --
+        # so there was no run-level timing record for the QLoRA arm
+        # independent of what got amortized into individual adapter rows.
+        telemetry = {
+            "wall_time_s": _time.perf_counter() - run_started,
+            "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
+            "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0,
+            "adapters": len(results), "eval_rows": len(eval_rows),
+        }
+        store.write_json("telemetry.json", telemetry)
         _safe(callback, {"arm": "qlora", "event": "qlora_done", "adapters": len(results)})
         store.finalize()
         return store

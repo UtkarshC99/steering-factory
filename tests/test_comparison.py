@@ -253,10 +253,150 @@ def test_build_comparison_joins_on_model_and_recipe(tmp_path):
     assert entry["qlora"]["test_quality"] == 0.5
     assert entry["steering"]["labeled_examples"] == 16
     assert entry["qlora"]["labeled_examples"] == 200
-    # Full sweep telemetry (12.5s over 2 configs) amortized to the selected config's share.
-    assert entry["steering"]["selected_config_extraction_cost_s"] == pytest.approx(12.5 / 2)
+    # This fixture's vectors carry no extraction_wall_time_s (predates that
+    # instrumentation), so _steering_cost falls back to the legacy
+    # whole-sweep-amortized figure: full sweep telemetry (12.5s over 2
+    # configs) amortized to the selected config's share. See
+    # test_steering_cost_prefers_the_selected_vectors_own_extraction_time
+    # for the new, precise per-vector path.
+    assert entry["steering"]["one_time_cost_s"] == pytest.approx(12.5 / 2)
     assert entry["steering"]["full_sweep_wall_time_s"] == 12.5
     assert entry["qlora"]["train_wall_time_s"] == 90.0
+    # QLoRA's one-time cost is now TRAIN time only (2026-07-26), not
+    # train+eval -- eval generation time (5.0s in this fixture) is
+    # deliberately excluded; see the identical test below.
+    assert entry["qlora"]["one_time_cost_s"] == pytest.approx(90.0)
+
+
+def test_steering_cost_prefers_the_selected_vectors_own_extraction_time(tmp_path):
+    """Regression test for Tier 2: one_time_cost_s must be the SELECTED
+    vector's own measured extraction_wall_time_s, not the whole run's wall
+    time amortized evenly across every config -- amortizing evenly assumes
+    every extraction is equally expensive, which real runs show is false
+    (different methods/layers/N cost differently)."""
+    steer_dir, qlora_dir = tmp_path / "steer_run", tmp_path / "qlora_run"
+    _build_steering_run(steer_dir)
+    _build_qlora_run(qlora_dir, test_quality=0.5)
+
+    # Give the two vectors DIFFERENT extraction times -- the winning config
+    # (mean_diff/L5) took 3.0s; the loser (pca/L8) took 40.0s. If cost were
+    # still amortized evenly (12.5/2=6.25) or used the loser's time, this
+    # test would catch it.
+    _write_jsonl(steer_dir / "vectors" / "index.jsonl", [
+        {"model_id": "m1", "recipe_id": "r1", "method": "mean_diff", "layer_idx": 5, "num_pairs": 16,
+         "vector_path": str(steer_dir / "vectors" / "v1.pt"), "extraction_wall_time_s": 3.0},
+        {"model_id": "m1", "recipe_id": "r1", "method": "pca", "layer_idx": 8, "num_pairs": 16,
+         "vector_path": str(steer_dir / "vectors" / "v2.pt"), "extraction_wall_time_s": 40.0},
+    ])
+
+    comparison = build_comparison(steer_dir, qlora_dir)
+    entry = comparison["comparisons"][0]
+    assert entry["steering"]["one_time_cost_s"] == pytest.approx(3.0)
+
+
+def test_qlora_one_time_cost_excludes_eval_generation_time(tmp_path):
+    steer_dir, qlora_dir = tmp_path / "steer_run", tmp_path / "qlora_run"
+    _build_steering_run(steer_dir)
+    _build_qlora_run(qlora_dir, test_quality=0.5)
+    _write_json(qlora_dir / "results" / "qlora.json", [
+        {"model_id": "m1", "recipe_id": "r1", "num_train_records": 200, "wall_time_s": 90.0,
+         "eval_wall_time_s": 500.0,  # deliberately huge, to prove it is NOT summed in
+         "adapter_size_bytes": 4096, "adapter_dir": str(qlora_dir / "qlora" / "m1" / "r1"), "train_loss": 0.3},
+    ])
+    comparison = build_comparison(steer_dir, qlora_dir)
+    entry = comparison["comparisons"][0]
+    assert entry["qlora"]["one_time_cost_s"] == pytest.approx(90.0)
+    assert entry["qlora"]["eval_wall_time_s"] == pytest.approx(500.0)  # kept on the row, just not folded in
+
+
+def test_cost_by_n_reports_every_n_sweep_point_separately(tmp_path):
+    """Regression test for the explicit ask: 'clearly delineate avg time
+    for x1 samples | for x2 samples | ...'. Two N-sweep points (N=10 and
+    N=40) with DIFFERENT costs must both appear, not just the max-N
+    headline point."""
+    steer_dir, qlora_dir = tmp_path / "steer_run", tmp_path / "qlora_run"
+
+    _write_jsonl(steer_dir / "results" / "generations.jsonl", _steering_rows())
+    _write_jsonl(steer_dir / "vectors" / "index.jsonl", [
+        {"model_id": "m1", "recipe_id": "r1", "method": "mean_diff", "layer_idx": 5, "num_pairs": 10,
+         "vector_path": str(steer_dir / "vectors" / "v1_n10.pt"), "extraction_wall_time_s": 1.0},
+        {"model_id": "m1", "recipe_id": "r1", "method": "mean_diff", "layer_idx": 5, "num_pairs": 40,
+         "vector_path": str(steer_dir / "vectors" / "v1_n40.pt"), "extraction_wall_time_s": 5.0},
+        {"model_id": "m1", "recipe_id": "r1", "method": "pca", "layer_idx": 8, "num_pairs": 40,
+         "vector_path": str(steer_dir / "vectors" / "v2_n40.pt"), "extraction_wall_time_s": 7.0},
+    ])
+    for p in ("v1_n10.pt", "v1_n40.pt", "v2_n40.pt"):
+        (steer_dir / "vectors" / p).write_bytes(b"0" * 10)
+    _write_json(steer_dir / "telemetry.json", {"wall_time_s": 13.0})
+    _write_json(steer_dir / "run.json", {"run_id": "s", "status": "completed", "manifest_hash": "abc"})
+
+    _write_jsonl(qlora_dir / "results" / "generations.jsonl", _qlora_rows(test_quality=0.5, num_train_records=40))
+    _write_json(qlora_dir / "results" / "qlora.json", [
+        {"model_id": "m1", "recipe_id": "r1", "num_train_records": 10, "wall_time_s": 20.0,
+         "eval_wall_time_s": 1.0, "adapter_size_bytes": 1, "adapter_dir": "x"},
+        {"model_id": "m1", "recipe_id": "r1", "num_train_records": 40, "wall_time_s": 60.0,
+         "eval_wall_time_s": 1.0, "adapter_size_bytes": 1, "adapter_dir": "y"},
+    ])
+    _write_json(qlora_dir / "run.json", {"run_id": "q", "status": "completed", "manifest_hash": "abc"})
+
+    comparison = build_comparison(steer_dir, qlora_dir)
+    entry = comparison["comparisons"][0]
+    by_n = {row["n"]: row for row in entry["cost_by_n"]}
+    assert set(by_n) == {10, 40}
+    assert by_n[10]["steering_one_time_cost_s"] == pytest.approx(1.0)
+    assert by_n[10]["steering_num_configs"] == 1
+    assert by_n[10]["qlora_one_time_cost_s"] == pytest.approx(20.0)
+    # N=40 has TWO configs (mean_diff + pca) -- averaged, not summed.
+    assert by_n[40]["steering_one_time_cost_s"] == pytest.approx((5.0 + 7.0) / 2)
+    assert by_n[40]["steering_num_configs"] == 2
+    assert by_n[40]["qlora_one_time_cost_s"] == pytest.approx(60.0)
+
+
+def test_run_qlora_writes_telemetry(tmp_path, monkeypatch):
+    """run_qlora previously wrote no telemetry.json at all, unlike
+    run_steering. Stubs finetune.train_qlora/evaluate_qlora_adapter (no
+    real peft/trl/GPU needed) to confirm the file now exists with a real
+    wall_time_s."""
+    from steering_factory import finetune as finetune_module
+    from steering_factory.runner import run_qlora
+
+    def fake_train_qlora(records, config, callback=None, callback_context=None):
+        return {"adapter_dir": "unused", "train_loss": 0.0, "global_step": 1,
+                "wall_time_s": 0.01, "adapter_size_bytes": 0, "log_history": []}
+
+    def fake_evaluate_qlora_adapter(examples, model_name, adapter_dir, max_new_tokens=96,
+                                     trust_remote_code=False, batch_size=16,
+                                     quantization="4bit", dtype=None, max_length=1024):
+        rows = [{"example_id": e["id"], "behavior_id": e["behavior_id"], "split": e["split"],
+                  "category": e.get("category"), "prompt": e["prompt"], "output": "x",
+                  "latency_s": 0.01, "batch_size": 1, "batch_wall_time_s": 0.01, "tokens_generated": 1}
+                 for e in examples]
+        return {"rows": rows, "wall_time_s": 0.01}
+
+    monkeypatch.setattr(finetune_module, "train_qlora", fake_train_qlora)
+    monkeypatch.setattr(finetune_module, "evaluate_qlora_adapter", fake_evaluate_qlora_adapter)
+
+    records = [{"id": f"e{i}", "prompt": f"p{i}", "positive": "pos", "negative": "neg", "category": "a"}
+               for i in range(10)]
+    manifest_path = tmp_path / "data.jsonl"
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        for r in records:
+            handle.write(json.dumps(r) + "\n")
+
+    manifest = {
+        "artifacts": {"root": str(tmp_path / "artifacts")},
+        "models": [{"id": "tiny", "name_or_path": "tiny/tiny-llama"}],
+        "splits": {"seed": 3, "steer_fraction": 0.5, "validation_fraction": 0.25, "group_key": "category"},
+        "recipes": [{"id": "r1", "behavior": "domain_classification",
+                     "dataset": {"adapter": "local_jsonl", "path": str(manifest_path)}}],
+        "finetune": {"backend": "qlora", "target_modules": ["q_proj"], "max_steps": 1},
+    }
+    store = run_qlora(manifest, command="test")
+    telemetry_path = store.path / "telemetry.json"
+    assert telemetry_path.exists()
+    telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+    assert telemetry["wall_time_s"] > 0
+    assert "gpu_peak_allocated_bytes" in telemetry
 
 
 def test_build_comparison_empty_when_no_matching_model_recipe(tmp_path):
