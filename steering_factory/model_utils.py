@@ -220,15 +220,32 @@ def layer_index_from_fraction(num_layers: int, fraction: float) -> int:
 
 def format_chat(tokenizer, user_message: str, system: Optional[str] = None) -> str:
     """Best-effort chat formatting using the tokenizer's chat template if
-    present, else a plain fallback so this still works on base models."""
+    present, else a plain fallback so this still works on base models.
+
+    Passes `enable_thinking=False` whenever the tokenizer's own chat
+    template accepts that kwarg (Qwen3's does; Gemma's does not and never
+    emits a <think> block at all). This is the single chokepoint every
+    generation/extraction/training call site routes through, so disabling
+    thinking here applies consistently everywhere rather than risking a
+    train/eval mismatch from patching only some call sites.
+
+    Why this matters beyond wasted tokens: a 96-token cap combined with
+    reasoning left on meant 81.7% of one real run's Qwen3 outputs on
+    harmful_instruction_compliance were STILL INSIDE an unclosed <think>
+    block when generation was cut off -- the model never produced a
+    delivered answer, only interrupted deliberation, which any keyword or
+    judge scorer then scores as if it were the final response."""
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": user_message})
 
     if getattr(tokenizer, "chat_template", None):
+        kwargs = {}
+        if "enable_thinking" in (getattr(tokenizer, "chat_template", "") or ""):
+            kwargs["enable_thinking"] = False
         return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True, **kwargs
         )
     prefix = f"{system}\n\n" if system else ""
     return f"{prefix}{user_message}\n"

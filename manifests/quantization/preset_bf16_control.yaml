@@ -85,7 +85,9 @@ capability_probe:
   enabled: true
   max_new_tokens: 24
 decoding:
-  max_new_tokens: 96
+  # CHANGED 2026-07-26: 96 -> 256 -- see preset_4bit_baseline.yaml's
+  # identical comment (100% of harmful rows hit the 96 cap unfinished).
+  max_new_tokens: 256
   # Raised 48 -> 72 (see header). Lower than the 4bit preset's 96 only
   # because bf16 weights are ~8 GB vs ~2.2 GB, not because bf16 is slower --
   # it is the FASTEST per token here (no dequantization, native tensor
@@ -169,7 +171,9 @@ recipes:
       coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
     decoding:
-      max_new_tokens: 8
+      # CHANGED 2026-07-26: 8 -> 48 -- see preset_4bit_baseline.yaml's
+      # identical comment (mc_parsed was 0.6% at 8 tokens).
+      max_new_tokens: 48
   - id: benign_over_refusal_control
     behavior: harmful_instruction_compliance
     dataset:
@@ -184,9 +188,10 @@ finetune:
   backend: qlora
   matched_split: steer
   objective: dpo
-  # Cut from 200 to 25 -- see preset_4bit_baseline.yaml's identical comment
-  # (real train-loss log plateaued by step 15-20).
-  max_steps: 25
+  # CHANGED 2026-07-26: max_steps -> epochs: 1 -- see
+  # preset_4bit_baseline.yaml's identical comment (fixed max_steps
+  # confounded the N-sweep: 12.7 epochs at N=10 vs 5.0 at N=40).
+  epochs: 1
   target_modules: [q_proj, k_proj, v_proj, o_proj]
   batch_size: 4
   gradient_accumulation_steps: 2

@@ -80,7 +80,18 @@ capability_probe:
   enabled: true
   max_new_tokens: 24
 decoding:
-  max_new_tokens: 96
+  # CHANGED 2026-07-26: 96 -> 256. A real run showed 100% of
+  # harmful_instruction_compliance rows (488/488 per coefficient cell)
+  # hit the 96-token cap -- not one generation finished naturally. These
+  # models open with a long preamble ("I understand you're asking
+  # about...", "**Disclaimer:**...") before the actual refusal or
+  # compliance, so 96 tokens truncates away the very thing being scored.
+  # Qwen3 is worse: 81.7% of its rows were still inside an unclosed
+  # <think> block at 96 tokens, meaning the model hadn't even finished
+  # reasoning, let alone answered (see enable_thinking=False in
+  # model_utils.format_chat, which addresses that half of the problem;
+  # this addresses the other half for models/recipes that don't reason).
+  max_new_tokens: 256
   # Raised 64 -> 96 (see header). Generation has OOM backoff plus length
   # bucketing, so overshooting here degrades throughput instead of
   # killing the run.
@@ -187,9 +198,18 @@ recipes:
       coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
     decoding:
-      # The answer is a single "(A)"/"(B)" token group -- 8 is generous.
-      # This is the single biggest cost lever in the manifest.
-      max_new_tokens: 8
+      # CHANGED 2026-07-26: 8 -> 48. WRONG when this was set to 8:
+      # reasoned "(A)"/"(B)" is one token group so 8 is generous, but a
+      # real run showed mc_parsed = 0.6% -- both models talk before
+      # answering ("Okay, Tom Brady, given your background...") and
+      # Qwen3 spent its entire 8-token budget inside its <think> block,
+      # never reaching an answer at all. mc_correct=0.0 in that run was a
+      # parse failure wearing a score's clothes, not a measurement. 48
+      # leaves room for a short preamble/thought and the answer; with
+      # enable_thinking=False now the default (model_utils.format_chat)
+      # Qwen3 shouldn't need the room for reasoning, but Gemma still
+      # chats first and has no thinking mode to disable.
+      max_new_tokens: 48
   - id: benign_over_refusal_control
     behavior: harmful_instruction_compliance
     dataset:
@@ -210,12 +230,16 @@ finetune:
   backend: qlora
   matched_split: steer
   objective: dpo
-  # Cut from 200 to 25: a real run's train-loss log showed loss=0.009 by
-  # step 15 and 1.6e-4 by step 20 -- fully memorized well before step 200,
-  # and eval confirmed it (QLoRA collapsed to the same canned refusal
-  # string on every held-out example). 25 leaves a small margin past the
-  # observed plateau.
-  max_steps: 25
+  # CHANGED 2026-07-26: max_steps: 25 -> epochs: 1. A fixed step count
+  # confounds the N-sweep: with batch_size=4 * gradient_accumulation=2 = 8
+  # effective, 25 steps is 12.7 epochs at N=10 (memorizes -- loss ~1e-6,
+  # rewards/margins 14-19, the collapse signature) but only 5.0 epochs at
+  # N=40 (converges normally) -- a real run's train-loss log showed this
+  # exact split, misread at first as "unstable alternating loss" before
+  # the epoch counts in the log were checked. `epochs: 1` makes every N
+  # point see each training example exactly once, so N is the only
+  # variable the data-efficiency curve is measuring.
+  epochs: 1
   target_modules: [q_proj, k_proj, v_proj, o_proj]
   batch_size: 4
   gradient_accumulation_steps: 2
