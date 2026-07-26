@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -12,6 +13,22 @@ from .config import TargetModelConfig
 logger = logging.getLogger(__name__)
 
 _TOKENIZER_COMPAT_PATCHED = False
+
+# bitsandbytes' LLM.int8() path (bnb_config_for's quantization="8bit"
+# branch) has no configurable compute dtype -- unlike 4bit's
+# bnb_4bit_compute_dtype, there is no bnb_8bit_compute_dtype in
+# BitsAndBytesConfig at all (confirmed against the installed transformers'
+# signature). Its MatMul8bitLt kernel always internally casts to fp16 for
+# the outlier decomposition regardless of the model's own dtype, and it
+# warns about that via warnings.warn() on EVERY int8 matmul call -- every
+# layer, every forward pass, every generation step -- which is what
+# flooded the 8bit_midpoint preset's log. This is expected LLM.int8()
+# behavior, not a misconfiguration to fix, so the warning is suppressed by
+# message text (not category) so an unrelated bitsandbytes warning would
+# still surface.
+warnings.filterwarnings(
+    "ignore", message=r"MatMul8bitLt: inputs will be cast from .* to float16 during quantization",
+)
 
 
 def _patch_tokenizer_special_tokens_compat():
