@@ -67,20 +67,26 @@ decoding:
   # than a conservative bump saves). Also used by the QLoRA eval arm. If
   # you see OOM at 32, drop back to 16 or 24.
   #
-  # Raised 32 -> 64 for A100 40GB. Generation has OOM backoff
+  # Raised 32 -> 64 -> 96 for A100 40GB. A real run then measured 12.08 GiB
+  # peak at batch=64 -- well under what the linear estimate above implied
+  # was needed to stay safe -- so batch was raised again, conservatively
+  # (~1.5x), rather than jumping to the much higher ceiling that
+  # measurement implies (see preset_4bit_baseline.yaml's header for the
+  # full re-derivation). Generation has OOM backoff
   # (sweep.run_with_oom_backoff) and length bucketing, so overshooting here
   # degrades throughput rather than killing the run.
-  batch_size: 64
+  batch_size: 96
 extraction:
-  # NOTE: now deliberately LOWER than decoding.batch_size, reversing the
-  # claim this comment used to make. Extraction being "strictly cheaper per
-  # row" is true per row and irrelevant in practice: _collect_diffs batches
+  # NOTE: deliberately LOWER than decoding.batch_size, reversing the claim
+  # this comment used to make. Extraction being "strictly cheaper per row"
+  # is true per row and irrelevant in practice: _collect_diffs batches
   # pos+neg together (2*N texts per forward pass) and extraction.py's
   # forward pass is the ONE generation path with no OOM backoff. That
   # unprotected path at 64 texts x 2048 tokens produced the 2.38 GiB
-  # allocation behind four consecutive OOMs. Until it gets backoff too,
-  # this stays below decoding.
-  batch_size: 48
+  # allocation behind four consecutive OOMs. Raised 48 -> 62 (a smaller,
+  # ~1.3x step) once a real A100 run measured comfortable headroom at 48;
+  # stays below decoding until extraction gets backoff too.
+  batch_size: 62
 recipes:
   # Real, gated/licensed benchmark data -- NOT the local_jsonl fixtures in
   # default_colab.yaml. Every recipe below requires
@@ -144,8 +150,29 @@ recipes:
       # present to see whether the extracted direction is meaningfully
       # bidirectional, and multiple magnitudes trace the dose-response
       # curve rather than a single before/after point.
+      #
+      # WIDENED AGAIN 2026-07-26 (7 -> 13 points), MANDATORY negative
+      # analog, per explicit request. Two real findings drove the specific
+      # shape, not a blind doubling:
+      #   - safe_refusal is bounded at 0 and a real run's base models
+      #     already refuse only 1.2%/11.8% of the time -- there is almost
+      #     no headroom to observe a negative effect on that metric alone.
+      #     A finer negative grid (plus reading js_divergence_vs_baseline,
+      #     an UNBOUNDED metric, alongside it -- see
+      #     memory: steering-metric-floor-effect) is what actually reveals
+      #     whether the negative direction does anything.
+      #   - comparison.best_steering_config now has a fluency gate
+      #     (perplexity ratio + repetition score -- see Tier 1 /
+      #     memory: steering-fluency-guard-missing). That same run showed
+      #     c=-2 real and fluent on one model (JS-div 0.58, ppl 1.02) but
+      #     DEGENERATE on the other (repetition 0.63) -- densifying near
+      #     -0.5..-2 (-1.5, -0.75, -0.25 added) is aimed at finding where
+      #     that fluent/degenerate boundary actually sits, since c=-1 alone
+      #     landed on the wrong side of it for one model.
+      # Symmetric density on the positive side keeps this comparable to a
+      # true dose-response curve rather than an asymmetric one-off probe.
       layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
   - id: calibrated_abstention_real
     behavior: appropriate_abstention
@@ -171,7 +198,7 @@ recipes:
       # 1 scope axis) so this recipe also gets the pos/neg dose-response
       # check instead of a single before/after point.
       layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
   # REMOVED: structured_output_real (JSONSchemaBench).
   #
@@ -216,7 +243,7 @@ recipes:
     extraction: [mean_diff, whitened_mean_diff]
     application:
       layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
     decoding:
       # Forced A/B answer -- 8 tokens is generous where the safety recipes

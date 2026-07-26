@@ -13,13 +13,21 @@
 # quantization: 4bit, dtype: bfloat16 compute -- nf4 double-quant weights,
 # bf16 activations/KV-cache.
 #
-# Memory sizing -- NOW TARGETING A100 40GB (this preset previously targeted
-# an L4 at 22.03 GiB, where the ceiling was ~33 and batch_size was 32).
-# Same derivation, new capacity: a live L4 run measured 8.6 GiB at
-# batch_size=16 for a ~4B model at 4bit (~2.0 GiB nf4 weights + ~0.4125 GiB
-# per unit of batch), and the same absolute 6.5 GiB safety margin is kept:
-#   ceiling = (39.4 - 6.5 - 2.0) / 0.4125 ~= 75
-# batch_size: 64 sits under that deliberately rather than at it.
+# Memory sizing -- RE-DERIVED from an actual A100 measurement (2026-07-26):
+# a real run peaked at 12.08 GiB of 40 (39.4 usable) at decoding batch=64 /
+# extraction batch=48 -- well under the 75/33 ceilings the earlier
+# extrapolated estimate implied, meaning that estimate significantly
+# over-stated real cost. Rather than push to the theoretical ceiling this
+# now implies (~174 for decoding), the bump is deliberately conservative:
+# 1.5x on decoding.batch_size (64->96, OOM-backoff-protected -- see
+# sweep.run_with_oom_backoff) and 1.3x on extraction.batch_size (48->62,
+# SMALLER factor and NO backoff protecting it -- extraction.py's forward
+# pass is the one generation path that has never had backoff, and it's
+# what produced the 2.38 GiB allocation behind four straight OOMs earlier
+# in this project). A large one-off jump straight to a theoretical ceiling
+# is exactly the kind of change that produced surprises before (the
+# seq^2-driven memory jump on structured_output_real); a measured,
+# moderate step is preferred.
 #
 # A SPEED CAVEAT THAT MATTERS FOR READING THIS MATRIX: on a 40 GB card a 4B
 # model was never memory-constrained (bf16 weights are only ~8 GiB), so
@@ -33,13 +41,18 @@
 # is not a clean quantization result.
 #
 # Step-count sanity: 2 extracting recipes x 2 extraction methods x 1 layer x
-# 7 coefficients x 1 token_scope x 2 n_sweep points. In practice
-# calibrated_abstention_real is skipped on most environments (its
-# on_load_error: skip fires on the datasets>=3.7 version guard), so the real
-# steering budget is harmful_instruction_compliance (~2548 generations per
-# model) plus the XSTest cross-recipe control, which is NOT counted in the
-# progress denominator because it has no steer split of its own but still
-# generates (~100 examples x 7 coefficients x 4 vectors = ~2800 per model).
+# 13 coefficients x 1 token_scope x 2 n_sweep points (coefficients widened
+# 7 -> 13 2026-07-26, mandatory negative analog -- see the coefficients
+# comment on harmful_instruction_compliance below for why this specific
+# grid). In practice calibrated_abstention_real is skipped on most
+# environments (its on_load_error: skip fires on the datasets>=3.7 version
+# guard), so the real steering budget is harmful_instruction_compliance
+# (~4732 generations per model, up from ~2548 at 7 coefficients) plus the
+# XSTest cross-recipe control, which is NOT counted in the progress
+# denominator because it has no steer split of its own but still generates
+# (~60 examples x 13 coefficients x 4 vectors = ~3120 per model). Batch
+# sizes were also raised (see the Memory sizing section above) so
+# per-generation cost should fall even as generation COUNT rises.
 # structured_output_real was removed -- see the note in the recipes list.
 # ============================================================================
 experiment:
@@ -68,20 +81,16 @@ capability_probe:
   max_new_tokens: 24
 decoding:
   max_new_tokens: 96
-  # A100 40GB (was 32 on the L4's 22GB). Generation has OOM backoff
-  # (sweep.run_with_oom_backoff) plus length bucketing, so overshooting
-  # here degrades throughput instead of killing the run -- which is why
-  # this side can be sized optimistically.
-  batch_size: 64
+  # Raised 64 -> 96 (see header). Generation has OOM backoff plus length
+  # bucketing, so overshooting here degrades throughput instead of
+  # killing the run.
+  batch_size: 96
 extraction:
-  # Deliberately LOWER than decoding.batch_size, inverting the old comment
-  # that extraction is "strictly cheaper". Extraction has NO OOM backoff --
-  # extraction.py's forward pass is the one generation path never wrapped --
-  # and _collect_diffs batches pos+neg together, so this number is doubled
-  # into 2*N texts per forward pass. That unprotected path, at 64 texts x
-  # 2048 tokens, is what produced the 2.38 GiB allocation behind four
-  # straight OOMs. Until it gets backoff too, it stays conservative.
-  batch_size: 48
+  # Raised 48 -> 62, a smaller step than decoding's -- see header. Still
+  # deliberately BELOW decoding.batch_size: extraction.py's forward pass
+  # has no OOM backoff, and _collect_diffs batches pos+neg together (2*N
+  # texts per forward pass).
+  batch_size: 62
 recipes:
   - id: harmful_instruction_compliance
     behavior: harmful_instruction_compliance
@@ -102,7 +111,7 @@ recipes:
     extraction: [mean_diff, whitened_mean_diff]
     application:
       layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
   - id: calibrated_abstention_real
     behavior: appropriate_abstention
@@ -117,7 +126,7 @@ recipes:
       # No grid existed here before -- defaulted to coefficient=1.0 only
       # (plus implicit 0.0). Widened to match harmful's grid.
       layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
   # REMOVED: structured_output_real (JSONSchemaBench).
   #
@@ -175,7 +184,7 @@ recipes:
     extraction: [mean_diff, whitened_mean_diff]
     application:
       layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
     decoding:
       # The answer is a single "(A)"/"(B)" token group -- 8 is generous.

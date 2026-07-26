@@ -27,13 +27,16 @@
 # range, not weight fidelity) and is likewise deliberately excluded --
 # see docs/quantization_matrix.md.
 #
-# Memory sizing -- A100 40GB (was an L4 at 22.03 GiB, ceiling ~18,
-# batch_size 16). bf16 weights are ~2 bytes/param, ~8.0 GiB for a ~4B model
-# (4x the 4bit baseline's ~2.0 GiB). Same slope and margin:
-#   ceiling = (39.4 - 6.5 - 8.0) / 0.4125 ~= 60
-# batch_size: 48 is set below that. Note what this does NOT mean: 48 < the
-# 4bit preset's 64 purely because the weights are 6 GiB larger, not because
-# bf16 is slower.
+# Memory sizing -- RE-DERIVED from a real A100 measurement, same as
+# preset_4bit_baseline.yaml (see that file's header for the corrected-slope
+# derivation, ~0.1575 GiB/unit-batch vs the ~0.4125 extrapolated one this
+# preset's ceiling used to assume). bf16 weights are ~2 bytes/param, ~8.0
+# GiB for a ~4B model (4x the 4bit baseline's ~2.0 GiB):
+#   ceiling = (39.4 - 6.5 - 8.0) / 0.1575 ~= 158
+# batch_size: 72/42 (decoding/extraction) is a conservative ~1.5x/1.3x step
+# up from the prior 48/32. Note what the gap to the 4bit preset's 96/62
+# does NOT mean: it's purely because the weights are 6 GiB larger, not
+# because bf16 is slower -- see the speed note below.
 #
 # ON SPEED, THIS PRESET IS THE OPPOSITE OF WHAT ITS BATCH SIZE SUGGESTS.
 # bf16 is the FASTEST per token of the three -- no dequantization, native
@@ -83,16 +86,16 @@ capability_probe:
   max_new_tokens: 24
 decoding:
   max_new_tokens: 96
-  # A100 40GB (was 16 on the L4). Lower than the 4bit preset's 64 only
+  # Raised 48 -> 72 (see header). Lower than the 4bit preset's 96 only
   # because bf16 weights are ~8 GB vs ~2.2 GB, not because bf16 is slower --
   # it is the FASTEST per token here (no dequantization, native tensor
   # cores). This preset's long wall time comes from its 3x wider layer
   # grid, not its precision.
-  batch_size: 48
+  batch_size: 72
 extraction:
-  # Below decoding on purpose -- extraction has NO OOM backoff. See
-  # preset_4bit_baseline.yaml's comment for the full reasoning.
-  batch_size: 32
+  # Raised 32 -> 42. Below decoding on purpose -- extraction has NO OOM
+  # backoff. See preset_4bit_baseline.yaml's comment for the full reasoning.
+  batch_size: 42
 recipes:
   - id: harmful_instruction_compliance
     behavior: harmful_instruction_compliance
@@ -107,7 +110,7 @@ recipes:
       # Widened vs the other two presets (see header comment): establishes
       # which layer is robust with no quantization noise to confound it.
       layers: ["early", "mid", "late"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
   - id: calibrated_abstention_real
     behavior: appropriate_abstention
@@ -120,7 +123,7 @@ recipes:
     extraction: [mean_diff, whitened_mean_diff]
     application:
       layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
   # REMOVED: structured_output_real (JSONSchemaBench).
   #
@@ -163,7 +166,7 @@ recipes:
     extraction: [mean_diff, whitened_mean_diff]
     application:
       layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
     decoding:
       max_new_tokens: 8

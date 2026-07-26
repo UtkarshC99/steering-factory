@@ -132,23 +132,29 @@ def test_batch_size_does_not_exceed_the_documented_safe_ceiling(path):
     simulation, just a guard against a future edit silently raising
     batch_size past what that preset's precision budget was sized for.
 
-    RE-DERIVED FOR A100 40GB (these were 33/28/18 for the 22.03 GiB L4).
-    Same method as the original: the L4 measured 8.6 GiB at batch 16 for a
-    4B model at 4bit, i.e. ~2.0 GiB weights + ~0.4125 GiB per unit of
-    batch, and the same absolute 6.5 GiB safety margin is kept.
+    RE-DERIVED TWICE now. First from an EXTRAPOLATED L4 measurement (8.6
+    GiB at batch 16, ~0.4125 GiB/unit-batch), giving ceilings of 75/70/60
+    that were never actually observed. Then (2026-07-26) from a REAL A100
+    measurement -- a run peaked at 12.08 GiB at decoding batch=64,
+    extraction batch=48 -- which backed out a materially different real
+    slope, ~0.1575 GiB/unit-batch (roughly 1/3 of the extrapolated one):
 
-        ceiling = (39.4 - 6.5 - weights) / 0.4125
+        per_batch_unit = (12.08 - weights) / 64  ~= 0.1575
+        ceiling = (39.4 - 6.5 - weights) / per_batch_unit
 
-    giving 4bit ~75 (weights 2.0), 8bit ~70 (4.0), bf16 ~60 (8.0). The
-    configured 64/48/48 all sit under those with room, which is deliberate:
-    generation has OOM backoff, but extraction does not, so the point of
-    this test is to catch a careless edit rather than to license running at
-    the ceiling."""
+    giving 4bit ~196, 8bit ~183, bf16 ~158. Deliberately NOT sized to
+    those corrected ceilings either: the configured 96/62 (4bit/layer_scan)
+    and 72/42 (8bit/bf16) are a conservative ~1.5x/1.3x step up from the
+    prior 64/48-ish values, not a jump to a theoretical maximum -- the
+    project has already been burned once by trusting an unmeasured
+    estimate over real data (the seq^2-driven memory jump on
+    structured_output_real). Extraction gets the smaller factor and the
+    lower absolute numbers because it has no OOM backoff; generation does."""
     ceilings = {
-        "preset_4bit_baseline.yaml": 75,
-        "preset_8bit_midpoint.yaml": 70,
-        "preset_bf16_control.yaml": 60,
-        "preset_low_bit_layer_scan.yaml": 75,
+        "preset_4bit_baseline.yaml": 196,
+        "preset_8bit_midpoint.yaml": 183,
+        "preset_bf16_control.yaml": 158,
+        "preset_low_bit_layer_scan.yaml": 196,
     }
     manifest = load_manifest(str(path), [])
     assert manifest["decoding"]["batch_size"] <= ceilings[path.name]

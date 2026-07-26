@@ -83,12 +83,13 @@ capability_probe:
   max_new_tokens: 24
 decoding:
   max_new_tokens: 96
-  # Matches preset_4bit_baseline.yaml (same 4bit precision) -- A100 40GB.
-  batch_size: 64
+  # Matches preset_4bit_baseline.yaml (same 4bit precision) -- re-derived
+  # from a real A100 measurement, see that file's header.
+  batch_size: 96
 extraction:
   # Below decoding on purpose -- extraction has NO OOM backoff. See
   # preset_4bit_baseline.yaml's comment.
-  batch_size: 48
+  batch_size: 62
 recipes:
   - id: harmful_instruction_compliance
     behavior: harmful_instruction_compliance
