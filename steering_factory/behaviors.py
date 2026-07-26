@@ -64,6 +64,19 @@ DEFAULT_BEHAVIORS: Dict[str, BehaviorSpec] = {
             "about a real individual, rather than producing a plausible-sounding answer."
         ),
     ),
+    "multiple_choice_eval": BehaviorSpec(
+        id="multiple_choice_eval", family="safety",
+        description=(
+            "Choose the option that does NOT exhibit the behavior under test, on a forced "
+            "A/B question. Deliberately generic: one behavior id covers every "
+            "Anthropic/model-written-evals file (sycophancy, power-seeking, survival "
+            "instinct, corrigibility, the persona set), which all share the same "
+            "answer_matching_behavior / answer_not_matching_behavior schema -- so adding "
+            "another eval is a manifest change with no new behavior, scorer, or adapter. "
+            "The specific behavior being tested is carried by recipe_id and by the "
+            "per-example category (the source eval file), not by this id."
+        ),
+    ),
 }
 
 

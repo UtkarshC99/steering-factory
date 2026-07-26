@@ -103,8 +103,13 @@ def _stub_finetune(monkeypatch):
 
     def fake_train_qlora(records, config, callback=None, callback_context=None):
         calls["trained"].append(dict(callback_context or {}))
+        # "dpo" (not the sft default) so tests can confirm the objective
+        # tag actually propagates from the trained adapter through
+        # adapter_dirs onto the CROSS-RECIPE eval rows too, not just the
+        # source recipe's own rows -- adapter_dirs used to carry only the
+        # adapter_dir string, so this tagging needed its own wiring.
         return {"adapter_dir": "unused-adapter-dir", "train_loss": 0.0, "global_step": 1,
-                "wall_time_s": 0.01, "adapter_size_bytes": 0, "log_history": []}
+                "wall_time_s": 0.01, "adapter_size_bytes": 0, "log_history": [], "objective": "dpo"}
 
     def fake_evaluate_qlora_adapter(examples, model_name, adapter_dir, max_new_tokens=96,
                                      trust_remote_code=False, batch_size=16,
@@ -211,3 +216,24 @@ def test_cross_recipe_rows_tagged_with_matching_num_train_records(tmp_path, _stu
     source_n = {r["num_train_records"] for r in source_rows}
     control_n = {r["num_train_records"] for r in control_rows}
     assert control_n == source_n
+
+
+def test_cross_recipe_rows_tagged_with_the_source_adapters_objective(tmp_path, _stub_finetune):
+    """Tier 3 regression test: an SFT run and a DPO run must never be
+    silently conflated as "qlora" in the comparison report. adapter_dirs
+    now carries (adapter_dir, objective) instead of just adapter_dir so
+    this tag reaches the cross-recipe (apply_adapter_from) rows too, not
+    just the source recipe's own rows -- _stub_finetune's fake_train_qlora
+    returns objective="dpo" specifically to exercise this."""
+    source_path, control_path = tmp_path / "source.jsonl", tmp_path / "control.jsonl"
+    _write_recipe_jsonl(source_path)
+    _write_control_jsonl(control_path)
+    manifest = _manifest(tmp_path, source_path, control_path)
+
+    store = run_qlora(manifest, command="test")
+    rows = _read_jsonl(store.path / "results" / "generations.jsonl")
+    source_rows = [r for r in rows if r["recipe_id"] == "source_recipe"]
+    control_rows = [r for r in rows if r["recipe_id"] == "control_recipe"]
+    assert source_rows and control_rows
+    assert all(r["objective"] == "dpo" for r in source_rows)
+    assert all(r["objective"] == "dpo" for r in control_rows)

@@ -8,9 +8,10 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .experiment_types import BehaviorSpec, ContrastiveExample, SplitPlan
 
@@ -89,6 +90,42 @@ class HuggingFaceAdapter:
 
     def normalize(self, record: Dict[str, Any], behavior: BehaviorSpec) -> ContrastiveExample:
         return LocalJsonlAdapter().normalize(record, behavior)
+
+
+def _choice_letter(raw: Any) -> Optional[str]:
+    """Normalizes an answer field to a bare letter.
+
+    Anthropic/model-written-evals stores these as " (A)" -- with a LEADING
+    SPACE and parentheses. Comparing those as strings is exactly the kind
+    of silent mismatch that has already cost this project three wrong
+    adapters, so every answer (and every model prediction, via
+    evaluators.multiple_choice_score) goes through this instead.
+    Accepts " (A)", "(A)", "A", "a", and "The answer is (B)". Returns None
+    if no choice is found, which callers must treat as UNSCOREABLE rather
+    than incorrect.
+
+    Deliberately not a bare `[A-Za-z]` scan: that returns "A" for "The
+    answer is (B)" (the 'a' in "answer") and "N" for "No" -- silently
+    wrong in the direction that looks like a real score. Parenthesized
+    form wins first; otherwise only a letter standing alone as its own
+    token counts."""
+    if raw is None:
+        return None
+    text = str(raw)
+    for pattern in (
+        r"\(\s*([A-Za-z])\s*\)",          # " (A)"  |  "The answer is (B)"
+        r"^\s*([A-Za-z])\s*\)",            # "B) Disagree"
+        # "A" | " b " -- the letter must be the ENTIRE answer. Anchored to
+        # $ rather than guarded with a lookahead: `\s*(?![A-Za-z])` looks
+        # equivalent but backtracks to zero spaces and then happily matches
+        # the "I" of "I cannot answer that". Caught by test_choice_letter_
+        # returns_none_rather_than_a_wrong_letter.
+        r"^\s*([A-Za-z])\s*$",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1).upper()
+    return None
 
 
 def _require_reviewed_dataset_card(config: Dict[str, Any], adapter_name: str, dataset_id: str, license_str: str) -> None:
@@ -362,6 +399,117 @@ class XSTestAdapter:
         )
 
 
+class ModelWrittenEvalsAdapter:
+    """Anthropic/model-written-evals (Perez et al. 2022) -- one adapter for
+    the WHOLE repo, selected by `subset` (a path to a .jsonl inside it):
+
+      sycophancy/sycophancy_on_political_typology_quiz.jsonl
+      sycophancy/sycophancy_on_nlp_survey.jsonl
+      sycophancy/sycophancy_on_philpapers2020.jsonl
+      advanced-ai-risk/human_generated_evals/power-seeking-inclination.jsonl
+      advanced-ai-risk/human_generated_evals/survival-instinct.jsonl
+      ... (16 human_generated_evals files, ~135 persona/ files)
+
+    Every file in the repo shares one schema, which is why one adapter
+    covers all of them and adding another eval is a pure-YAML change:
+
+      question                     : str, ends with "Choices:
+
+(A) ...
+
+(B) ..."
+      answer_matching_behavior     : str, exactly " (A)" or " (B)"
+      answer_not_matching_behavior : str, the other one
+
+    CONFIRMED against the live dataset card, not assumed -- note the
+    LEADING SPACE in the answer fields (" (A)", not "(A)"). Three earlier
+    adapters in this file shipped with wrong guessed schemas, so the
+    answers are normalized through `_choice_letter` rather than compared
+    as strings.
+
+    CONTRASTIVE DIRECTION (a real decision, not an implementation detail):
+    `answer_matching_behavior` is the answer that EXHIBITS the behavior
+    being tested -- the sycophantic answer, the power-seeking answer. We
+    map positive=answer_NOT_matching and negative=answer_matching, so a
+    POSITIVE coefficient steers AWAY from the tested behavior and
+    `mc_correct` (the quality key) rises when the model avoids it. That
+    orientation matters because comparison.best_steering_config MAXIMIZES
+    quality -- with the mapping inverted, the harness would faithfully
+    select the config that makes the model maximally sycophantic. QLoRA
+    trains on `positive` too, so both arms target the same direction.
+
+    Prompt length: sycophancy questions embed a generated biography
+    ("Hello, my name is ...") and run to ~600 tokens; the
+    advanced-ai-risk/persona files have no preamble and are far shorter.
+    All are well inside the default 1024-token cap and, unlike
+    JSONSchemaBench, are structurally uniform -- which is what makes batch
+    memory predictable here.
+    """
+    name = "model_written_evals"
+    default_dataset = "Anthropic/model-written-evals"
+    default_subset = "sycophancy/sycophancy_on_political_typology_quiz.jsonl"
+
+    def load(self, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+        dataset_id = config.get("dataset", self.default_dataset)
+        _require_reviewed_dataset_card(config, "ModelWrittenEvalsAdapter", dataset_id, "CC-BY-4.0")
+        try:
+            from datasets import load_dataset
+        except ImportError as exc:
+            raise RuntimeError("Install the optional 'datasets' dependency to load benchmark adapters.") from exc
+        subset = config.get("subset", self.default_subset)
+        # data_files, not a named config: the repo is plain JSONL files in
+        # directories with no loading script, so the file path IS the
+        # subset selector.
+        ds = load_dataset(dataset_id, data_files=subset, split=config.get("split", "train"),
+                           cache_dir=config.get("cache_dir"))
+        rows = []
+        for index, row in enumerate(ds):
+            rows.append({
+                "id": f"{index}", "question": row.get("question"),
+                "answer_matching_behavior": row.get("answer_matching_behavior"),
+                "answer_not_matching_behavior": row.get("answer_not_matching_behavior"),
+                # category = the eval file, so splits.group_key: category
+                # stratifies across evals when several are loaded, and the
+                # safety bundle's per_category breakdown stays meaningful.
+                "category": subset.rsplit("/", 1)[-1].replace(".jsonl", ""),
+                "source": dataset_id,
+            })
+        return rows
+
+    def normalize(self, record: Dict[str, Any], behavior: BehaviorSpec) -> ContrastiveExample:
+        prompt = str(record["question"]).strip()
+        matching = _choice_letter(record.get("answer_matching_behavior"))
+        not_matching = _choice_letter(record.get("answer_not_matching_behavior"))
+        return ContrastiveExample(
+            id=str(record.get("id", hashlib.sha256(prompt.encode()).hexdigest()[:16])), prompt=prompt,
+            # See the class docstring: positive is the answer that does NOT
+            # exhibit the tested behavior, so +coefficient steers away from it.
+            positive=f"({not_matching})" if not_matching else "",
+            negative=f"({matching})" if matching else "",
+            behavior_id=behavior.id,
+            # BUG FIXED 2026-07-26: this hardcoded split="train" (the HF
+            # config.get("split", "train") in load() above is the HF
+            # *dataset* split name -- unrelated -- and got conflated with
+            # our steer/validation/test split here). _load_normalized_records
+            # (runner.py) overwrites item["split"] from stable_split()
+            # BEFORE calling normalize(), same as LocalJsonlAdapter, so this
+            # must read that assignment through, not invent an unrecognized
+            # value. run_steering/run_evaluate/run_qlora only ever select
+            # split=="steer" or split in ("validation","test"); "train" matches
+            # neither, so every row silently vanished -- all 250 sycophancy
+            # examples loaded, produced zero vectors, zero generations, zero
+            # QLoRA rows, with no error (see memory:
+            # adapter-split-must-flow-through).
+            split=str(record.get("split", "test")),
+            source=str(record.get("source", self.name)), category=record.get("category"),
+            metadata={
+                "benchmark": "model-written-evals", "eval_file": record.get("category"),
+                "answer_matching_behavior": matching,
+                "answer_not_matching_behavior": not_matching,
+            },
+        )
+
+
 ADAPTERS = {
     "local_jsonl": LocalJsonlAdapter,
     "huggingface": HuggingFaceAdapter,
@@ -369,6 +517,7 @@ ADAPTERS = {
     "abstentionbench": AbstentionBenchAdapter,
     "jsonschemabench": JSONSchemaBenchAdapter,
     "xstest": XSTestAdapter,
+    "model_written_evals": ModelWrittenEvalsAdapter,
 }
 
 

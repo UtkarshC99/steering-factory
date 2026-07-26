@@ -66,12 +66,27 @@ decoding:
   # doesn't scale perfectly linearly, and a mid-run OOM costs more time
   # than a conservative bump saves). Also used by the QLoRA eval arm. If
   # you see OOM at 32, drop back to 16 or 24.
-  batch_size: 32
+  #
+  # Raised 32 -> 64 -> 96 for A100 40GB. A real run then measured 12.08 GiB
+  # peak at batch=64 -- well under what the linear estimate above implied
+  # was needed to stay safe -- so batch was raised again, conservatively
+  # (~1.5x), rather than jumping to the much higher ceiling that
+  # measurement implies (see preset_4bit_baseline.yaml's header for the
+  # full re-derivation). Generation has OOM backoff
+  # (sweep.run_with_oom_backoff) and length bucketing, so overshooting here
+  # degrades throughput rather than killing the run.
+  batch_size: 96
 extraction:
-  # Extraction is plain forward passes (no autoregression, no retained
-  # scores) -- strictly cheaper per row than generation -- so it can safely
-  # match or exceed decoding.batch_size.
-  batch_size: 32
+  # NOTE: deliberately LOWER than decoding.batch_size, reversing the claim
+  # this comment used to make. Extraction being "strictly cheaper per row"
+  # is true per row and irrelevant in practice: _collect_diffs batches
+  # pos+neg together (2*N texts per forward pass) and extraction.py's
+  # forward pass is the ONE generation path with no OOM backoff. That
+  # unprotected path at 64 texts x 2048 tokens produced the 2.38 GiB
+  # allocation behind four consecutive OOMs. Raised 48 -> 62 (a smaller,
+  # ~1.3x step) once a real A100 run measured comfortable headroom at 48;
+  # stays below decoding until extraction gets backoff too.
+  batch_size: 62
 recipes:
   # Real, gated/licensed benchmark data -- NOT the local_jsonl fixtures in
   # default_colab.yaml. Every recipe below requires
@@ -114,7 +129,7 @@ recipes:
       # floor) after the quality-key filter dropped None-scored rows, even
       # though the nominal split size was 20. 150 gives validation=30 with
       # margin for that attrition, on every recipe.
-      max_records: 150
+      max_records: 250
     # Dropped `pca` (kept mean_diff, whitened_mean_diff): pca was the
     # least-motivated of the three methods for a first correctness pass --
     # re-add once the pipeline is confirmed producing valid, parseable
@@ -135,8 +150,29 @@ recipes:
       # present to see whether the extracted direction is meaningfully
       # bidirectional, and multiple magnitudes trace the dose-response
       # curve rather than a single before/after point.
+      #
+      # WIDENED AGAIN 2026-07-26 (7 -> 13 points), MANDATORY negative
+      # analog, per explicit request. Two real findings drove the specific
+      # shape, not a blind doubling:
+      #   - safe_refusal is bounded at 0 and a real run's base models
+      #     already refuse only 1.2%/11.8% of the time -- there is almost
+      #     no headroom to observe a negative effect on that metric alone.
+      #     A finer negative grid (plus reading js_divergence_vs_baseline,
+      #     an UNBOUNDED metric, alongside it -- see
+      #     memory: steering-metric-floor-effect) is what actually reveals
+      #     whether the negative direction does anything.
+      #   - comparison.best_steering_config now has a fluency gate
+      #     (perplexity ratio + repetition score -- see Tier 1 /
+      #     memory: steering-fluency-guard-missing). That same run showed
+      #     c=-2 real and fluent on one model (JS-div 0.58, ppl 1.02) but
+      #     DEGENERATE on the other (repetition 0.63) -- densifying near
+      #     -0.5..-2 (-1.5, -0.75, -0.25 added) is aimed at finding where
+      #     that fluent/degenerate boundary actually sits, since c=-1 alone
+      #     landed on the wrong side of it for one model.
+      # Symmetric density on the positive side keeps this comparable to a
+      # true dose-response curve rather than an asymmetric one-off probe.
       layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
   - id: calibrated_abstention_real
     behavior: appropriate_abstention
@@ -152,7 +188,7 @@ recipes:
       # OTHER recipe in this manifest keeps the default (on_load_error:
       # raise, i.e. unset) -- a broken dataset there still stops the run.
       on_load_error: skip
-      max_records: 150
+      max_records: 250
     extraction: [mean_diff, whitened_mean_diff]
     application:
       # No application grid existed here before -- _evaluate_vector_grid's
@@ -162,50 +198,57 @@ recipes:
       # 1 scope axis) so this recipe also gets the pos/neg dose-response
       # check instead of a single before/after point.
       layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
-  - id: structured_output_real
-    behavior: structured_output
+  # REMOVED: structured_output_real (JSONSchemaBench).
+  #
+  # Cut after it OOMed four separate runs and produced no usable signal.
+  # Both reasons are worth keeping written down, because they are selection
+  # criteria for any future recipe, not just facts about this one:
+  #
+  #  1. MEMORY. Its prompts embed a whole JSON schema, so lengths ranged from
+  #     a few dozen tokens to the truncation cap. Raising that cap to 2048 so
+  #     schemas stopped being cut mid-object made extraction's own forward
+  #     pass allocate 64 texts x 2048 x 9728 (the MLP intermediate) = 2.38 GiB
+  #     in one tensor -- the exact allocation every OOM reported. No other
+  #     recipe here has prompts remotely that long or that variable.
+  #  2. NO SIGNAL. Even before the memory problem, JSON parsing succeeded on
+  #     2 of 2160 steering rows and 1 of 360 QLoRA rows. Its quality key
+  #     (leaf_exact_match) is None whenever parsing fails, and a recipe whose
+  #     quality is None everywhere is silently DROPPED from the comparison
+  #     rather than reported as a zero -- so it consumed roughly half the
+  #     run's generation budget and contributed nothing to the report.
+  #
+  # Nothing is lost: the jsonschemabench adapter, the structured_output
+  # behavior, and structured_score all remain in the codebase. Re-add this
+  # block to run it, ideally as its OWN manifest so its memory profile can
+  # only take down its own run -- and give extraction its own smaller
+  # batch size there, since extraction.py's forward pass has no OOM backoff.
+  - id: sycophancy_agreement
+    # Anthropic/model-written-evals, sycophancy subset (Perez et al. 2022).
+    # Replaces structured_output_real. One adapter covers the whole repo --
+    # `subset` is a path inside it -- so the 16
+    # advanced-ai-risk/human_generated_evals files (power-seeking,
+    # survival-instinct, corrigible-*-HHH, ...) and the ~135 persona files
+    # are each a pure-YAML addition needing no new adapter, behavior, or
+    # scorer. See ModelWrittenEvalsAdapter for the confirmed schema and for
+    # why positive = answer_NOT_matching_behavior.
+    behavior: multiple_choice_eval
     dataset:
-      adapter: jsonschemabench
-      dataset: epfl-dlab/JSONSchemaBench
-      subset: default  # confirmed against the live dataset viewer: 9.56K rows, train split 5.75K
-      reviewed_dataset_card: true
-      max_records: 150
+      adapter: model_written_evals
+      dataset: Anthropic/model-written-evals
+      subset: sycophancy/sycophancy_on_political_typology_quiz.jsonl
+      reviewed_dataset_card: true  # cc-by-4.0
+      max_records: 250
     extraction: [mean_diff, whitened_mean_diff]
     application:
-      # Same as calibrated_abstention_real above: no grid existed here
-      # before, so this recipe only ever ran at coefficient=1.0 (plus the
-      # implicit 0.0 baseline). Widened to the same grid for the same
-      # reason -- see harmful_instruction_compliance's comment.
       layers: ["mid"]
-      coefficients: [-2, -1, -0.5, 0, 0.5, 1, 2]
+      coefficients: [-2, -1.5, -1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1, 1.5, 2]
       token_scopes: [all]
-    # This recipe's prompts embed a full JSON schema and routinely approach
-    # the 1024-token truncation cap, unlike HarmBench's short prompts --
-    # decoding.batch_size: 32 above was sized from HarmBench's own observed
-    # VRAM usage and is NOT safe here. A real run OOM'd specifically on this
-    # recipe (VRAM swinging ~21.8GB -> ~11-14GB -> ~11.5GB batch-to-batch, a
-    # real variable-size spike from long-prompt batches, not fragmentation).
-    # Halved relative to the manifest default as a conservative fix.
-    #
-    # max_length: 2048 (was the 1024 default) -- a real run truncated long
-    # schemas mid-object, so the model never even saw the closing braces or
-    # required fields regardless of output budget. max_new_tokens: 256 (was
-    # 96) -- the same run showed tokens_generated==96 on nearly every row
-    # (cut off mid-object on the OUTPUT side too). Both raised together
-    # since fixing only one still leaves the JSON incomplete.
     decoding:
-      # Halved from 16 after a real OOM at 16 on this recipe (19.48 GiB
-      # live, only 352 MiB fragmented -- genuinely out of memory, not
-      # fragmentation). With sweep.length_bucketed_chunks grouping
-      # similar-length prompts and sweep.run_with_oom_backoff halving on
-      # OOM, this is a STARTING point rather than a hard promise: the
-      # short-schema buckets run densely at 8 and only the long tail
-      # backs off, instead of one static number having to fit both.
-      batch_size: 8
-      max_new_tokens: 256
-      max_length: 2048
+      # Forced A/B answer -- 8 tokens is generous where the safety recipes
+      # need 96. The single biggest cost lever in this manifest.
+      max_new_tokens: 8
   - id: benign_over_refusal_control
     # XSTest is a benign control set, not a steer source -- see
     # XSTestAdapter's docstring. Every row normalizes to split="test"
@@ -231,12 +274,17 @@ recipes:
       adapter: xstest
       dataset: walledai/XSTest
       reviewed_dataset_card: true
-      max_records: 100
+      # Trimmed 100 -> 60: with harmful's 7-coefficient x 4-vector grid this
+      # control was the single biggest generation consumer in the run
+      # (~2800/model, more than the recipe it controls for). 60 is still
+      # ample for a false-refusal rate.
+      max_records: 60
       apply_vectors_from: harmful_instruction_compliance
       apply_adapter_from: harmful_instruction_compliance
 finetune:
   backend: qlora
   matched_split: steer
+  objective: dpo
   # Cut from 200 to 25: a real run's train-loss log showed loss=0.009 by
   # step 15 and 1.6e-4 by step 20 -- the adapter had fully memorized its
   # ~40-80 example steer pool well before step 200, and the eval outputs

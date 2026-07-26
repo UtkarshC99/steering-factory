@@ -128,21 +128,52 @@ def test_low_bit_layer_scan_matches_baseline_precision_not_a_new_level():
 
 @pytest.mark.parametrize("path", PRESET_FILES, ids=lambda p: p.name)
 def test_batch_size_does_not_exceed_the_documented_safe_ceiling(path):
-    """Sanity pin on the memory-sizing math in each file's header comment --
-    not a full memory simulation, just a guard against a future edit
-    silently raising batch_size past what that preset's own precision
-    budget was sized for. Ceilings taken directly from the derivation in
-    each file's header (4bit~33, 8bit~28, bf16~18 max safe batch at a 6.5
-    GiB margin on a 22.03 GiB L4)."""
+    """Sanity pin on the memory-sizing math -- not a full memory
+    simulation, just a guard against a future edit silently raising
+    batch_size past what that preset's precision budget was sized for.
+
+    RE-DERIVED TWICE now. First from an EXTRAPOLATED L4 measurement (8.6
+    GiB at batch 16, ~0.4125 GiB/unit-batch), giving ceilings of 75/70/60
+    that were never actually observed. Then (2026-07-26) from a REAL A100
+    measurement -- a run peaked at 12.08 GiB at decoding batch=64,
+    extraction batch=48 -- which backed out a materially different real
+    slope, ~0.1575 GiB/unit-batch (roughly 1/3 of the extrapolated one):
+
+        per_batch_unit = (12.08 - weights) / 64  ~= 0.1575
+        ceiling = (39.4 - 6.5 - weights) / per_batch_unit
+
+    giving 4bit ~196, 8bit ~183, bf16 ~158. Deliberately NOT sized to
+    those corrected ceilings either: the configured 96/62 (4bit/layer_scan)
+    and 72/42 (8bit/bf16) are a conservative ~1.5x/1.3x step up from the
+    prior 64/48-ish values, not a jump to a theoretical maximum -- the
+    project has already been burned once by trusting an unmeasured
+    estimate over real data (the seq^2-driven memory jump on
+    structured_output_real). Extraction gets the smaller factor and the
+    lower absolute numbers because it has no OOM backoff; generation does."""
     ceilings = {
-        "preset_4bit_baseline.yaml": 33,
-        "preset_8bit_midpoint.yaml": 28,
-        "preset_bf16_control.yaml": 18,
-        "preset_low_bit_layer_scan.yaml": 33,
+        "preset_4bit_baseline.yaml": 196,
+        "preset_8bit_midpoint.yaml": 183,
+        "preset_bf16_control.yaml": 158,
+        "preset_low_bit_layer_scan.yaml": 196,
     }
     manifest = load_manifest(str(path), [])
     assert manifest["decoding"]["batch_size"] <= ceilings[path.name]
     assert manifest["extraction"]["batch_size"] <= ceilings[path.name]
+
+
+@pytest.mark.parametrize("path", PRESET_FILES, ids=lambda p: p.name)
+def test_extraction_batch_is_not_larger_than_decoding_batch(path):
+    """Extraction must stay at or below decoding, inverting the intuition
+    that it is "strictly cheaper per row".
+
+    Per row it is. In practice extraction is the RISKIER path: `_collect_diffs`
+    batches the positive and negative side together (2*N texts per forward
+    pass), and extraction.py's forward pass is the one generation path with
+    no OOM backoff wrapped around it. That unprotected path is what
+    allocated 2.38 GiB in a single tensor and produced four consecutive
+    OOMs, while every generation-side fix had no effect on it."""
+    manifest = load_manifest(str(path), [])
+    assert manifest["extraction"]["batch_size"] <= manifest["decoding"]["batch_size"]
 
 
 def test_yaml_files_are_plain_yaml_not_just_manifest_loadable():

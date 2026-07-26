@@ -101,7 +101,7 @@ What each tunable controls, and why "optimal" shifts by precision (see
 | `n_sweep` | labeled-example budget per arm | lower-bit weights → noisier per-example activations → the data-efficiency curve may need more points/larger N to keep `min_split_size=20` cleared with margin, avoiding the exact n_test=1 false-signal failure mode `comparison.py` already guards against |
 | `steer_fraction` | size of the steer pool feeding extraction | governs how many `n_sweep` points are non-redundant (`_subsample_n` returns the whole pool unchanged once `n >= len(steer)`) — second-order relative to quantization, held fixed across all four presets for comparability |
 | `layers` | depth in the residual stream where the direction is applied/extracted | quantization error is not uniform across depth — a layer that's robust under bf16 is not necessarily robust under 4-bit (H3) |
-| `coefficients` | steering dose | quantization perturbs activation scale slightly, so the coefficient that was optimal at one precision may not be optimal at another — held fixed here since none of the four hypotheses are specifically about dose-response, but worth flagging as a follow-up axis |
+| `coefficients` | steering dose, AND (2026-07-26) whether the extracted direction is bidirectional | quantization perturbs activation scale slightly, so the coefficient that was optimal at one precision may not be optimal at another. Widened to 13 points (from 7) and made a MANDATORY negative-analog check: a real run showed `safe_refusal` (bounded at 0, base models already refuse only 1-12% of the time) has almost no headroom to show a negative effect, while the unbounded `js_divergence_vs_baseline` showed the negative direction is real and often as strong as the positive one — see `comparison.DEFAULT_FLUENCY_CAP_RATIO`'s module docstring and memory: steering-metric-floor-effect. The same run also showed the fluent/degenerate boundary sits at a DIFFERENT magnitude per model (c=-2 was fluent for one model, degenerate — high repetition — for the other), which is why the grid is denser near ±0.25-0.75 rather than just wider at the extremes |
 | extraction `method` (mean_diff / pca / whitened_mean_diff) | how the direction is estimated from the pooled diffs | `whitened_mean_diff` is the most sensitive to activation covariance, which quantization perturbs more than a raw mean; `mean_diff` is the least sensitive, making it the right choice when isolating a *different* axis (e.g. H3's layer scan) |
 
 ## Per-preset design
@@ -124,39 +124,60 @@ should run **first** — H1 and H3 both need the bf16 control's numbers to
 compare against. `preset_low_bit_layer_scan.yaml` is a deliberate follow-up,
 not part of the first confirming pass.
 
-## Memory sizing per preset (L4, 22.03 GiB real capacity)
+## Memory sizing per preset (A100 40GB, ~39.4 GiB usable)
 
-A real run hit a CUDA OOM (`Tried to allocate 11.59 GiB`, only 10.84 GiB
-free) late in a long steering sweep, with 8.52 GiB actually allocated but
-2.44 GiB "reserved but unallocated" (PyTorch's own fragmentation
-diagnostic) — this was memory fragmentation across thousands of `generate()`
-calls of varying shape, not a genuine over-allocation; the sweep loop only
-called `torch.cuda.empty_cache()` once per **model**, not periodically
-across the (method, layer, n_sweep) grid. That's now fixed (per-vector
-`empty_cache()` calls in `runner.py`'s steering-sweep and evaluate loops),
-and the batch sizes below are sized with a larger safety margin than before
-specifically because that fragmentation was observed once already at a
-nominally "safe" setting.
+This matrix originally targeted an L4 (22.03 GiB). Migrated to A100 40GB
+partway through, and the sizing story has gone through two real revisions
+since — both are worth keeping, since each corrected a real
+over-/under-estimate rather than being a cosmetic change:
 
-Derivation: a live run measured 8.6 GiB used at `batch_size=16` under 4bit
-(~2.0 GiB nf4 weights for a ~4B-param model + ~6.6 GiB
-activations/KV-cache at that batch size) — scaling the activation term
-linearly with batch size gives ≈0.4125 GiB per unit of batch. Each
-precision level's weight footprint scales roughly with bytes/param (4bit
-≈0.5 B/param ≈2.0 GiB total; 8bit ≈1 B/param ≈4.0 GiB; bf16 ≈2 B/param
-≈8.0 GiB), and a 6.5 GiB safety margin is held out of the 22.03 GiB cap:
+1. **A real fragmentation OOM** (`Tried to allocate 11.59 GiB`, only 10.84
+   GiB free, 2.44 GiB "reserved but unallocated") happened on the L4
+   because `torch.cuda.empty_cache()` was only called once per **model**,
+   not per vector. Fixed with per-vector `empty_cache()` calls.
+2. **A real OOM on `structured_output_real`** (since removed from every
+   preset — see that recipe's own removal note in each manifest) traced to
+   extraction's forward pass having no batch-size cap on a per-recipe
+   varying-length input, allocating 2.38 GiB in a single tensor. Generation
+   now has `sweep.run_with_oom_backoff` (halves and retries on OOM) plus
+   `sweep.length_bucketed_chunks` (groups similar-length prompts so batch
+   cost tracks real content); extraction still has neither, which is why
+   its `batch_size` stays below decoding's in every preset.
+3. **The batch-size ESTIMATE itself was wrong by ~2.6x.** The original
+   derivation (below, kept for the historical record) extrapolated
+   ≈0.4125 GiB per unit of batch from a single L4 measurement. A real
+   A100 run (2026-07-26) measured the ACTUAL peak at decoding batch=64: **12.08
+   GiB**, not the ~14 GiB the old model would have predicted at that
+   batch size on this card's larger weight/activation mix — implying a
+   corrected slope of ≈0.1575 GiB per unit of batch, roughly a third of
+   the original estimate. batch_size was raised again on the strength of
+   that real measurement, but only ~1.5x (decoding) / ~1.3x (extraction,
+   the unprotected path), not to the much higher ceiling the corrected
+   slope implies — the project has already been burned once by trusting
+   an estimate over a measurement (this whole numbered list exists because
+   of that), so another large one-off jump is deliberately avoided.
 
-| preset | weights (~) | max safe batch (6.5 GiB margin) | configured `batch_size` |
-|---|---|---|---|
-| 4bit baseline | 2.0 GiB | ~33 | 32 |
-| 8bit midpoint | 4.0 GiB | ~28 | 24 |
-| bf16 control | 8.0 GiB | ~18 | 16 |
-| low-bit layer scan (4bit) | 2.0 GiB | ~33 | 32 |
+Original L4-era derivation (kept for reference, not current): a live L4
+run measured 8.6 GiB at `batch_size=16` under 4bit (~2.0 GiB nf4 weights +
+~6.6 GiB activations/KV-cache at that batch size) → ≈0.4125 GiB/unit-batch,
+6.5 GiB margin, giving max-safe-batch ≈33/28/18 for 4bit/8bit/bf16 on a
+22.03 GiB L4.
 
-`decoding.batch_size` and `extraction.batch_size` are set identically per
-preset (extraction is plain forward passes, strictly cheaper than
-generation per row, so it can safely match or exceed the generation
-batch size).
+Current (A100, corrected slope ≈0.1575 GiB/unit-batch, same 6.5 GiB
+margin, 39.4 GiB usable):
+
+| preset | weights (~) | corrected ceiling | configured `decoding.batch_size` | configured `extraction.batch_size` |
+|---|---|---|---|---|
+| 4bit baseline | 2.0 GiB | ~196 | 96 | 62 |
+| 8bit midpoint | 4.0 GiB | ~183 | 72 | 42 |
+| bf16 control | 8.0 GiB | ~158 | 72 | 42 |
+| low-bit layer scan (4bit) | 2.0 GiB | ~196 | 96 | 62 |
+
+`extraction.batch_size` is deliberately BELOW `decoding.batch_size` in
+every preset now, reversing the original claim that extraction is
+"strictly cheaper per row" (true per row, irrelevant in practice: it has
+no OOM backoff and `_collect_diffs` batches pos+neg together, doubling
+the effective batch).
 
 ## Results-reporting template
 
@@ -165,6 +186,23 @@ hypothesis above) *before* looking at the numbers, then fill in the
 observed result and whether it confirmed or refuted the hypothesis. This
 keeps the matrix a set of pre-registered, checkable claims rather than an
 open-ended sweep read after the fact.
+
+Before quoting a `test_quality`/winner from `report.md`, also check (added
+2026-07-26, see Tier 1 of that date's work):
+- The `distinct%` column and the "Safety / degeneracy controls" section --
+  a real run showed a QLoRA adapter score `safe_refusal=1.0` while
+  collapsed to 1-6 distinct outputs and falsely refusing 68-96% of benign
+  prompts. `winner` now reads `inconclusive (...)` when this happens, but
+  a raw `test_quality` number pulled directly from `report.json` does not
+  carry that caveat with it.
+- The "Steering configs rejected for fluency" section -- a config that
+  scored well on validation but was excluded for degenerate perplexity/
+  repetition will show there instead of as the selected winner.
+- `recipes[].steering.benign_control` for `harmful_instruction_compliance`
+  and `sycophancy_agreement` specifically, both of which now have a
+  matched control (XSTest, and the density check above) precisely because
+  a bare quality number on those two behaviors is the easiest to game by
+  refusing/agreeing unconditionally.
 
 ### H1 — `preset_8bit_midpoint.yaml` vs `preset_bf16_control.yaml`
 
