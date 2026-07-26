@@ -357,6 +357,18 @@ def full_config_grid(rows: List[Dict[str, Any]], behavior_id: Optional[str]) -> 
         grid.append({
             "method": method, "layer_idx": layer_idx, "coefficient": coefficient,
             "token_scope": token_scope, "test_quality": quality, "n_test": len(group),
+            # js_divergence_vs_baseline (added 2026-07-26): unbounded, so it
+            # doesn't share safe_refusal/mc_correct's floor-effect blind
+            # spot -- a real run showed negative coefficients scoring
+            # safe_refusal=0.000 at c=-2/-1/-0.5 (floored: the base model
+            # already refuses so rarely there's no room to observe a
+            # further shift), while js_divergence at the same configs was
+            # 0.418-0.579, near-baseline perplexity -- i.e. clearly,
+            # measurably different from the unsteered output despite the
+            # bounded quality metric reading as "did nothing". Surfaced
+            # here as a bidirectionality check on the whole grid, not only
+            # a diagnostic used to reject a fluency outlier.
+            "js_divergence_vs_baseline": _mean(group, "js_divergence_vs_baseline"),
         })
     return grid
 

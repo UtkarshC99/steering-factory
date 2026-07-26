@@ -226,6 +226,49 @@ def render_comparison_markdown(comparison: Dict[str, Any], plot_paths: Optional[
                     )
             lines.append("")
 
+        any_js = any(
+            row.get("js_divergence_vs_baseline") is not None
+            for entry in entries for row in (entry.get("config_grid") or [])
+        )
+        if any_js:
+            lines.append("## Bidirectionality (JS divergence from baseline)")
+            lines.append("")
+            lines.append(
+                "`safe_refusal`/`mc_correct` are bounded 0-1, so a model that already refuses (or already "
+                "answers correctly) almost all the time has little room left to show a further shift -- a "
+                "real run scored negative coefficients safe_refusal=0.000 at c=-2/-1/-0.5 purely from this "
+                "floor effect, reading as \"negative steering does nothing.\" `js_divergence_vs_baseline` "
+                "(Jensen-Shannon divergence between the steered and unsteered next-token distributions, "
+                "unbounded) does not share that blind spot: the same run measured 0.418-0.579 at those "
+                "configs, at near-baseline perplexity -- clearly, measurably different output despite the "
+                "bounded metric reading as inert. For each (model, recipe, method), the most-divergent "
+                "coefficient on the POSITIVE side and on the NEGATIVE side are shown, so a genuinely inert "
+                "direction (small divergence in that sign) is distinguishable from one that is merely "
+                "invisible to the bounded quality metric."
+            )
+            lines.append("")
+            lines.append("| model | recipe | method | max +coeff JS div | at c= | max -coeff JS div | at c= |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for entry in entries:
+                grid = entry.get("config_grid") or []
+                by_method: Dict[Any, List[Dict[str, Any]]] = {}
+                for row in grid:
+                    if row.get("js_divergence_vs_baseline") is not None:
+                        by_method.setdefault(row["method"], []).append(row)
+                for method, rows in sorted(by_method.items(), key=lambda item: str(item[0])):
+                    pos = [r for r in rows if (r.get("coefficient") or 0) > 0]
+                    neg = [r for r in rows if (r.get("coefficient") or 0) < 0]
+                    best_pos = max(pos, key=lambda r: r["js_divergence_vs_baseline"], default=None)
+                    best_neg = max(neg, key=lambda r: r["js_divergence_vs_baseline"], default=None)
+                    lines.append(
+                        f"| {entry['model_id']} | {entry['recipe_id']} | {method} | "
+                        f"{_fmt(best_pos['js_divergence_vs_baseline']) if best_pos else 'n/a'} | "
+                        f"{_fmt(best_pos.get('coefficient'), 2) if best_pos else 'n/a'} | "
+                        f"{_fmt(best_neg['js_divergence_vs_baseline']) if best_neg else 'n/a'} | "
+                        f"{_fmt(best_neg.get('coefficient'), 2) if best_neg else 'n/a'} |"
+                    )
+            lines.append("")
+
         if plot_paths:
             lines.append("## Visualizations")
             lines.append("")

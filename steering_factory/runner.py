@@ -87,6 +87,18 @@ def _load_normalized_records(manifest: Dict[str, Any], store: ArtifactStore) -> 
             # whatever order the adapter happened to return rows in.
             seed = manifest.get("splits", {}).get("seed", 17)
             records = _subsample_n(records, int(max_records), seed)
+        elif max_records is not None and int(max_records) > len(records):
+            # A manifest can silently get FEWER records than max_records
+            # asks for -- e.g. HarmBench's `standard` subset has only ~200
+            # rows, so max_records: 250 never triggers the subsample branch
+            # above and the recipe quietly runs on whatever the pool
+            # actually has. Log it so a smaller-than-requested split shows
+            # up in the run log instead of only being discoverable by
+            # counting rows in the output afterward.
+            logger.warning(
+                "Recipe %r: requested max_records=%d but %s adapter's pool only has %d records; "
+                "using all %d.", recipe["id"], int(max_records), adapter.name, len(records), len(records),
+            )
 
         split = SplitPlan(**recipe.get("splits", manifest.get("splits", {})))
         assignments = stable_split(records, split)

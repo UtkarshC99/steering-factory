@@ -57,6 +57,31 @@ def test_max_records_larger_than_pool_is_a_no_op(tmp_path):
     assert len(_read_examples(store)) == 10
 
 
+def test_max_records_larger_than_pool_logs_a_warning(tmp_path, caplog):
+    """Regression: HarmBench's `standard` subset has only ~200 rows, so
+    max_records: 250 silently ran on 200 with no visible sign the request
+    wasn't honored -- a run's actual N could only be discovered by
+    counting output rows after the fact. A real shortfall must be logged,
+    not just a no-op."""
+    import logging
+
+    data_path = tmp_path / "toy.jsonl"
+    _write_recipe_jsonl(data_path, n_per_category=5)  # 10 total
+    with caplog.at_level(logging.WARNING, logger="steering_factory.runner"):
+        prepare_data(_manifest(tmp_path, data_path, max_records=1000), command="test")
+    assert any("max_records=1000" in record.message and "only has 10" in record.message for record in caplog.records)
+
+
+def test_max_records_matching_pool_exactly_does_not_warn(tmp_path, caplog):
+    import logging
+
+    data_path = tmp_path / "toy.jsonl"
+    _write_recipe_jsonl(data_path, n_per_category=5)  # 10 total
+    with caplog.at_level(logging.WARNING, logger="steering_factory.runner"):
+        prepare_data(_manifest(tmp_path, data_path, max_records=10), command="test")
+    assert not any("max_records=" in record.message for record in caplog.records)
+
+
 def test_max_records_is_deterministic_for_the_same_seed(tmp_path):
     data_path = tmp_path / "toy.jsonl"
     _write_recipe_jsonl(data_path, n_per_category=20)
