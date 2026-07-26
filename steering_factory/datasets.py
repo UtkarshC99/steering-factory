@@ -486,7 +486,21 @@ class ModelWrittenEvalsAdapter:
             # exhibit the tested behavior, so +coefficient steers away from it.
             positive=f"({not_matching})" if not_matching else "",
             negative=f"({matching})" if matching else "",
-            behavior_id=behavior.id, split="train",
+            behavior_id=behavior.id,
+            # BUG FIXED 2026-07-26: this hardcoded split="train" (the HF
+            # config.get("split", "train") in load() above is the HF
+            # *dataset* split name -- unrelated -- and got conflated with
+            # our steer/validation/test split here). _load_normalized_records
+            # (runner.py) overwrites item["split"] from stable_split()
+            # BEFORE calling normalize(), same as LocalJsonlAdapter, so this
+            # must read that assignment through, not invent an unrecognized
+            # value. run_steering/run_evaluate/run_qlora only ever select
+            # split=="steer" or split in ("validation","test"); "train" matches
+            # neither, so every row silently vanished -- all 250 sycophancy
+            # examples loaded, produced zero vectors, zero generations, zero
+            # QLoRA rows, with no error (see memory:
+            # adapter-split-must-flow-through).
+            split=str(record.get("split", "test")),
             source=str(record.get("source", self.name)), category=record.get("category"),
             metadata={
                 "benchmark": "model-written-evals", "eval_file": record.get("category"),
