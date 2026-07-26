@@ -1079,14 +1079,17 @@ def run_qlora(
         decoding_cfg = manifest.get("decoding", {})
         max_new_tokens = decoding_cfg.get("max_new_tokens", 96)
         eval_batch_size = decoding_cfg.get("batch_size", 16)
-        # (model_id, recipe_id, num_train_records) -> trained adapter_dir,
+        # (model_id, recipe_id, num_train_records) -> (adapter_dir, objective),
         # populated as the main loop below trains each adapter -- read by
         # the apply_adapter_from cross-recipe pass after this loop so a
         # recipe with no train pool of its own (XSTest) can still be
         # evaluated against an already-trained adapter, at every N-sweep
         # point the source recipe trained, mirroring the steering arm's
-        # apply_vectors_from.
-        adapter_dirs: Dict[tuple, str] = {}
+        # apply_vectors_from. `objective` travels alongside adapter_dir so
+        # the cross-recipe eval rows below can be tagged with it too --
+        # otherwise a DPO-trained adapter's benign-control rows would be
+        # silently unlabeled.
+        adapter_dirs: Dict[tuple, tuple] = {}
         for model in manifest["models"]:
             for recipe in manifest["recipes"]:
                 recipe_examples = [e for e in examples if e["recipe_id"] == recipe["id"]]
@@ -1114,7 +1117,8 @@ def run_qlora(
                                      "quantization": model.get("quantization", "4bit"), "dtype": model.get("dtype")}
                     train_result = train_qlora(train_subset, qlora_config, callback=callback,
                                                 callback_context={"model_id": model["id"], "recipe_id": recipe["id"]})
-                    adapter_dirs[(model["id"], recipe["id"], len(train_subset))] = train_result["adapter_dir"]
+                    adapter_dirs[(model["id"], recipe["id"], len(train_subset))] = \
+                        (train_result["adapter_dir"], train_result.get("objective", "sft"))
                     results.append({"model_id": model["id"], "recipe_id": recipe["id"], "num_train_records": len(train_subset),
                                      "quantization": model.get("quantization", "4bit"), "dtype": model.get("dtype"), **train_result})
                     _safe(callback, {"arm": "qlora", "event": "adapter_done", "model_id": model["id"], "recipe_id": recipe["id"],
@@ -1162,6 +1166,10 @@ def run_qlora(
                                            "recipe_id": recipe["id"], "arm": "qlora",
                                            "num_train_records": len(train_subset),
                                            "quantization": model.get("quantization", "4bit"), "dtype": model.get("dtype"),
+                                           # Recorded so an SFT run and a DPO run are never silently
+                                           # conflated as "qlora" in the comparison report -- see
+                                           # finetune.train_qlora's config["objective"] docstring.
+                                           "objective": train_result.get("objective", "sft"),
                                            "benchmark": example_metadata.get("benchmark"),
                                            "is_safe_control": example_metadata.get("is_safe_control"),
                                            **row, **score})
@@ -1192,7 +1200,7 @@ def run_qlora(
                 recipe_eval_batch_size = recipe_decoding.get("batch_size", eval_batch_size)
                 recipe_max_new_tokens = recipe_decoding.get("max_new_tokens", max_new_tokens)
                 recipe_max_length = recipe_decoding.get("max_length", 1024)
-                for (adapter_model_id, adapter_recipe_id, num_train_records), adapter_dir in adapter_dirs.items():
+                for (adapter_model_id, adapter_recipe_id, num_train_records), (adapter_dir, adapter_objective) in adapter_dirs.items():
                     if adapter_model_id != model["id"] or adapter_recipe_id != source_id:
                         continue
                     eval_started = _time.perf_counter()
@@ -1211,6 +1219,7 @@ def run_qlora(
                                            "recipe_id": applicator_id, "arm": "qlora",
                                            "num_train_records": num_train_records,
                                            "quantization": model.get("quantization", "4bit"), "dtype": model.get("dtype"),
+                                           "objective": adapter_objective,
                                            "benchmark": example_metadata.get("benchmark"),
                                            "is_safe_control": example_metadata.get("is_safe_control"),
                                            **row, **score})

@@ -57,6 +57,24 @@ def train_qlora(
     `callback_context` (e.g. `{"model_id", "recipe_id"}`) is merged into
     every emitted event so a multi-model/multi-recipe run's events stay
     attributable. Always `None` from the CLI; see `callbacks.py`.
+
+    `config["objective"]` (added 2026-07-26, default "sft" -- unchanged
+    behavior for every manifest written before this existed) selects the
+    training objective:
+      - "sft": the original path below, trains on `prompt + positive` only.
+        `negative` is loaded onto every record (ContrastiveExample always
+        carries it) but never read here -- this arm discards half the
+        supervision the steering arm's whole mechanism is built on (the
+        pos-minus-neg activation difference). A real run showed exactly
+        the failure mode this predicts: with a single canned refusal as
+        `positive`, "always emit it" IS the objective's optimum, and the
+        adapter did that on 358/364 held-out rows regardless of input.
+      - "dpo": trains on (prompt, chosen=positive, rejected=negative)
+        via trl.DPOTrainer -- the data is already in exactly this shape,
+        `trl` is already a dependency. This is the closer analogue to
+        steering: the loss is a function of the PREFERENCE between the two
+        responses, not a memorized target string.
+    See finetune.py's _train_qlora_dpo for the dpo path.
     """
     if not qlora_available():
         raise RuntimeError("QLoRA requires optional dependencies: pip install peft trl datasets")
@@ -64,6 +82,13 @@ def train_qlora(
     missing = required - set(config)
     if missing:
         raise ValueError(f"QLoRA config missing {sorted(missing)}")
+
+    objective = config.get("objective", "sft")
+    if objective == "dpo":
+        return _train_qlora_dpo(records, config, callback, callback_context)
+    if objective != "sft":
+        raise ValueError(f"Unknown finetune.objective: {objective!r} (expected 'sft' or 'dpo')")
+
     from datasets import Dataset
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, Trainer, TrainingArguments
@@ -129,7 +154,84 @@ def train_qlora(
     log_history = list(trainer.state.log_history)
     return {"records": len(records), "wall_time_s": time.perf_counter() - started, "train_loss": output.training_loss,
             "global_step": output.global_step, "adapter_dir": config["output_dir"], "adapter_size_bytes": size,
-            "log_history": log_history}
+            "log_history": log_history, "objective": "sft"}
+
+
+def _train_qlora_dpo(
+    records: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    callback: Optional[RunCallback] = None,
+    callback_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """DPO objective: trains on the PREFERENCE between `positive` (chosen)
+    and `negative` (rejected) for the same prompt, rather than memorizing
+    `positive` as a fixed target. trl.DPOTrainer's expected dataset schema
+    (confirmed directly against its own _prepare_dataset -- not assumed)
+    is exactly `prompt`/`chosen`/`rejected` as plain strings, which is a
+    direct rename of this project's own `prompt`/`positive`/`negative`
+    fields -- no reshaping needed.
+
+    Model loading mirrors train_qlora's SFT path (same bnb_config_for/
+    resolve_dtype precision handling, so quantization stays matched to the
+    steering arm), except LoRA is applied via DPOTrainer's own
+    `peft_config` argument rather than a manual get_peft_model call --
+    DPOTrainer calls get_peft_model internally when given peft_config, but
+    (confirmed by reading DPOTrainer.__init__) does NOT call
+    prepare_model_for_kbit_training itself, so that step is still done
+    here explicitly for a quantized base, exactly like the SFT path."""
+    from datasets import Dataset
+    from peft import LoraConfig, prepare_model_for_kbit_training
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from trl import DPOConfig, DPOTrainer
+    from .model_utils import bnb_config_for, format_chat, resolve_dtype
+
+    started = time.perf_counter()
+    tokenizer = AutoTokenizer.from_pretrained(config["model_name"], trust_remote_code=config.get("trust_remote_code", False))
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    dtype = resolve_dtype(config.get("dtype"))
+    quant = bnb_config_for(config.get("quantization", "4bit"), dtype)
+    quant_kwargs = {"quantization_config": quant} if quant is not None else {"torch_dtype": dtype}
+    model = AutoModelForCausalLM.from_pretrained(config["model_name"], device_map="auto",
+                                                  trust_remote_code=config.get("trust_remote_code", False), **quant_kwargs)
+    if quant is not None:
+        model = prepare_model_for_kbit_training(model)
+
+    peft_config = LoraConfig(r=int(config.get("rank", 16)), lora_alpha=int(config.get("alpha", 32)),
+        lora_dropout=float(config.get("dropout", 0.05)), bias="none", task_type="CAUSAL_LM", target_modules=config["target_modules"])
+
+    dataset = Dataset.from_list([
+        {"prompt": format_chat(tokenizer, r["prompt"]), "chosen": r["positive"], "rejected": r["negative"]}
+        for r in records
+    ])
+
+    args = DPOConfig(
+        output_dir=config["output_dir"], num_train_epochs=float(config.get("epochs", 1)),
+        max_steps=int(config.get("max_steps", -1)), learning_rate=float(config.get("learning_rate", 2e-4)),
+        per_device_train_batch_size=int(config.get("batch_size", 4)),
+        gradient_accumulation_steps=int(config.get("gradient_accumulation_steps", 2)),
+        logging_steps=int(config.get("logging_steps", 5)), save_strategy="no", report_to=[],
+        # beta: how strongly the loss penalizes moving away from the
+        # reference (pre-training) policy -- trl's own default (0.1) unless
+        # the manifest overrides it. Deliberately NOT reusing "temperature"
+        # or another borrowed name; this is DPO's own hyperparameter.
+        beta=float(config.get("dpo_beta", 0.1)),
+        max_length=int(config.get("max_length", 512)),
+    )
+    trainer_callback = _build_trainer_callback(callback, callback_context or {})
+    trainer = DPOTrainer(
+        model=model, args=args, train_dataset=dataset, processing_class=tokenizer, peft_config=peft_config,
+        callbacks=[trainer_callback] if trainer_callback is not None else None,
+    )
+    output = trainer.train()
+    trainer.save_model(config["output_dir"])
+    tokenizer.save_pretrained(config["output_dir"])
+    size = sum(os.path.getsize(os.path.join(root, file)) for root, _, files in os.walk(config["output_dir"]) for file in files)
+    log_history = list(trainer.state.log_history)
+    return {"records": len(records), "wall_time_s": time.perf_counter() - started, "train_loss": output.training_loss,
+            "global_step": output.global_step, "adapter_dir": config["output_dir"], "adapter_size_bytes": size,
+            "log_history": log_history, "objective": "dpo"}
 
 
 def _generate_batched_rows(
