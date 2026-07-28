@@ -9,6 +9,7 @@ import pytest
 
 from steering_factory.comparison import (
     HeldOutViolation,
+    _qlora_cost,
     assert_disjoint_selection_and_test_rows,
     best_steering_config,
     build_comparison,
@@ -229,6 +230,103 @@ def test_qlora_quality_distinct_output_ratio_is_none_without_output_field():
     assert result["distinct_output_ratio"] is None
 
 
+def test_best_steering_config_reports_mc_parsed_rate_for_multiple_choice_eval():
+    """Regression test for a real run (2026-07-26): sycophancy_agreement
+    scored mc_correct=0.0000 across every coefficient, which read as "the
+    model never avoids the sycophantic answer" -- but mc_parsed_rate was
+    0.6%, meaning the model wasn't answering in the expected format at
+    all (chatted instead of emitting "(A)"/"(B)", or Qwen3 spent its whole
+    token budget inside <think>). mc_parsed_rate must be surfaced
+    alongside mc_correct so a 0.0 score can be told apart from a
+    non-answer."""
+    rows = _steering_rows(behavior_id="multiple_choice_eval")
+    for row in rows:
+        row["mc_correct"] = row.pop("exact_match")
+        row["mc_parsed"] = 1.0 if row["mc_correct"] == 1.0 else 0.2  # mostly unparsed on the losing config
+    result = best_steering_config(rows, "multiple_choice_eval")
+    assert result is not None
+    assert result["quality_key"] == "mc_correct"
+    # Winning config (mean_diff/L5/c=1) has mc_correct=1.0 on every test row
+    # in this fixture, so mc_parsed tracks it at 1.0 too.
+    assert result["mc_parsed_rate"] == pytest.approx(1.0)
+
+
+def test_qlora_quality_reports_mc_parsed_rate_for_multiple_choice_eval():
+    rows = _qlora_rows(behavior_id="multiple_choice_eval", test_quality=0.0)
+    for row in rows:
+        row["mc_correct"] = row.pop("exact_match")
+        row["mc_parsed"] = 0.006  # collapsed parse rate, matching the real run
+    result = qlora_quality(rows, "multiple_choice_eval")
+    assert result["quality_key"] == "mc_correct"
+    assert result["mc_parsed_rate"] == pytest.approx(0.006)
+
+
+def test_mc_parsed_rate_absent_for_non_multiple_choice_behaviors():
+    # domain_classification uses exact_match, which has no mc_parsed
+    # concept at all -- the key should simply not appear, not be None.
+    rows = _steering_rows()
+    result = best_steering_config(rows, "domain_classification")
+    assert "mc_parsed_rate" not in result
+
+
+def test_qlora_cost_reports_final_rewards_margin_from_dpo_log_history():
+    """Regression test for a real run (2026-07-26): N=10 DPO adapters
+    reached rewards/margins 14-19 alongside train_loss ~1e-6 (12.7 epochs
+    from a fixed max_steps -- see max-steps-confounds-the-n-sweep in
+    project memory) while N=40 adapters converged normally at margins
+    5-6. final_rewards_margin must read the LAST logged value, not e.g.
+    the max or the first."""
+    qlora_results = [{
+        "model_id": "m1", "recipe_id": "r1", "num_train_records": 10, "wall_time_s": 37.6,
+        "log_history": [
+            {"step": 5, "loss": 0.15, "rewards/margins": 5.5},
+            {"step": 10, "loss": 9e-6, "rewards/margins": 12.1},
+            {"step": 25, "loss": 9e-7, "rewards/margins": 14.1},
+        ],
+    }]
+    result = _qlora_cost(qlora_results, "m1", "r1", [])
+    assert result["final_rewards_margin"] == pytest.approx(14.1)
+
+
+def test_qlora_cost_final_rewards_margin_is_none_for_sft():
+    # objective: sft's log_history has no rewards/margins key at all.
+    qlora_results = [{
+        "model_id": "m1", "recipe_id": "r1", "num_train_records": 10, "wall_time_s": 37.6,
+        "log_history": [{"step": 5, "loss": 0.15}, {"step": 25, "loss": 0.01}],
+    }]
+    result = _qlora_cost(qlora_results, "m1", "r1", [])
+    assert result["final_rewards_margin"] is None
+
+
+def test_cost_table_flags_high_dpo_margin_as_likely_collapse():
+    comparison = {
+        "steering_run": "s", "qlora_run": "q", "min_split_size": 20,
+        "comparisons": [{
+            "model_id": "m1", "recipe_id": "r1", "behavior_id": "domain_classification",
+            "steering": {"test_quality": 0.5, "beat_baseline": True, "one_time_cost_s": 1.0},
+            "qlora": {"test_quality": 0.6, "one_time_cost_s": 40.0, "final_rewards_margin": 19.0},
+        }],
+        "excluded": [],
+    }
+    markdown = render_comparison_markdown(comparison)
+    assert "DPO final margin" in markdown
+    assert "collapse signature" in markdown.lower()
+
+
+def test_cost_table_does_not_flag_a_converging_dpo_margin():
+    comparison = {
+        "steering_run": "s", "qlora_run": "q", "min_split_size": 20,
+        "comparisons": [{
+            "model_id": "m1", "recipe_id": "r1", "behavior_id": "domain_classification",
+            "steering": {"test_quality": 0.5, "beat_baseline": True, "one_time_cost_s": 1.0},
+            "qlora": {"test_quality": 0.6, "one_time_cost_s": 40.0, "final_rewards_margin": 4.8},
+        }],
+        "excluded": [],
+    }
+    markdown = render_comparison_markdown(comparison)
+    assert "collapse signature" not in markdown.lower()
+
+
 def test_qlora_quality_reports_validation_and_test():
     rows = _qlora_rows(test_quality=0.66)
     result = qlora_quality(rows, "domain_classification")
@@ -366,7 +464,7 @@ def test_run_qlora_writes_telemetry(tmp_path, monkeypatch):
 
     def fake_evaluate_qlora_adapter(examples, model_name, adapter_dir, max_new_tokens=96,
                                      trust_remote_code=False, batch_size=16,
-                                     quantization="4bit", dtype=None, max_length=1024):
+                                     quantization="4bit", dtype=None, max_length=1024, system_prompt=None):
         rows = [{"example_id": e["id"], "behavior_id": e["behavior_id"], "split": e["split"],
                   "category": e.get("category"), "prompt": e["prompt"], "output": "x",
                   "latency_s": 0.01, "batch_size": 1, "batch_wall_time_s": 0.01, "tokens_generated": 1}
@@ -629,6 +727,49 @@ def test_winner_inconclusive_on_collapsed_distinct_output_even_without_benign_da
     markdown = render_comparison_markdown(comparison)
     assert "inconclusive" in markdown.lower()
     assert "collapsed" in markdown.lower()
+
+
+def test_winner_inconclusive_on_low_mc_parsed_rate():
+    """Regression test for a real run (2026-07-26): sycophancy_agreement's
+    mc_correct=0.0000 with mc_parsed_rate=0.6% would otherwise report
+    "qlora wins 0.10 vs 0.00" as if it were a real quality gap, when in
+    fact steering's rows never parsed at all."""
+    comparison = {
+        "steering_run": "s", "qlora_run": "q", "min_split_size": 20,
+        "comparisons": [{
+            "model_id": "m1", "recipe_id": "r1", "behavior_id": "multiple_choice_eval",
+            "steering": {"test_quality": 0.0, "beat_baseline": True, "mc_parsed_rate": 0.006},
+            "qlora": {"test_quality": 0.10, "mc_parsed_rate": 0.20},
+        }],
+        "excluded": [],
+    }
+    markdown = render_comparison_markdown(comparison)
+    assert "inconclusive" in markdown.lower()
+    assert "expected format" in markdown.lower()
+
+
+def test_mc_parsed_column_only_appears_when_data_exists():
+    comparison_without = {
+        "steering_run": "s", "qlora_run": "q", "min_split_size": 20,
+        "comparisons": [{
+            "model_id": "m1", "recipe_id": "r1", "behavior_id": "domain_classification",
+            "steering": {"test_quality": 0.5, "beat_baseline": True},
+            "qlora": {"test_quality": 0.6},
+        }],
+        "excluded": [],
+    }
+    assert "parsed%" not in render_comparison_markdown(comparison_without)
+
+    comparison_with = {
+        "steering_run": "s", "qlora_run": "q", "min_split_size": 20,
+        "comparisons": [{
+            "model_id": "m1", "recipe_id": "r1", "behavior_id": "multiple_choice_eval",
+            "steering": {"test_quality": 0.5, "beat_baseline": True, "mc_parsed_rate": 0.9},
+            "qlora": {"test_quality": 0.6, "mc_parsed_rate": 0.95},
+        }],
+        "excluded": [],
+    }
+    assert "parsed%" in render_comparison_markdown(comparison_with)
 
 
 def test_benign_control_section_only_appears_when_data_exists():

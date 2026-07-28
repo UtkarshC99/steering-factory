@@ -67,6 +67,72 @@ def test_full_config_grid_is_deterministically_ordered():
     assert grid_a == grid_b
 
 
+def test_full_config_grid_reports_js_divergence_vs_baseline():
+    """Regression test for the metric-floor finding: safe_refusal/mc_correct
+    are bounded 0-1 and can read as "no effect" purely from a floor effect
+    (a real run scored negative coefficients safe_refusal=0.000 while
+    js_divergence_vs_baseline was 0.418-0.579 at the same configs, at
+    near-baseline perplexity). full_config_grid must surface the mean
+    js_divergence per config so this is visible, not just a diagnostic
+    used internally to reject a fluency outlier."""
+    rows = _grid_rows()
+    for row in rows:
+        row["js_divergence_vs_baseline"] = 0.5 if row["coefficient"] < 0 else 0.1
+    grid = full_config_grid(rows, "domain_classification")
+    assert all("js_divergence_vs_baseline" in r for r in grid)
+    neg = [r for r in grid if r["coefficient"] < 0]
+    pos = [r for r in grid if r["coefficient"] >= 0]
+    assert all(r["js_divergence_vs_baseline"] == pytest.approx(0.5) for r in neg)
+    assert all(r["js_divergence_vs_baseline"] == pytest.approx(0.1) for r in pos)
+
+
+def test_full_config_grid_js_divergence_is_none_without_the_field():
+    grid = full_config_grid(_grid_rows(), "domain_classification")
+    assert all(r["js_divergence_vs_baseline"] is None for r in grid)
+
+
+def test_bidirectionality_section_appears_and_reports_max_per_sign():
+    comparison = {
+        "steering_run": "s", "qlora_run": "q", "min_split_size": 20,
+        "comparisons": [{
+            "model_id": "m1", "recipe_id": "r1", "behavior_id": "domain_classification",
+            "steering": {"test_quality": 0.5, "beat_baseline": True},
+            "qlora": {"test_quality": 0.6},
+            "config_grid": [
+                {"method": "mean_diff", "layer_idx": 5, "coefficient": -2.0, "token_scope": "all",
+                 "test_quality": 0.0, "n_test": 10, "js_divergence_vs_baseline": 0.42},
+                {"method": "mean_diff", "layer_idx": 5, "coefficient": -1.0, "token_scope": "all",
+                 "test_quality": 0.0, "n_test": 10, "js_divergence_vs_baseline": 0.58},
+                {"method": "mean_diff", "layer_idx": 5, "coefficient": 1.0, "token_scope": "all",
+                 "test_quality": 0.9, "n_test": 10, "js_divergence_vs_baseline": 0.30},
+            ],
+        }],
+        "excluded": [],
+    }
+    markdown = render_comparison_markdown(comparison)
+    assert "Bidirectionality" in markdown
+    # Best negative is c=-1.0 (js=0.58), best positive is c=1.0 (js=0.30).
+    assert "0.5800" in markdown
+    assert "0.3000" in markdown
+
+
+def test_bidirectionality_section_absent_without_js_divergence_data():
+    comparison = {
+        "steering_run": "s", "qlora_run": "q", "min_split_size": 20,
+        "comparisons": [{
+            "model_id": "m1", "recipe_id": "r1", "behavior_id": "domain_classification",
+            "steering": {"test_quality": 0.5, "beat_baseline": True},
+            "qlora": {"test_quality": 0.6},
+            "config_grid": [
+                {"method": "mean_diff", "layer_idx": 5, "coefficient": 1.0, "token_scope": "all",
+                 "test_quality": 0.9, "n_test": 10},
+            ],
+        }],
+        "excluded": [],
+    }
+    assert "Bidirectionality" not in render_comparison_markdown(comparison)
+
+
 # --- plot_data_efficiency_curve ---------------------------------------------
 
 def test_plot_data_efficiency_curve_writes_a_file(tmp_path):
