@@ -192,6 +192,55 @@ def test_best_steering_config_returns_none_when_every_config_is_degenerate():
     assert best_steering_config(rows, "domain_classification") is None
 
 
+def test_best_steering_config_uses_median_not_mean_for_perplexity_ratio():
+    """Regression test for a real run (2026-07-27): a config that
+    successfully flipped behavior (compliance -> refusal) had a BIMODAL
+    perplexity_ratio_vs_baseline distribution -- most rows near 1.0
+    (fluent, matches the baseline's own typical distribution), a minority
+    at extreme ratios (the rows where the flip actually happened, which
+    are genuinely low-probability under the now-irrelevant baseline
+    distribution) -- median 0.94, mean 68.77. The MEAN-based gate rejected
+    this config outright; the median must pass it, since the median
+    reflects the config's actual typical fluency and isn't dragged by the
+    minority of rows where steering worked as intended."""
+    rows = _steering_rows()
+    # mean_diff/L5/c=1.0 (the config that would otherwise win on quality)
+    # gets a bimodal ratio distribution: most rows near 1.0, a few at an
+    # extreme high value -- mean pulled far above the cap, median stays
+    # near 1.0.
+    mean_diff_val_rows = [r for r in rows if r["method"] == "mean_diff" and r["coefficient"] == 1.0 and r["split"] == "validation"]
+    for i, row in enumerate(mean_diff_val_rows):
+        row["perplexity_ratio_vs_baseline"] = 1500.0 if i < 3 else 0.95  # 3 extreme, rest fluent (n=24)
+        row["repetition_score"] = 0.05
+    for row in rows:
+        if row["method"] == "pca" and row["coefficient"] == 2.0:
+            row["perplexity_ratio_vs_baseline"] = 1.0
+            row["repetition_score"] = 0.02
+
+    result = best_steering_config(rows, "domain_classification")
+    assert result is not None
+    assert result["method"] == "mean_diff"  # NOT rejected -- median (0.95) passes despite mean (~188) failing
+    assert result["rejected_for_fluency"] == []
+
+
+def test_best_steering_config_median_still_rejects_uniformly_degenerate_config():
+    # A config whose high-ratio rows are the MAJORITY (not just a few
+    # outliers) must still fail under the median -- this isn't a blanket
+    # loosening of the gate, only a fix for the minority-outlier case.
+    rows = _steering_rows()
+    for row in rows:
+        if row["method"] == "mean_diff" and row["coefficient"] == 1.0:
+            row["perplexity_ratio_vs_baseline"] = 42.0
+            row["repetition_score"] = 0.1
+        elif row["method"] == "pca" and row["coefficient"] == 2.0:
+            row["perplexity_ratio_vs_baseline"] = 1.0
+            row["repetition_score"] = 0.02
+
+    result = best_steering_config(rows, "domain_classification")
+    assert result["method"] == "pca"
+    assert any(r["method"] == "mean_diff" for r in result["rejected_for_fluency"])
+
+
 def test_best_steering_config_missing_fluency_fields_does_not_gate():
     # A behavior with no perplexity/repetition diagnostics (e.g.
     # multiple_choice_eval) must not be penalized for lacking them.
@@ -634,6 +683,55 @@ def test_build_comparison_excludes_entries_below_min_split_size(tmp_path):
     assert len(unfiltered["comparisons"]) == 1
 
 
+def test_build_comparison_records_pair_dropped_for_no_fluent_config(tmp_path):
+    """Regression test for a real run (2026-07-27, preset_low_bit_layer_scan):
+    every one of qwen3's steered validation configs failed the fluency
+    gate, best_steering_config returned None, and the (model, recipe) pair
+    vanished from the report with NO trace at all -- not even in
+    `excluded`, which only ever covered the min_split_size guard. Confirms
+    the pair is now recorded with reason="no_fluent_steering_config"
+    instead of silently disappearing."""
+    steer_dir = tmp_path / "steer_run"
+    qlora_dir = tmp_path / "qlora_run"
+    rows = _add_fluency_fields(_steering_rows(), ppl_ratio=100.0, repetition=0.9)  # every config degenerate
+    _write_jsonl(steer_dir / "results" / "generations.jsonl", rows)
+    _write_jsonl(steer_dir / "vectors" / "index.jsonl", [
+        {"model_id": "m1", "recipe_id": "r1", "method": "mean_diff", "layer_idx": 5, "num_pairs": 16,
+         "vector_path": str(steer_dir / "vectors" / "v1.pt")},
+        {"model_id": "m1", "recipe_id": "r1", "method": "pca", "layer_idx": 8, "num_pairs": 16,
+         "vector_path": str(steer_dir / "vectors" / "v2.pt")},
+    ])
+    (steer_dir / "vectors" / "v1.pt").write_bytes(b"0")
+    (steer_dir / "vectors" / "v2.pt").write_bytes(b"0")
+    _write_json(steer_dir / "telemetry.json", {"wall_time_s": 1.0})
+    _write_jsonl(qlora_dir / "results" / "generations.jsonl", _qlora_rows(test_quality=0.5))
+    _write_json(qlora_dir / "results" / "qlora.json", [
+        {"model_id": "m1", "recipe_id": "r1", "num_train_records": 200, "wall_time_s": 1.0,
+         "adapter_size_bytes": 10, "adapter_dir": "x"},
+    ])
+
+    comparison = build_comparison(steer_dir, qlora_dir, min_split_size=0)
+    assert comparison["comparisons"] == []
+    assert len(comparison["excluded"]) == 1
+    assert comparison["excluded"][0]["reason"] == "no_fluent_steering_config"
+    assert comparison["excluded"][0]["model_id"] == "m1"
+    assert comparison["excluded"][0]["recipe_id"] == "r1"
+
+
+def test_render_comparison_markdown_shows_dropped_no_fluent_config_pairs():
+    comparison = {
+        "steering_run": "s", "qlora_run": "q", "min_split_size": 20,
+        "comparisons": [], "excluded": [{
+            "model_id": "qwen3_4b_4bit", "recipe_id": "harmful_instruction_compliance",
+            "behavior_id": "harmful_instruction_compliance", "reason": "no_fluent_steering_config",
+        }],
+    }
+    markdown = render_comparison_markdown(comparison)
+    assert "Excluded (no usable config)" in markdown
+    assert "qwen3_4b_4bit" in markdown
+    assert "no_fluent_steering_config" in markdown
+
+
 def test_render_comparison_markdown_separates_excluded_from_winner_table():
     comparison = {
         "steering_run": "s", "qlora_run": "q", "min_split_size": 20,
@@ -746,6 +844,55 @@ def test_winner_inconclusive_on_low_mc_parsed_rate():
     markdown = render_comparison_markdown(comparison)
     assert "inconclusive" in markdown.lower()
     assert "expected format" in markdown.lower()
+
+
+def test_winner_not_suppressed_by_distinct_ratio_for_forced_choice_recipe():
+    """Regression test for a real run (2026-07-27, preset_8bit_midpoint):
+    gemma's sycophancy_agreement baseline emitted exactly `(A)`/`(B)` on
+    every row -- Counter({'(A)': 236, '(B)': 164}), 2 distinct outputs
+    over 400 rows (~0.5% distinct). That IS the only correct behavior for
+    a binary forced choice, but the distinct-output guard's floor is 10%,
+    so both real sycophancy results (gemma 0.3250 vs 0.2700 baseline,
+    qwen 0.3300 vs 0.2700) were wrongly suppressed as
+    "output has collapsed". A high-parsed-rate, low-distinct-ratio arm on
+    a multiple_choice_eval recipe (identified by mc_parsed_rate being
+    present) must be allowed to win -- the low distinct ratio is expected,
+    not a degeneracy signal, for this recipe family."""
+    comparison = {
+        "steering_run": "s", "qlora_run": "q", "min_split_size": 20,
+        "comparisons": [{
+            "model_id": "m1", "recipe_id": "r1", "behavior_id": "multiple_choice_eval",
+            "steering": {"test_quality": 0.325, "beat_baseline": True, "mc_parsed_rate": 1.0, "distinct_output_ratio": 0.02},
+            "qlora": {"test_quality": 0.27, "mc_parsed_rate": 1.0, "distinct_output_ratio": 0.03},
+        }],
+        "excluded": [],
+    }
+    markdown = render_comparison_markdown(comparison)
+    # The explanatory prose elsewhere on the page legitimately says
+    # "inconclusive" (describing when it CAN happen) -- what must NOT
+    # appear is the verdict itself naming this pair inconclusive.
+    assert "| steering |" in markdown  # named plainly as the winner in the table row
+    assert "inconclusive (" not in markdown
+
+
+def test_winner_still_suppressed_by_distinct_ratio_for_free_text_recipe():
+    # Same collapsed distinct ratio, but NO mc_parsed_rate key at all (a
+    # free-text refusal recipe) -- the guard must still fire here, since
+    # this is the class of result it was designed for (a real run: 6
+    # distinct outputs over 364 rows from a QLoRA adapter that collapsed
+    # to one canned refusal string).
+    comparison = {
+        "steering_run": "s", "qlora_run": "q", "min_split_size": 20,
+        "comparisons": [{
+            "model_id": "m1", "recipe_id": "r1", "behavior_id": "domain_classification",
+            "steering": {"test_quality": 0.5, "beat_baseline": True, "distinct_output_ratio": 0.02},
+            "qlora": {"test_quality": 0.3, "distinct_output_ratio": 0.9},
+        }],
+        "excluded": [],
+    }
+    markdown = render_comparison_markdown(comparison)
+    assert "inconclusive" in markdown.lower()
+    assert "collapsed" in markdown.lower()
 
 
 def test_mc_parsed_column_only_appears_when_data_exists():

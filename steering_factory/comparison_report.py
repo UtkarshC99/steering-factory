@@ -76,9 +76,23 @@ def _degeneracy_reason(arm_name: str, arm: Dict[str, Any]) -> Optional[str]:
     mc_parsed_rate = arm.get("mc_parsed_rate")
     if mc_parsed_rate is not None and mc_parsed_rate < MIN_MC_PARSED_RATE_FOR_A_WINNER:
         return f"{arm_name} answered in the expected format only {mc_parsed_rate:.0%} of the time"
-    distinct = arm.get("distinct_output_ratio")
-    if distinct is not None and distinct < MIN_DISTINCT_OUTPUT_RATIO_FOR_A_WINNER:
-        return f"{arm_name} output has collapsed ({distinct:.0%} distinct)"
+    # The distinct-output check is skipped entirely for multiple_choice_eval
+    # recipes (identified by `mc_parsed_rate` being present at all, even if
+    # None -- best_steering_config/qlora_quality only set that key when
+    # quality_key == "mc_correct"). A real run (2026-07-27, 8bit_midpoint)
+    # had gemma's sycophancy_agreement baseline emit exactly `(A)`/`(B)` on
+    # every row -- Counter({'(A)': 236, '(B)': 164}), 2 distinct outputs
+    # over 400 rows, ratio ~0.5%. That IS the only correct behavior for a
+    # binary forced choice; the guard was designed for free-text refusal
+    # recipes (where 6 distinct outputs over 364 rows really did mean a
+    # collapsed canned response) and fires on every well-behaved
+    # multiple_choice_eval result by construction, since its answer space
+    # is 1-2 tokens wide. mc_parsed_rate (checked above) is the correct
+    # degeneracy signal for this recipe family.
+    if "mc_parsed_rate" not in arm:
+        distinct = arm.get("distinct_output_ratio")
+        if distinct is not None and distinct < MIN_DISTINCT_OUTPUT_RATIO_FOR_A_WINNER:
+            return f"{arm_name} output has collapsed ({distinct:.0%} distinct)"
     return None
 
 
@@ -367,7 +381,8 @@ def render_comparison_markdown(comparison: Dict[str, Any], plot_paths: Optional[
                     )
             lines.append("")
 
-    if excluded:
+    insufficient_data = [e for e in excluded if e.get("reason") == "insufficient_data"]
+    if insufficient_data:
         lines.append("## Excluded (insufficient data)")
         lines.append("")
         lines.append(
@@ -378,11 +393,36 @@ def render_comparison_markdown(comparison: Dict[str, Any], plot_paths: Optional[
         lines.append("")
         lines.append("| model | recipe | n_test (steering) | n_validation (steering) | n_test (qlora) | n_validation (qlora) |")
         lines.append("|---|---|---|---|---|---|")
-        for entry in excluded:
+        for entry in insufficient_data:
             lines.append(
                 f"| {entry['model_id']} | {entry['recipe_id']} | {entry['n_test_steering']} | "
                 f"{entry['n_validation_steering']} | {entry['n_test_qlora']} | {entry['n_validation_qlora']} |"
             )
+        lines.append("")
+
+    # Added 2026-07-27: was a SILENT drop before -- a real run had every one
+    # of qwen3's steered configs on harmful_instruction_compliance fail the
+    # fluency gate, and the (model, recipe) pair vanished from the report
+    # entirely with no trace (not even in the insufficient-data table
+    # above, which only covers the min_split_size guard). See
+    # build_comparison's identical comment at the append site.
+    dropped_no_config = [e for e in excluded if e.get("reason") in ("no_fluent_steering_config", "no_qlora_quality")]
+    if dropped_no_config:
+        lines.append("## Excluded (no usable config)")
+        lines.append("")
+        lines.append(
+            "These (model, recipe) pairs are ABSENT from the Matched quality table above, not just "
+            "excluded from naming a winner -- `no_fluent_steering_config` means every steered "
+            "validation config for this pair failed the fluency gate (see `Steering configs rejected "
+            "for fluency` above for which configs and why), so there was no config left to select a "
+            "winner from at all. `no_qlora_quality` means the QLoRA arm had no scoreable validation/"
+            "test rows for this pair."
+        )
+        lines.append("")
+        lines.append("| model | recipe | reason |")
+        lines.append("|---|---|---|")
+        for entry in dropped_no_config:
+            lines.append(f"| {entry['model_id']} | {entry['recipe_id']} | {entry['reason']} |")
         lines.append("")
 
     return "\n".join(lines)

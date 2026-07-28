@@ -161,14 +161,42 @@ def _steering_config_key(row: Dict[str, Any]) -> Tuple:
     return (row.get("method"), row.get("layer_idx"), row.get("coefficient"), row.get("token_scope"))
 
 
+def _median(values: List[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
 def _is_fluent(
     rows: List[Dict[str, Any]], fluency_cap_ratio: float = DEFAULT_FLUENCY_CAP_RATIO,
     repetition_cap: float = DEFAULT_REPETITION_CAP,
 ) -> bool:
-    """A config is fluent if its rows' MEAN perplexity ratio and repetition
-    score both clear the cap -- mirrors sweep.suggest_best_coefficients'
-    per-row filter, but applied as a config-level gate here since
-    best_steering_config selects a whole config, not individual rows.
+    """A config is fluent if its rows' MEDIAN perplexity ratio and MEDIAN
+    repetition score both clear the cap -- mirrors sweep.suggest_best_
+    coefficients' per-row filter, but applied as a config-level gate here
+    since best_steering_config selects a whole config, not individual rows.
+
+    MEDIAN, not mean (changed 2026-07-27): perplexity_ratio_vs_baseline is
+    measured against the UNSTEERED baseline's distribution, so a config
+    that successfully flips behavior (e.g. compliance -> refusal) makes the
+    now-different text genuinely low-probability under that baseline --
+    inflating the ratio for a REASON UNRELATED to fluency. A real run
+    (2026-07-27, qwen3_4b_4bit, mean_diff L12 c=+1.0) had ratios
+    [0.00, ..., median 0.94, ..., 1500.77] -- clearly bimodal, not a
+    uniformly-degenerate distribution, with clean refusal text like "I
+    can't help with that. I'm here to support you..." landing at the
+    1500x extreme purely because the baseline would have complied. The
+    mean (68.77) was dragged far past the cap by exactly the rows where
+    steering worked; the median (0.94) reflects the config's actual
+    typical fluency and correctly passes it. A config that's genuinely
+    degenerate throughout (e.g. a real run's c=-1.0 repetition loop,
+    repetition_score 0.72-0.85 across nearly every row) still fails under
+    the median the same as it did under the mean -- this only changes the
+    verdict for configs whose high-ratio rows are the minority driving up
+    an unrepresentative mean.
 
     Both checks matter independently: on the 2026-07-26 run, Qwen3-4B's
     c=-2.0 passed the perplexity check (ratio 1.02, near-normal) but failed
@@ -182,11 +210,11 @@ def _is_fluent(
     repetitions = [r["repetition_score"] for r in rows if r.get("repetition_score") is not None]
     if not ratios and not repetitions:
         return True  # behavior lacks these diagnostics (e.g. multiple_choice_eval); nothing to gate on
-    mean_ratio = sum(ratios) / len(ratios) if ratios else None
-    mean_repetition = sum(repetitions) / len(repetitions) if repetitions else None
-    if mean_ratio is not None and mean_ratio > fluency_cap_ratio:
+    median_ratio = _median(ratios) if ratios else None
+    median_repetition = _median(repetitions) if repetitions else None
+    if median_ratio is not None and median_ratio > fluency_cap_ratio:
         return False
-    if mean_repetition is not None and mean_repetition >= repetition_cap:
+    if median_repetition is not None and median_repetition >= repetition_cap:
         return False
     return True
 
@@ -650,6 +678,19 @@ def build_comparison(
         steer_quality = best_steering_config(steer_rows, behavior_id)
         qlora_q = qlora_quality(qlora_rows, behavior_id)
         if steer_quality is None or qlora_q is None:
+            # Was a SILENT drop before 2026-07-27: a real run had every one
+            # of qwen3's 6 steered configs on harmful_instruction_compliance
+            # fail the fluency gate (best_steering_config returns None with
+            # no fluent candidates), and the pair vanished from the report
+            # with no trace at all -- not even in `excluded`, which only
+            # ever covered the min_split_size guard below. The report
+            # showed gemma only, with nothing to indicate qwen was missing.
+            # Recorded here so "steering had no usable config for this
+            # (model, recipe)" is a visible finding, not a silent gap.
+            excluded.append({
+                "model_id": model_id, "recipe_id": recipe_id, "behavior_id": behavior_id,
+                "reason": "no_fluent_steering_config" if steer_quality is None else "no_qlora_quality",
+            })
             continue
 
         control_recipe_ids = _control_recipe_ids(manifest, recipe_id)
